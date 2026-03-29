@@ -1,4 +1,41 @@
-rules: []
+rules:
+  - name: block_dangerous_shell
+    tool: shell_exec
+    action: block
+    conditions:
+      - type: pattern_match
+        field: command
+        patterns:
+          - "rm\\s+-rf"
+          - "curl.*\\|.*sh"
+          - "curl.*\\|.*bash"
+          - "wget.*\\|.*sh"
+          - "chmod\\s+777"
+          - "sudo\\s+"
+    message: "Blocked: dangerous shell command"
+
+  - name: block_data_exfil
+    tool: shell_exec
+    action: block
+    conditions:
+      - type: pattern_match
+        field: command
+        patterns:
+          - "curl.*-d\\s"
+          - "curl.*--data"
+          - "wget.*--post"
+          - "\\|\\s*nc\\s"
+          - "\\|\\s*netcat"
+    message: "Blocked: possible data exfiltration"
+
+  - name: flag_external_email
+    tool: email_send
+    action: require_approval
+    conditions:
+      - type: domain_allowlist
+        field: to
+        allowed_domains: ["company.com", "internal.org"]
+    message: "Email to external domain requires approval"
 settings:
   log_all_calls: true
-  log_file: "agentparry.log"
+  log_file: "agentshield.log"
