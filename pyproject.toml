@@ -1,0 +1,13 @@
+[project]
+name = "agent-parry"
+version = "0.1.0"
+description = "AgentParry: scan, protect, and verify autonomous AI agents against prompt injection, data exfiltration, and privilege escalation."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pyyaml",
+    "pydantic",
+    "rich",
+    "httpx",
+]

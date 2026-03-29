@@ -1,4 +1,4 @@
-"""Shared Pydantic models and constants for AgentShield."""
+"""Shared Pydantic models and constants for AgentParry."""
 
 from __future__ import annotations
 

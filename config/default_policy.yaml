@@ -1,0 +1,4 @@
+rules: []
+settings:
+  log_all_calls: true
+  log_file: "agentparry.log"
