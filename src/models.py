@@ -77,6 +77,7 @@ class AttackPayload(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     expected_behavior: str = ""
     severity: str = "low"
+    description: str = ""
 
 
 class AttackResult(BaseModel):
