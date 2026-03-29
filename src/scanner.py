@@ -174,7 +174,7 @@ class Scanner:
         console.print(
             Panel(
                 f"{summary}\n\nVulnerability Score: {score_text}",
-                title="🔍 AgentParry Scan Report",
+                title="[bold]AgentParry Scan Report[/bold]",
                 expand=False,
             )
         )
@@ -319,7 +319,7 @@ class Scanner:
     @staticmethod
     def _status_cell(result: AttackResult) -> Text:
         if result.was_blocked:
-            return Text("✅ BLOCKED", style="green")
+            return Text("[+] BLOCKED", style="green")
         if result.was_redacted:
-            return Text("🛡️ REDACTED", style="blue")
-        return Text("❌ VULNERABLE", style="red")
+            return Text("[~] REDACTED", style="blue")
+        return Text("[!] VULNERABLE", style="red")

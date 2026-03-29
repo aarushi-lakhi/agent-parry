@@ -19,7 +19,7 @@ _PI_PATTERNS: list[tuple[str, str, str]] = [
     ("disregard", r"disregard.*rules|override.*safety", "safety override"),
 ]
 
-_BASE64_PATTERN = r"[A-Za-z0-9+/=]{100,}"
+_BASE64_PATTERN = r"[A-Za-z0-9+/=]{40,}"
 
 _DE_PATTERNS: list[tuple[str, str, str]] = [
     ("curl", r"curl.*-d", "curl POST exfiltration"),
@@ -29,10 +29,11 @@ _DE_PATTERNS: list[tuple[str, str, str]] = [
 ]
 
 _PE_PATTERNS: list[tuple[str, str, str]] = [
-    ("chmod", r"chmod\s+777", "world-writable permission change"),
+    ("chmod 777", r"chmod\s+777", "world-writable permission change"),
     ("rm", r"rm\s+-rf\s+/", "recursive root deletion"),
     ("|", r"curl.*\|\s*bash", "remote script execution"),
-    ("chmod", r"chmod\s+\+s", "SUID bit escalation"),
+    ("chmod +s", r"chmod\s+\+s", "SUID bit escalation"),
+    ("chmod", r"chmod\s+777|chmod\s+\+s", "dangerous chmod"),
 ]
 
 
@@ -64,8 +65,7 @@ class RuleGenerator:
         existing: list[dict[str, Any]] = policy.get("rules", [])
         existing = [r for r in existing if not r.get("name", "").startswith("autogen_")]
 
-        existing.extend(rules)
-        policy["rules"] = existing
+        policy["rules"] = rules + existing
 
         with open(policy_path, "w") as f:
             yaml.dump(policy, f, default_flow_style=False, sort_keys=False)
@@ -116,6 +116,30 @@ class RuleGenerator:
         return None
 
     @staticmethod
+    def _make_rule(
+        attack_id: str,
+        tool: str,
+        action: str,
+        field: str,
+        patterns: list[str],
+        description: str,
+    ) -> dict[str, Any]:
+        return {
+            "name": f"autogen_{attack_id}",
+            "tool": tool,
+            "action": action,
+            "message": description,
+            "description": description,
+            "conditions": [
+                {
+                    "type": "pattern_match",
+                    "field": field,
+                    "patterns": patterns,
+                }
+            ],
+        }
+
+    @staticmethod
     def _rule_prompt_injection(
         attack_id: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
@@ -135,16 +159,10 @@ class RuleGenerator:
             if pattern is None:
                 first_words = " ".join(body.split()[:4])
                 pattern = re.escape(first_words)
-                desc = "blocks prompt injection in email body"
 
-        return {
-            "name": f"autogen_{attack_id}",
-            "tool": "email_send",
-            "action": "block",
-            "match_field": "body",
-            "pattern": pattern,
-            "description": desc,
-        }
+        return RuleGenerator._make_rule(
+            attack_id, "email_send", "BLOCK", "body", [pattern], desc,
+        )
 
     @staticmethod
     def _rule_data_exfiltration(
@@ -160,14 +178,9 @@ class RuleGenerator:
                 desc = f"blocks {label}"
                 break
 
-        return {
-            "name": f"autogen_{attack_id}",
-            "tool": "shell_exec",
-            "action": "block",
-            "match_field": "command",
-            "pattern": pattern,
-            "description": desc,
-        }
+        return RuleGenerator._make_rule(
+            attack_id, "shell_exec", "BLOCK", "command", [pattern], desc,
+        )
 
     @staticmethod
     def _rule_privilege_escalation(
@@ -183,14 +196,9 @@ class RuleGenerator:
                 desc = f"blocks {label}"
                 break
 
-        return {
-            "name": f"autogen_{attack_id}",
-            "tool": "shell_exec",
-            "action": "block",
-            "match_field": "command",
-            "pattern": pattern,
-            "description": desc,
-        }
+        return RuleGenerator._make_rule(
+            attack_id, "shell_exec", "BLOCK", "command", [pattern], desc,
+        )
 
     @staticmethod
     def _rule_pii_leak(
@@ -200,20 +208,13 @@ class RuleGenerator:
             file_path: str = arguments.get("path", "")
             filename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
             pattern = re.escape(filename)
-            return {
-                "name": f"autogen_{attack_id}",
-                "tool": "file_read",
-                "action": "redact",
-                "match_field": "path",
-                "pattern": pattern,
-                "description": f"redacts output when reading {filename}",
-            }
+            return RuleGenerator._make_rule(
+                attack_id, "file_read", "BLOCK", "path", [pattern],
+                f"blocks reads of {filename}",
+            )
 
-        return {
-            "name": f"autogen_{attack_id}",
-            "tool": "email_send",
-            "action": "block",
-            "match_field": "body",
-            "pattern": r"\d{3}-\d{2}-\d{4}|4\d{3}[-\s]?\d{4}",
-            "description": "blocks emails containing SSN or credit card numbers",
-        }
+        return RuleGenerator._make_rule(
+            attack_id, "email_send", "BLOCK", "body",
+            [r"\d{3}-\d{2}-\d{4}", r"4\d{3}[-\s]?\d{4}"],
+            "blocks emails containing SSN or credit card numbers",
+        )

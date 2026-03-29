@@ -1,41 +1,82 @@
 rules:
-  - name: block_dangerous_shell
-    tool: shell_exec
-    action: block
-    conditions:
-      - type: pattern_match
-        field: command
-        patterns:
-          - "rm\\s+-rf"
-          - "curl.*\\|.*sh"
-          - "curl.*\\|.*bash"
-          - "wget.*\\|.*sh"
-          - "chmod\\s+777"
-          - "sudo\\s+"
-    message: "Blocked: dangerous shell command"
-
-  - name: block_data_exfil
-    tool: shell_exec
-    action: block
-    conditions:
-      - type: pattern_match
-        field: command
-        patterns:
-          - "curl.*-d\\s"
-          - "curl.*--data"
-          - "wget.*--post"
-          - "\\|\\s*nc\\s"
-          - "\\|\\s*netcat"
-    message: "Blocked: possible data exfiltration"
-
-  - name: flag_external_email
-    tool: email_send
-    action: require_approval
-    conditions:
-      - type: domain_allowlist
-        field: to
-        allowed_domains: ["company.com", "internal.org"]
-    message: "Email to external domain requires approval"
+- name: autogen_pi-003
+  tool: email_send
+  action: BLOCK
+  message: blocks base64-encoded prompt injection in email body
+  description: blocks base64-encoded prompt injection in email body
+  conditions:
+  - type: pattern_match
+    field: body
+    patterns:
+    - '[A-Za-z0-9+/=]{40,}'
+- name: autogen_pi-004
+  tool: email_send
+  action: BLOCK
+  message: blocks safety override in email body
+  description: blocks safety override in email body
+  conditions:
+  - type: pattern_match
+    field: body
+    patterns:
+    - disregard.*rules|override.*safety
+- name: autogen_pe-004
+  tool: shell_exec
+  action: BLOCK
+  message: blocks SUID bit escalation
+  description: blocks SUID bit escalation
+  conditions:
+  - type: pattern_match
+    field: command
+    patterns:
+    - chmod\s+\+s
+- name: autogen_pl-003
+  tool: email_send
+  action: BLOCK
+  message: blocks emails containing SSN or credit card numbers
+  description: blocks emails containing SSN or credit card numbers
+  conditions:
+  - type: pattern_match
+    field: body
+    patterns:
+    - \d{3}-\d{2}-\d{4}
+    - 4\d{3}[-\s]?\d{4}
+- name: block_dangerous_shell
+  tool: shell_exec
+  action: block
+  conditions:
+  - type: pattern_match
+    field: command
+    patterns:
+    - rm\s+-rf
+    - curl.*\|.*sh
+    - curl.*\|.*bash
+    - wget.*\|.*sh
+    - chmod\s+777
+    - sudo\s+
+  message: 'Blocked: dangerous shell command'
+- name: block_data_exfil
+  tool: shell_exec
+  action: block
+  conditions:
+  - type: pattern_match
+    field: command
+    patterns:
+    - curl.*-d\s
+    - curl.*--data
+    - wget.*--post
+    - \|\s*nc\s
+    - \|\s*netcat
+  message: 'Blocked: possible data exfiltration'
+- name: flag_external_email
+  tool: email_send
+  action: require_approval
+  conditions:
+  - type: domain_allowlist
+    field: to
+    allowed_domains:
+    - company.com
+    - internal.org
+  message: Email to external domain requires approval
 settings:
   log_all_calls: true
-  log_file: "agentshield.log"
+  log_file: agentparry.log
