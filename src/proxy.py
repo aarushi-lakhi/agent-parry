@@ -139,7 +139,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept", "Mcp-Session-Id", "Authorization"],
+    allow_headers=[
+        "Content-Type",
+        "Accept",
+        "Mcp-Session-Id",
+        "Authorization",
+        "AgentParry-Safe-Scan",
+    ],
 )
 
 
@@ -218,7 +224,13 @@ def _mcp_session_response_headers(*, rpc_method: str, incoming_session: str | No
     return {}
 
 
-def _handle_mcp_rpc(request: JsonRpcRequest) -> JsonRpcResponse:
+def _safe_scan_truthy(value: str | None) -> bool:
+    if value is None or not value.strip():
+        return False
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
     if request.method in {"initialize", "tools/list"}:
         upstream_payload = _forward_to_upstream(request.model_dump())
         return JsonRpcResponse.model_validate(upstream_payload)
@@ -230,7 +242,7 @@ def _handle_mcp_rpc(request: JsonRpcRequest) -> JsonRpcResponse:
             message=f"Method not found: {request.method}",
         )
 
-    if _bypass_all:
+    if _bypass_all and not safe_scan:
         upstream_payload = _forward_to_upstream(request.model_dump())
         return JsonRpcResponse.model_validate(upstream_payload)
 
@@ -274,6 +286,12 @@ def _handle_mcp_rpc(request: JsonRpcRequest) -> JsonRpcResponse:
         _log_approve(tool_name, arguments, decision.rule_name or "requires_approval")
     else:
         _log_allow(tool_name, arguments)
+
+    if safe_scan:
+        return JsonRpcResponse(
+            id=request.id,
+            result={"_agentparry": {"safe_scan": True, "would_forward": True}},
+        )
 
     upstream_payload = _forward_to_upstream(request.model_dump())
     result_payload = upstream_payload.get("result")
@@ -371,8 +389,10 @@ async def mcp_post(request: Request) -> Response:
     except ValidationError as exc:
         return JSONResponse({"detail": exc.errors()}, status_code=422)
 
+    safe_hdr = request.headers.get("agentparry-safe-scan") or request.headers.get("AgentParry-Safe-Scan")
+    safe_scan = _safe_scan_truthy(safe_hdr)
     try:
-        rpc_resp = _handle_mcp_rpc(rpc_req)
+        rpc_resp = _handle_mcp_rpc(rpc_req, safe_scan=safe_scan)
     except UpstreamConfigurationError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=503)
     rpc_dict = rpc_resp.model_dump(mode="json")

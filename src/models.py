@@ -87,6 +87,7 @@ class AttackResult(BaseModel):
     was_blocked: bool = False
     was_redacted: bool = False
     passed_through: bool = False
+    evaluated_only: bool = False
     proxy_response: dict[str, Any] | None = None
     notes: str = ""
 
@@ -98,9 +99,16 @@ class ScanReport(BaseModel):
     blocked: int = 0
     passed: int = 0
     redacted: int = 0
+    policy_allowed_safe: int = 0
     results: list[AttackResult] = Field(default_factory=list)
     vulnerability_score: float = 0.0
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    target_url: str = ""
+    safe_mode: bool = False
+    discovered_tools: list[str] = Field(default_factory=list)
+    matched_yaml_payloads: int = 0
+    total_yaml_payloads: int = 0
+    payload_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProxyStats(BaseModel):

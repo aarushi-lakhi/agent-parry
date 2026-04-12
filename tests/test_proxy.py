@@ -308,6 +308,31 @@ class TestProxy(unittest.TestCase):
                     main()
         self.assertEqual(raised.exception.code, 1)
 
+    @patch("src.proxy._forward_to_upstream")
+    def test_safe_scan_header_skips_upstream_when_allowed(self, mock_forward) -> None:
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "email_send",
+                    "arguments": {
+                        "to": "dev@example.com",
+                        "subject": "x",
+                        "body": "hello",
+                    },
+                },
+            },
+            headers={"AgentParry-Safe-Scan": "1"},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("_agentparry", body.get("result", {}))
+        self.assertTrue(body["result"]["_agentparry"].get("safe_scan"))
+        mock_forward.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,7 @@ from typing import Any
 import json5
 
 from src.models import PROXY_URL, ScanReport
-from src.scanner import Scanner
+from src.scanner import Scanner, save_scan_outputs
 from src.stdio_proxy import main_argv as stdio_main_argv
 
 
@@ -61,10 +61,15 @@ def cmd_wrap(args: argparse.Namespace) -> int:
 
 async def _cmd_scan_live(args: argparse.Namespace) -> int:
     scanner = Scanner(payloads_path=args.payloads)
-    report = await scanner.run_scan(proxy_url=args.target)
+    report = await scanner.run_scan(
+        proxy_url=args.target,
+        discover=args.discover,
+        safe=args.safe,
+    )
     scanner.print_report(report)
-    path = scanner.save_report(report, args.output)
-    print(f"Report saved: {path}", file=sys.stderr)
+    paths = save_scan_outputs(scanner, report, args.output, args.format)
+    for p in paths:
+        print(f"Report saved: {p}", file=sys.stderr)
     return 0
 
 
@@ -258,6 +263,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  agentparry scan --target http://localhost:9090/mcp --output reports/\n"
+            "  agentparry scan --target http://localhost:9090/mcp --discover --format both\n"
+            "  agentparry scan --target http://localhost:9090/mcp --safe --format md --output reports/scan.md\n"
             "  agentparry scan --report-only reports/scan_2026-04-12.json\n"
         ),
     )
@@ -274,7 +281,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Load a saved scan JSON and print the report (no network)",
     )
     p_scan.add_argument("--payloads", default="attacks/payloads.yaml", help="Attack payloads YAML")
-    p_scan.add_argument("--output", default="reports/", help="Directory for saved JSON report")
+    p_scan.add_argument(
+        "--output",
+        default="reports/",
+        help="Output directory or file (.json / .md) depending on --format",
+    )
+    p_scan.add_argument(
+        "--format",
+        choices=("json", "md", "both"),
+        default="json",
+        help="Write JSON, Markdown, or both (default: json)",
+    )
+    p_scan.add_argument(
+        "--discover",
+        action="store_true",
+        help="Call tools/list first; remap YAML payloads and add schema-driven probes",
+    )
+    p_scan.add_argument(
+        "--safe",
+        action="store_true",
+        help="Input-side checks only: proxy evaluates policy but does not forward tool calls",
+    )
     p_scan.set_defaults(handler=cmd_scan)
 
     p_claude = sub.add_parser(
