@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "agent-parry"
 version = "0.1.0"
@@ -10,12 +14,18 @@ dependencies = [
     "pydantic",
     "rich",
     "httpx",
+    "json5",
 ]
+
+[project.scripts]
+agentparry = "src.cli:main"
+agentparry-proxy = "src.proxy:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
 ]
 
-[project.scripts]
-agentparry-proxy = "src.proxy:main"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

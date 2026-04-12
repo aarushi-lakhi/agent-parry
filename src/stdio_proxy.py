@@ -617,13 +617,15 @@ async def _run_proxy(argv: list[str]) -> int:
     return 0 if code in (0, None) else 1
 
 
-def main_argv(argv: list[str]) -> int:
-    return asyncio.run(_run_proxy(argv))
+def main_argv(argv: list[str] | None = None) -> int:
+    """Run the stdio proxy with argv as from the shell (excluding program name)."""
+    args = sys.argv[1:] if argv is None else argv
+    return asyncio.run(_run_proxy(args))
 
 
 def main() -> None:
     try:
-        raise SystemExit(main_argv(sys.argv[1:]))
+        raise SystemExit(main_argv())
     except KeyboardInterrupt:
         raise SystemExit(130) from None
 
