@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import re
 import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from src.models import PolicyAction, PolicyDecision
-from src.proxy import app, policy_engine, stats
+from src.proxy import app, mcp_get, policy_engine, stats
 
 
 class TestProxy(unittest.TestCase):
@@ -125,6 +129,102 @@ class TestProxy(unittest.TestCase):
         self.assertEqual(rules_response.json(), {"rules": [{"name": "demo"}]})
         self.assertIn("total_requests", stats_response.json())
         mock_reload.assert_called_once()
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_post_mcp_sse_when_accept_includes_event_stream(self, mock_forward) -> None:
+        mock_forward.return_value = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"serverInfo": {"name": "mock", "version": "1.0"}},
+        }
+        response = self.client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/event-stream", response.headers.get("content-type", ""))
+        self.assertIn("event: message", response.text)
+        match = re.search(r"^data: (.+)$", response.text, re.MULTILINE)
+        self.assertIsNotNone(match)
+        payload = json.loads(match.group(1))
+        self.assertEqual(payload["result"]["serverInfo"]["name"], "mock")
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_mcp_session_initialize_and_echo(self, mock_forward) -> None:
+        mock_forward.return_value = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"serverInfo": {"name": "mock", "version": "1.0"}},
+        }
+        init = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        self.assertEqual(init.status_code, 200)
+        sid = init.headers.get("mcp-session-id")
+        self.assertIsNotNone(sid)
+        self.assertGreater(len(sid or ""), 0)
+
+        mock_forward.return_value = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": []},
+        }
+        follow = self.client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            headers={"Mcp-Session-Id": sid},
+        )
+        self.assertEqual(follow.status_code, 200)
+        self.assertEqual(follow.headers.get("mcp-session-id"), sid)
+
+    def test_options_mcp_cors(self) -> None:
+        response = self.client.options(
+            "/mcp",
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type, mcp-session-id",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "*")
+
+    def test_delete_mcp(self) -> None:
+        response = self.client.delete("/mcp")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_get_mcp_opens_sse_stream(self) -> None:
+        async def _first_sse_chunk() -> bytes | str:
+            streaming = await mcp_get()
+            self.assertIn("text/event-stream", streaming.media_type or "")
+            first = await streaming.body_iterator.__anext__()
+            return first
+
+        chunk = asyncio.run(_first_sse_chunk())
+        if isinstance(chunk, str):
+            self.assertIn(": open", chunk)
+        else:
+            self.assertIn(b": open", chunk)
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_auth_requires_bearer_when_token_set(self, mock_forward) -> None:
+        mock_forward.return_value = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"serverInfo": {"name": "mock", "version": "1.0"}},
+        }
+        with patch.dict(os.environ, {"AGENTPARRY_AUTH_TOKEN": "secret-token"}):
+            denied = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        self.assertEqual(denied.status_code, 401)
+
+        with patch.dict(os.environ, {"AGENTPARRY_AUTH_TOKEN": "secret-token"}):
+            ok = self.client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(ok.json()["result"]["serverInfo"]["name"], "mock")
 
 
 if __name__ == "__main__":

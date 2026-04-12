@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import uuid
 from typing import Any
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 from rich.console import Console
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 
 from src.inspector import InputInspector, OutputInspector
 from src.models import MOCK_SERVER_URL, JsonRpcRequest, JsonRpcResponse, PolicyAction, ProxyStats
@@ -20,6 +27,25 @@ input_inspector = InputInspector()
 output_inspector = OutputInspector()
 stats = ProxyStats()
 _bypass_all: bool = False
+
+
+class _BearerAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        expected = os.environ.get("AGENTPARRY_AUTH_TOKEN", "").strip()
+        if expected and request.method != "OPTIONS":
+            auth = request.headers.get("authorization", "")
+            if not auth.startswith("Bearer ") or auth.removeprefix("Bearer ").strip() != expected:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+app.add_middleware(_BearerAuthMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "Mcp-Session-Id", "Authorization"],
+)
 
 
 def _jsonrpc_error(*, request_id: int | str, code: int, message: str, data: Any | None = None) -> JsonRpcResponse:
@@ -83,50 +109,15 @@ def _forward_to_upstream(payload: dict[str, Any]) -> dict[str, Any]:
         return response.json()
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    try:
-        with httpx.Client(timeout=2.0) as client:
-            response = client.get(MOCK_SERVER_URL.replace("/mcp", "/health"))
-            response.raise_for_status()
-        upstream = "connected"
-    except Exception:
-        upstream = "disconnected"
-    return {"status": "ok", "upstream": upstream}
+def _mcp_session_response_headers(*, rpc_method: str, incoming_session: str | None) -> dict[str, str]:
+    if rpc_method == "initialize":
+        return {"Mcp-Session-Id": str(uuid.uuid4())}
+    if incoming_session:
+        return {"Mcp-Session-Id": incoming_session}
+    return {}
 
 
-@app.get("/stats")
-def get_stats() -> dict[str, int]:
-    return stats.model_dump()
-
-
-@app.post("/policy/disable")
-def disable_policy() -> dict[str, str]:
-    global _bypass_all
-    _bypass_all = True
-    return {"status": "ok", "policy": "disabled"}
-
-
-@app.post("/policy/enable")
-def enable_policy() -> dict[str, str]:
-    global _bypass_all
-    _bypass_all = False
-    return {"status": "ok", "policy": "enabled"}
-
-
-@app.post("/policy/reload")
-def reload_policy() -> dict[str, Any]:
-    policy_engine.reload()
-    return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
-
-
-@app.get("/policy/rules")
-def list_rules() -> dict[str, Any]:
-    return {"rules": policy_engine.get_rules()}
-
-
-@app.post("/mcp")
-def mcp(request: JsonRpcRequest) -> JsonRpcResponse:
+def _handle_mcp_rpc(request: JsonRpcRequest) -> JsonRpcResponse:
     if request.method in {"initialize", "tools/list"}:
         upstream_payload = _forward_to_upstream(request.model_dump())
         return JsonRpcResponse.model_validate(upstream_payload)
@@ -195,3 +186,90 @@ def mcp(request: JsonRpcRequest) -> JsonRpcResponse:
         upstream_payload["result"] = sanitized_result
 
     return JsonRpcResponse.model_validate(upstream_payload)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            response = client.get(MOCK_SERVER_URL.replace("/mcp", "/health"))
+            response.raise_for_status()
+        upstream = "connected"
+    except Exception:
+        upstream = "disconnected"
+    return {"status": "ok", "upstream": upstream}
+
+
+@app.get("/stats")
+def get_stats() -> dict[str, int]:
+    return stats.model_dump()
+
+
+@app.post("/policy/disable")
+def disable_policy() -> dict[str, str]:
+    global _bypass_all
+    _bypass_all = True
+    return {"status": "ok", "policy": "disabled"}
+
+
+@app.post("/policy/enable")
+def enable_policy() -> dict[str, str]:
+    global _bypass_all
+    _bypass_all = False
+    return {"status": "ok", "policy": "enabled"}
+
+
+@app.post("/policy/reload")
+def reload_policy() -> dict[str, Any]:
+    policy_engine.reload()
+    return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
+
+
+@app.get("/policy/rules")
+def list_rules() -> dict[str, Any]:
+    return {"rules": policy_engine.get_rules()}
+
+
+@app.get("/mcp")
+async def mcp_get() -> StreamingResponse:
+    async def keepalive() -> Any:
+        yield ": open\n\n"
+        while True:
+            await asyncio.sleep(30)
+            yield ": keepalive\n\n"
+
+    return StreamingResponse(keepalive(), media_type="text/event-stream")
+
+
+@app.delete("/mcp")
+def mcp_delete() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request) -> Response:
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"detail": "Invalid JSON body"}, status_code=400)
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON body"}, status_code=400)
+
+    try:
+        rpc_req = JsonRpcRequest.model_validate(body)
+    except ValidationError as exc:
+        return JSONResponse({"detail": exc.errors()}, status_code=422)
+
+    rpc_resp = _handle_mcp_rpc(rpc_req)
+    rpc_dict = rpc_resp.model_dump(mode="json")
+    incoming = request.headers.get("mcp-session-id")
+    extra_headers = _mcp_session_response_headers(rpc_method=rpc_req.method, incoming_session=incoming)
+    accept = (request.headers.get("accept") or "").lower()
+    wants_sse = "text/event-stream" in accept
+
+    if wants_sse:
+        line = json.dumps(rpc_dict, separators=(",", ":"), ensure_ascii=True)
+        content = f"event: message\ndata: {line}\n\n"
+        return Response(content=content, media_type="text/event-stream", headers=extra_headers)
+
+    return JSONResponse(rpc_dict, headers=extra_headers)
