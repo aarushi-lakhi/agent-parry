@@ -11,8 +11,8 @@ from pydantic import BaseModel, Field
 
 PROXY_PORT = 9090
 MOCK_SERVER_PORT = 8080
-PROXY_URL = "http://localhost:9090/mcp"
-MOCK_SERVER_URL = "http://localhost:8080/mcp"
+PROXY_URL = "http://127.0.0.1:9090/mcp"
+MOCK_SERVER_URL = "http://127.0.0.1:8080/mcp"
 
 
 class JsonRpcRequest(BaseModel):

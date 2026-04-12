@@ -19,6 +19,7 @@ policy_engine = PolicyEngine()
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
 stats = ProxyStats()
+_bypass_all: bool = False
 
 
 def _jsonrpc_error(*, request_id: int | str, code: int, message: str, data: Any | None = None) -> JsonRpcResponse:
@@ -99,6 +100,20 @@ def get_stats() -> dict[str, int]:
     return stats.model_dump()
 
 
+@app.post("/policy/disable")
+def disable_policy() -> dict[str, str]:
+    global _bypass_all
+    _bypass_all = True
+    return {"status": "ok", "policy": "disabled"}
+
+
+@app.post("/policy/enable")
+def enable_policy() -> dict[str, str]:
+    global _bypass_all
+    _bypass_all = False
+    return {"status": "ok", "policy": "enabled"}
+
+
 @app.post("/policy/reload")
 def reload_policy() -> dict[str, Any]:
     policy_engine.reload()
@@ -122,6 +137,10 @@ def mcp(request: JsonRpcRequest) -> JsonRpcResponse:
             code=-32601,
             message=f"Method not found: {request.method}",
         )
+
+    if _bypass_all:
+        upstream_payload = _forward_to_upstream(request.model_dump())
+        return JsonRpcResponse.model_validate(upstream_payload)
 
     stats.increment(total_requests=1)
     tool_name, arguments = _get_tool_payload(request)
