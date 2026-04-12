@@ -27,12 +27,15 @@ console = Console()
 class Scanner:
     """Loads attack payloads from YAML and fires them at the proxy."""
 
-    def __init__(self, payloads_path: str = "attacks/payloads.yaml") -> None:
-        with open(payloads_path) as f:
-            data = yaml.safe_load(f)
-        self.payloads: list[AttackPayload] = [
-            AttackPayload(**entry) for entry in data.get("payloads", [])
-        ]
+    def __init__(self, payloads_path: str | None = "attacks/payloads.yaml") -> None:
+        if payloads_path is None:
+            self.payloads: list[AttackPayload] = []
+        else:
+            with open(payloads_path) as f:
+                data = yaml.safe_load(f)
+            self.payloads = [
+                AttackPayload(**entry) for entry in data.get("payloads", [])
+            ]
 
     # ------------------------------------------------------------------
     # Scan execution

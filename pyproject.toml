@@ -16,3 +16,6 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+
+[project.scripts]
+agentparry-proxy = "src.proxy:main"
