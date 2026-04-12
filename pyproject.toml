@@ -11,3 +11,8 @@ dependencies = [
     "rich",
     "httpx",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
