@@ -11,3 +11,6 @@ dependencies = [
     "rich",
     "httpx",
 ]
+
+[project.scripts]
+agentparry-proxy = "src.proxy:main"

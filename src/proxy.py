@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
+import shlex
+import subprocess
+import sys
+import threading
 import uuid
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -27,6 +33,95 @@ input_inspector = InputInspector()
 output_inspector = OutputInspector()
 stats = ProxyStats()
 _bypass_all: bool = False
+
+_stdio_server: subprocess.Popen[bytes] | None = None
+_stdio_lock = threading.Lock()
+
+
+class UpstreamConfigurationError(Exception):
+    """Raised when AGENTPARRY_UPSTREAM_CMD and AGENTPARRY_UPSTREAM_URL are both set."""
+
+
+def _upstream_cmd() -> str:
+    return os.environ.get("AGENTPARRY_UPSTREAM_CMD", "").strip()
+
+
+def _upstream_url_env() -> str:
+    return os.environ.get("AGENTPARRY_UPSTREAM_URL", "").strip()
+
+
+def _upstream_config_conflict_message() -> str | None:
+    if _upstream_cmd() and _upstream_url_env():
+        return "Set only one of AGENTPARRY_UPSTREAM_CMD or AGENTPARRY_UPSTREAM_URL"
+    return None
+
+
+def _effective_http_mcp_url() -> str:
+    return _upstream_url_env() or MOCK_SERVER_URL
+
+
+def _health_probe_url(mcp_url: str) -> str | None:
+    if "/mcp" in mcp_url:
+        return mcp_url.replace("/mcp", "/health", 1)
+    parts = urlsplit(mcp_url)
+    if parts.scheme and parts.netloc:
+        return urlunsplit((parts.scheme, parts.netloc, "/health", "", ""))
+    return None
+
+
+def _drain_stderr(proc: subprocess.Popen[bytes]) -> None:
+    if proc.stderr is None:
+        return
+    try:
+        while proc.stderr.readline():
+            pass
+    except Exception:
+        pass
+
+
+def _ensure_stdio_server() -> subprocess.Popen[bytes]:
+    global _stdio_server
+    if _stdio_server is not None and _stdio_server.poll() is None:
+        return _stdio_server
+    _stdio_server = None
+    raw = os.environ["AGENTPARRY_UPSTREAM_CMD"].strip()
+    argv = shlex.split(raw, posix=(os.name != "nt"))
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    threading.Thread(target=_drain_stderr, args=(proc,), daemon=True).start()
+    _stdio_server = proc
+    return proc
+
+
+def _forward_via_stdio(payload: dict[str, Any]) -> dict[str, Any]:
+    line = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+    if "\n" in line or "\r" in line:
+        raise ValueError("JSON-RPC payload must not contain embedded newlines for stdio transport")
+    req_id = payload.get("id")
+    with _stdio_lock:
+        proc = _ensure_stdio_server()
+        if proc.stdin is None or proc.stdout is None:
+            raise RuntimeError("MCP stdio subprocess missing stdin/stdout")
+        proc.stdin.write(line.encode("utf-8") + b"\n")
+        proc.stdin.flush()
+        while True:
+            out = proc.stdout.readline()
+            if not out:
+                raise RuntimeError("EOF from MCP stdio server")
+            try:
+                msg: Any = json.loads(out.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if "id" not in msg:
+                continue
+            if msg.get("id") == req_id:
+                return msg
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -103,8 +198,14 @@ def _get_tool_payload(request: JsonRpcRequest) -> tuple[str | None, dict[str, An
 
 
 def _forward_to_upstream(payload: dict[str, Any]) -> dict[str, Any]:
+    conflict = _upstream_config_conflict_message()
+    if conflict:
+        raise UpstreamConfigurationError(conflict)
+    if _upstream_cmd():
+        return _forward_via_stdio(payload)
+    url = _effective_http_mcp_url()
     with httpx.Client(timeout=20.0) as client:
-        response = client.post(MOCK_SERVER_URL, json=payload)
+        response = client.post(url, json=payload)
         response.raise_for_status()
         return response.json()
 
@@ -190,14 +291,24 @@ def _handle_mcp_rpc(request: JsonRpcRequest) -> JsonRpcResponse:
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    if _upstream_config_conflict_message():
+        return {"status": "ok", "upstream": "misconfigured"}
+    if _upstream_cmd():
+        proc = _stdio_server
+        if proc is not None and proc.poll() is None:
+            return {"status": "ok", "upstream": "connected"}
+        return {"status": "ok", "upstream": "disconnected"}
+    mcp_url = _effective_http_mcp_url()
+    probe = _health_probe_url(mcp_url)
+    if probe is None:
+        return {"status": "ok", "upstream": "unknown"}
     try:
         with httpx.Client(timeout=2.0) as client:
-            response = client.get(MOCK_SERVER_URL.replace("/mcp", "/health"))
+            response = client.get(probe)
             response.raise_for_status()
-        upstream = "connected"
+        return {"status": "ok", "upstream": "connected"}
     except Exception:
-        upstream = "disconnected"
-    return {"status": "ok", "upstream": upstream}
+        return {"status": "ok", "upstream": "disconnected"}
 
 
 @app.get("/stats")
@@ -260,7 +371,10 @@ async def mcp_post(request: Request) -> Response:
     except ValidationError as exc:
         return JSONResponse({"detail": exc.errors()}, status_code=422)
 
-    rpc_resp = _handle_mcp_rpc(rpc_req)
+    try:
+        rpc_resp = _handle_mcp_rpc(rpc_req)
+    except UpstreamConfigurationError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=503)
     rpc_dict = rpc_resp.model_dump(mode="json")
     incoming = request.headers.get("mcp-session-id")
     extra_headers = _mcp_session_response_headers(rpc_method=rpc_req.method, incoming_session=incoming)
@@ -273,3 +387,37 @@ async def mcp_post(request: Request) -> Response:
         return Response(content=content, media_type="text/event-stream", headers=extra_headers)
 
     return JSONResponse(rpc_dict, headers=extra_headers)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AgentParry MCP security proxy")
+    parser.add_argument(
+        "--upstream-url",
+        default=None,
+        metavar="URL",
+        help="Forward JSON-RPC to this HTTP MCP endpoint (or set AGENTPARRY_UPSTREAM_URL)",
+    )
+    parser.add_argument(
+        "--upstream-command",
+        default=None,
+        metavar="CMD",
+        help="Run this command as stdio MCP server (or set AGENTPARRY_UPSTREAM_CMD)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
+    parser.add_argument("--port", type=int, default=9090, help="Bind port")
+    parser.add_argument("--log-level", default="info", help="Uvicorn log level")
+    args = parser.parse_args()
+    if args.upstream_url is not None:
+        os.environ["AGENTPARRY_UPSTREAM_URL"] = args.upstream_url.strip()
+    if args.upstream_command is not None:
+        os.environ["AGENTPARRY_UPSTREAM_CMD"] = args.upstream_command.strip()
+    if _upstream_config_conflict_message():
+        print(_upstream_config_conflict_message(), file=sys.stderr)
+        sys.exit(1)
+    import uvicorn
+
+    uvicorn.run("src.proxy:app", host=args.host, port=args.port, log_level=args.log_level)
+
+
+if __name__ == "__main__":
+    main()
