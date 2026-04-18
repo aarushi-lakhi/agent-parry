@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import signal
 import subprocess
 import sys
@@ -36,10 +37,8 @@ def _cleanup() -> None:
             proc.terminate()
             proc.wait(timeout=5)
         except Exception:
-            try:
+            with contextlib.suppress(Exception):
                 proc.kill()
-            except Exception:
-                pass
     _processes.clear()
 
 

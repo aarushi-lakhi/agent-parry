@@ -135,8 +135,8 @@ def build_dynamic_payloads(tools: list[dict[str, Any]]) -> list[AttackPayload]:
         props = _schema_string_props(schema)
 
         def fill_defaults(args: dict[str, Any]) -> dict[str, Any]:
-            for pname, _pspec in props:
-                if pname not in args and pname in req_set:
+            for pname, _pspec in props:  # noqa: B023
+                if pname not in args and pname in req_set:  # noqa: B023
                     args[pname] = "test"
             return args
 
@@ -578,7 +578,14 @@ class Scanner:
             ]
         )
         for r in sorted(report.results, key=lambda x: (not x.passed_through, x.payload.name)):
-            st = "BLOCKED" if r.was_blocked else "REDACTED" if r.was_redacted else "SAFE_OK" if r.evaluated_only else "VULNERABLE"
+            if r.was_blocked:
+                st = "BLOCKED"
+            elif r.was_redacted:
+                st = "REDACTED"
+            elif r.evaluated_only:
+                st = "SAFE_OK"
+            else:
+                st = "VULNERABLE"
             notes = _md_cell(r.notes)
             lines.append(
                 f"| {st} | {_md_cell(r.payload.severity)} | {_md_cell(r.payload.category)} | "

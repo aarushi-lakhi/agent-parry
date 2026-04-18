@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -225,7 +226,13 @@ class StdioMcpProxy:
         if not isinstance(msg, dict):
             return None
         if msg.get("jsonrpc") != "2.0":
-            self._log_line("client→server", msg.get("method") if isinstance(msg.get("method"), str) else None, "passthrough", "non-2.0 jsonrpc")
+            raw_method = msg.get("method")
+            self._log_line(
+                "client→server",
+                raw_method if isinstance(raw_method, str) else None,
+                "passthrough",
+                "non-2.0 jsonrpc",
+            )
             return msg
 
         method = msg.get("method")
@@ -511,10 +518,8 @@ async def _run_proxy(argv: list[str]) -> int:
                     break
         except Exception:
             logging.getLogger(__name__).exception("stdin reader thread crashed")
-            try:
+            with contextlib.suppress(Exception):
                 asyncio.run_coroutine_threadsafe(stdin_queue.put(None), loop).result()
-            except Exception:
-                pass
 
     threading.Thread(target=_stdin_reader_thread, name="agentparry-stdin", daemon=True).start()
 
@@ -550,10 +555,8 @@ async def _run_proxy(argv: list[str]) -> int:
                     logger.exception("Unexpected error writing to child stdin")
                     break
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 proc.stdin.close()
-            except Exception:
-                pass
 
     async def server_to_client() -> None:
         assert proc.stdout is not None
@@ -607,10 +610,8 @@ async def _run_proxy(argv: list[str]) -> int:
         await asyncio.wait_for(stderr_task, timeout=2.0)
     except TimeoutError:
         stderr_task.cancel()
-    try:
+    with contextlib.suppress(Exception):
         stderr_log_handle.close()
-    except Exception:
-        pass
 
     return 0 if code in (0, None) else 1
 
