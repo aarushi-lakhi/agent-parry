@@ -18,8 +18,6 @@ from src.policy import PolicyEngine
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
-# Injected into the stdin asyncio queue when the child stdout closes first, so the
-# client forwarding loop can exit without blocking forever on stdin.
 _PROXY_STOP_STDIN = object()
 
 
