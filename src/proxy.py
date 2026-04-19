@@ -166,7 +166,7 @@ def _compact_args(arguments: dict[str, Any]) -> str:
 
 def _print_log_line(line: str) -> None:
     try:
-        console.print(line)
+        console.print(line, markup=False, highlight=False)
     except UnicodeEncodeError:
         fallback = line.encode("ascii", errors="replace").decode("ascii")
         console.file.write(f"{fallback}\n")
