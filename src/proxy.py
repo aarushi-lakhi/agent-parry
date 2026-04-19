@@ -25,7 +25,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 from src.inspector import InputInspector, OutputInspector
-from src.models import MOCK_SERVER_URL, JsonRpcRequest, JsonRpcResponse, PolicyAction, ProxyStats
+from src.models import (
+    MOCK_SERVER_URL,
+    JsonRpcRequest,
+    JsonRpcResponse,
+    PolicyAction,
+    ProxyStats,
+    is_known_mcp_method,
+    is_tools_call,
+)
 from src.policy import PolicyEngine
 
 DEFAULT_POLICY_PATH = "config/default_policy.yaml"
@@ -272,17 +280,32 @@ def _safe_scan_truthy(value: str | None) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
-    if request.method in {"initialize", "tools/list"}:
-        upstream_payload = _forward_to_upstream(request.model_dump())
-        return JsonRpcResponse.model_validate(upstream_payload)
+def _validated_response(request_id: int | str, upstream_payload: dict[str, Any]) -> JsonRpcResponse:
+    """Validate an upstream response, surfacing a JSON-RPC error instead of a 500.
 
-    if request.method != "tools/call":
+    JsonRpcResponse requires an id, so an upstream that answers without one
+    would otherwise raise ValidationError out of the request handler.
+    """
+    try:
+        return JsonRpcResponse.model_validate(upstream_payload)
+    except ValidationError:
         return _jsonrpc_error(
-            request_id=request.id,
-            code=-32601,
-            message=f"Method not found: {request.method}",
+            request_id=request_id,
+            code=-32603,
+            message="Malformed response from upstream MCP server",
         )
+
+
+def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
+    if not is_tools_call(request.method):
+        if not is_known_mcp_method(request.method):
+            return _jsonrpc_error(
+                request_id=request.id,
+                code=-32601,
+                message=f"Method not found: {request.method}",
+            )
+        upstream_payload = _forward_to_upstream(request.model_dump())
+        return _validated_response(request.id, upstream_payload)
 
     stats.increment(total_requests=1)
     tool_name, arguments = _get_tool_payload(request)
@@ -334,7 +357,7 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     upstream_payload = _forward_to_upstream(request.model_dump())
     result_payload = upstream_payload.get("result")
     if not isinstance(result_payload, dict):
-        return JsonRpcResponse.model_validate(upstream_payload)
+        return _validated_response(request.id, upstream_payload)
 
     sanitized_result, pii_findings = output_inspector.inspect(tool_name, result_payload)
     if pii_findings:
@@ -342,7 +365,7 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
         _log_redact(tool_name, len(pii_findings))
         upstream_payload["result"] = sanitized_result
 
-    return JsonRpcResponse.model_validate(upstream_payload)
+    return _validated_response(request.id, upstream_payload)
 
 
 @app.get("/health")
