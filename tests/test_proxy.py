@@ -153,9 +153,11 @@ class TestProxy(unittest.TestCase):
     @patch("src.proxy.policy_engine.get_rules")
     def test_policy_endpoints_and_stats(self, mock_rules, mock_reload) -> None:
         mock_rules.return_value = [{"name": "demo"}]
+        admin = {"Authorization": "Bearer s3cret"}
 
-        reload_response = self.client.post("/policy/reload")
-        rules_response = self.client.get("/policy/rules")
+        with patch.dict(os.environ, {"AGENTPARRY_ADMIN_TOKEN": "s3cret"}, clear=False):
+            reload_response = self.client.post("/policy/reload", headers=admin)
+            rules_response = self.client.get("/policy/rules", headers=admin)
         stats_response = self.client.get("/stats")
 
         self.assertEqual(reload_response.status_code, 200)
@@ -211,7 +213,8 @@ class TestProxy(unittest.TestCase):
         self.assertEqual(follow.status_code, 200)
         self.assertEqual(follow.headers.get("mcp-session-id"), sid)
 
-    def test_options_mcp_cors(self) -> None:
+    def test_options_mcp_does_not_allow_any_origin(self) -> None:
+        # No origin is allowlisted by default, so no allow-origin header comes back.
         response = self.client.options(
             "/mcp",
             headers={
@@ -220,8 +223,66 @@ class TestProxy(unittest.TestCase):
                 "Access-Control-Request-Headers": "content-type, mcp-session-id",
             },
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers.get("access-control-allow-origin"), "*")
+        self.assertIsNone(response.headers.get("access-control-allow-origin"))
+
+    def test_cors_origins_default_empty(self) -> None:
+        self.assertEqual(proxy_module._cors_origins(""), [])
+
+    def test_cors_origins_parses_comma_separated(self) -> None:
+        parsed = proxy_module._cors_origins("http://a.test, http://b.test ,")
+        self.assertEqual(parsed, ["http://a.test", "http://b.test"])
+
+    def test_policy_reload_forbidden_when_no_admin_token(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("src.proxy.policy_engine.reload") as mock_reload,
+        ):
+            os.environ.pop("AGENTPARRY_ADMIN_TOKEN", None)
+            response = self.client.post("/policy/reload")
+        self.assertEqual(response.status_code, 403)
+        mock_reload.assert_not_called()
+
+    def test_policy_reload_rejects_wrong_token(self) -> None:
+        with (
+            patch.dict(os.environ, {"AGENTPARRY_ADMIN_TOKEN": "right"}, clear=False),
+            patch("src.proxy.policy_engine.reload") as mock_reload,
+        ):
+            response = self.client.post("/policy/reload", headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(response.status_code, 401)
+        mock_reload.assert_not_called()
+
+    def test_policy_rules_requires_admin_token(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENTPARRY_ADMIN_TOKEN", None)
+            response = self.client.get("/policy/rules")
+        self.assertEqual(response.status_code, 403)
+
+    def test_policy_route_refuses_cross_origin_request(self) -> None:
+        with patch.dict(os.environ, {"AGENTPARRY_ADMIN_TOKEN": "right"}, clear=False):
+            response = self.client.post(
+                "/policy/reload",
+                headers={"Authorization": "Bearer right", "Origin": "http://evil.test"},
+            )
+        self.assertEqual(response.status_code, 403)
+
+    def test_policy_bypass_routes_are_gone(self) -> None:
+        self.assertEqual(self.client.post("/policy/disable").status_code, 404)
+        self.assertEqual(self.client.post("/policy/enable").status_code, 404)
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_enforcement_still_on_after_rejected_disable(self, mock_forward) -> None:
+        self.assertEqual(self.client.post("/policy/disable").status_code, 404)
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {"name": "shell_exec", "arguments": {"command": "rm -rf /"}},
+            },
+        )
+        self.assertEqual(response.json()["error"]["code"], -32001)
+        mock_forward.assert_not_called()
 
     def test_delete_mcp(self) -> None:
         response = self.client.delete("/mcp")
