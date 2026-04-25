@@ -24,9 +24,14 @@ from rich.console import Console
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
+from src import audit
 from src.inspector import InputInspector, OutputInspector
 from src.models import (
     MOCK_SERVER_URL,
+    AuditAction,
+    AuditDirection,
+    AuditRecord,
+    Finding,
     JsonRpcRequest,
     JsonRpcResponse,
     PolicyAction,
@@ -210,10 +215,6 @@ def _jsonrpc_error(*, request_id: int | str, code: int, message: str, data: Any 
     )
 
 
-def _compact_args(arguments: dict[str, Any]) -> str:
-    return json.dumps(arguments, separators=(", ", ": "), ensure_ascii=True)
-
-
 def _print_log_line(line: str) -> None:
     try:
         console.print(line, markup=False, highlight=False)
@@ -222,24 +223,45 @@ def _print_log_line(line: str) -> None:
         console.file.write(f"{fallback}\n")
 
 
-def _log_allow(tool_name: str, arguments: dict[str, Any]) -> None:
-    _print_log_line(f"[ALLOW]   {tool_name:<10} {_compact_args(arguments)}")
+def _record(
+    action: AuditAction,
+    *,
+    direction: AuditDirection = AuditDirection.CLIENT_TO_SERVER,
+    method: str | None = None,
+    tool: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    rule: str | None = None,
+    request_id: Any = None,
+    session_id: str | None = None,
+    findings: list[Finding] | None = None,
+    pii_redactions: int | None = None,
+    detail: str = "",
+) -> AuditRecord:
+    """Audit one already-computed decision and print the derived console line.
 
-
-def _log_block(tool_name: str, arguments: dict[str, Any], reason: str) -> None:
-    _print_log_line(f"[BLOCK]   {tool_name:<10} {_compact_args(arguments)}  <- {reason}")
-
-
-def _log_approve(tool_name: str, arguments: dict[str, Any], reason: str) -> None:
-    _print_log_line(f"[APPROVE] {tool_name:<10} {_compact_args(arguments)}  <- {reason}")
-
-
-def _log_redact(tool_name: str, count: int) -> None:
-    _print_log_line(f"[REDACT]  {tool_name:<10} ({count} PII items redacted)")
-
-
-def _log_inject(tool_name: str) -> None:
-    _print_log_line(f"[INJECT]  {tool_name:<10} prompt injection detected (critical)")
+    The single logging path for this module. The five `_log_*` helpers it
+    replaced were one of the two independent formatting paths whose divergence
+    the audit log exists to fix; a third would recreate it.
+    """
+    writer = audit.get_writer()
+    record = writer.build(
+        action=action,
+        direction=direction,
+        method=method,
+        tool=tool,
+        rule=rule,
+        request_id=request_id,
+        session_id=session_id,
+        arguments=arguments,
+        findings=findings,
+        pii_redactions=pii_redactions,
+        detail=detail,
+    )
+    writer.write(record)
+    line = audit.format_console_line(record, arguments=arguments)
+    if line is not None:
+        _print_log_line(line)
+    return record
 
 
 def _get_tool_payload(request: JsonRpcRequest) -> tuple[str | None, dict[str, Any] | None]:
@@ -266,11 +288,22 @@ def _forward_to_upstream(payload: dict[str, Any]) -> dict[str, Any]:
         return response.json()
 
 
-def _mcp_session_response_headers(*, rpc_method: str, incoming_session: str | None) -> dict[str, str]:
+def _resolve_session_id(*, rpc_method: str, incoming_session: str | None) -> str | None:
+    """Resolve the session id before dispatch so audit records can carry it.
+
+    initialize mints its id here rather than in the response-header helper,
+    which is the only way the record and the Mcp-Session-Id header can agree.
+    """
     if rpc_method == "initialize":
-        return {"Mcp-Session-Id": str(uuid.uuid4())}
-    if incoming_session:
-        return {"Mcp-Session-Id": incoming_session}
+        return str(uuid.uuid4())
+    return incoming_session
+
+
+def _mcp_session_response_headers(*, rpc_method: str, session_id: str | None) -> dict[str, str]:
+    if rpc_method == "initialize":
+        return {"Mcp-Session-Id": session_id or str(uuid.uuid4())}
+    if session_id:
+        return {"Mcp-Session-Id": session_id}
     return {}
 
 
@@ -296,26 +329,40 @@ def _validated_response(request_id: int | str, upstream_payload: dict[str, Any])
         )
 
 
-def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
+def _handle_mcp_rpc(
+    request: JsonRpcRequest,
+    *,
+    safe_scan: bool = False,
+    session_id: str | None = None,
+) -> JsonRpcResponse:
+    audit_ctx: dict[str, Any] = {
+        "method": request.method,
+        "request_id": request.id,
+        "session_id": session_id,
+    }
     if not is_tools_call(request.method):
         if not is_known_mcp_method(request.method):
+            _record(AuditAction.METHOD_NOT_FOUND, detail="method not in the MCP allowlist", **audit_ctx)
             return _jsonrpc_error(
                 request_id=request.id,
                 code=-32601,
                 message=f"Method not found: {request.method}",
             )
+        _record(AuditAction.PASSTHROUGH, detail="known MCP method forwarded without tool inspection", **audit_ctx)
         upstream_payload = _forward_to_upstream(request.model_dump())
         return _validated_response(request.id, upstream_payload)
 
     stats.increment(total_requests=1)
     tool_name, arguments = _get_tool_payload(request)
     if tool_name is None:
+        _record(AuditAction.INVALID_PARAMS, detail="'name' must be a string", **audit_ctx)
         return _jsonrpc_error(
             request_id=request.id,
             code=-32602,
             message="Invalid params: 'name' must be a string.",
         )
     if arguments is None:
+        _record(AuditAction.INVALID_PARAMS, tool=tool_name, detail="'arguments' must be an object", **audit_ctx)
         return _jsonrpc_error(
             request_id=request.id,
             code=-32602,
@@ -325,7 +372,14 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     injection_findings = input_inspector.inspect(tool_name, arguments)
     if any(finding.severity == "critical" for finding in injection_findings):
         stats.increment(blocked=1)
-        _log_inject(tool_name)
+        _record(
+            AuditAction.BLOCK_INJECTION,
+            tool=tool_name,
+            arguments=arguments,
+            findings=injection_findings,
+            detail="critical prompt injection pattern",
+            **audit_ctx,
+        )
         return _jsonrpc_error(
             request_id=request.id,
             code=-32001,
@@ -335,18 +389,43 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     decision = policy_engine.evaluate(tool_name, arguments)
     if decision.action == PolicyAction.BLOCK:
         stats.increment(blocked=1)
-        _log_block(tool_name, arguments, decision.rule_name or "policy_block")
+        _record(
+            AuditAction.BLOCK_POLICY,
+            tool=tool_name,
+            arguments=arguments,
+            rule=decision.rule_name or "policy_block",
+            findings=injection_findings,
+            detail=decision.message,
+            **audit_ctx,
+        )
         return _jsonrpc_error(
             request_id=request.id,
             code=-32001,
             message=decision.message or "Blocked by policy",
         )
 
+    forwarding = "policy evaluated only (safe scan)" if safe_scan else "forwarded upstream"
     if decision.action == PolicyAction.REQUIRE_APPROVAL:
         stats.increment(flagged_for_approval=1, approved=1)
-        _log_approve(tool_name, arguments, decision.rule_name or "requires_approval")
+        _record(
+            AuditAction.REQUIRE_APPROVAL,
+            tool=tool_name,
+            arguments=arguments,
+            rule=decision.rule_name or "requires_approval",
+            findings=injection_findings,
+            detail=f"policy asked REQUIRE_APPROVAL; auto-approved and {forwarding}",
+            **audit_ctx,
+        )
     else:
-        _log_allow(tool_name, arguments)
+        _record(
+            AuditAction.ALLOW,
+            tool=tool_name,
+            arguments=arguments,
+            rule=decision.rule_name,
+            findings=injection_findings,
+            detail=f"policy {decision.action.value}; {forwarding}",
+            **audit_ctx,
+        )
 
     if safe_scan:
         return JsonRpcResponse(
@@ -362,7 +441,15 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     sanitized_result, pii_findings = output_inspector.inspect(tool_name, result_payload)
     if pii_findings:
         stats.increment(redacted=1)
-        _log_redact(tool_name, len(pii_findings))
+        _record(
+            AuditAction.REDACT_OUTPUT,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            tool=tool_name,
+            findings=pii_findings,
+            pii_redactions=len(pii_findings),
+            detail="PII redacted from tool result",
+            **audit_ctx,
+        )
         upstream_payload["result"] = sanitized_result
 
     return _validated_response(request.id, upstream_payload)
@@ -449,13 +536,14 @@ async def mcp_post(request: Request) -> Response:
 
     safe_hdr = request.headers.get("agentparry-safe-scan") or request.headers.get("AgentParry-Safe-Scan")
     safe_scan = _safe_scan_truthy(safe_hdr)
+    incoming = request.headers.get("mcp-session-id")
+    session_id = _resolve_session_id(rpc_method=rpc_req.method, incoming_session=incoming)
     try:
-        rpc_resp = _handle_mcp_rpc(rpc_req, safe_scan=safe_scan)
+        rpc_resp = _handle_mcp_rpc(rpc_req, safe_scan=safe_scan, session_id=session_id)
     except UpstreamConfigurationError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=503)
     rpc_dict = rpc_resp.model_dump(mode="json")
-    incoming = request.headers.get("mcp-session-id")
-    extra_headers = _mcp_session_response_headers(rpc_method=rpc_req.method, incoming_session=incoming)
+    extra_headers = _mcp_session_response_headers(rpc_method=rpc_req.method, session_id=session_id)
     accept = (request.headers.get("accept") or "").lower()
     wants_sse = "text/event-stream" in accept
 
