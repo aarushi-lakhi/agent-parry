@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import os
+import secrets
 import signal
 import subprocess
 import sys
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 import httpx
 from rich.console import Console
@@ -27,8 +29,15 @@ MOCK_SERVER_PORT = 8080
 PROXY_BASE = f"http://127.0.0.1:{PROXY_PORT}"
 MOCK_SERVER_BASE = f"http://127.0.0.1:{MOCK_SERVER_PORT}"
 MCP_URL = f"http://127.0.0.1:{PROXY_PORT}/mcp"
+MOCK_MCP_URL = f"http://127.0.0.1:{MOCK_SERVER_PORT}/mcp"
+
+ADMIN_TOKEN = secrets.token_urlsafe(32)
 
 _processes: list[subprocess.Popen[bytes]] = []
+
+
+def _admin_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _cleanup() -> None:
@@ -37,10 +46,8 @@ def _cleanup() -> None:
             proc.terminate()
             proc.wait(timeout=5)
         except Exception:
-            try:
+            with contextlib.suppress(Exception):
                 proc.kill()
-            except Exception:
-                pass
     _processes.clear()
 
 
@@ -95,8 +102,6 @@ async def phase1_unprotected(fast: bool) -> None:
     )
 
     async with httpx.AsyncClient() as client:
-        await client.post(f"{PROXY_BASE}/policy/disable")
-
         attacks = [
             (
                 "shell_exec",
@@ -120,7 +125,7 @@ async def phase1_unprotected(fast: bool) -> None:
         ]
 
         for idx, (tool, args, label) in enumerate(attacks, start=1):
-            result = await _send_tool_call(client, MCP_URL, tool, args, idx)
+            result = await _send_tool_call(client, MOCK_MCP_URL, tool, args, idx)
             was_blocked = result.get("error") is not None
             if was_blocked:
                 console.print(f"  [green]\u2713[/green]  {label} \u2192 BLOCKED")
@@ -156,8 +161,7 @@ async def phase2_scan(fast: bool) -> tuple[Scanner, ScanReport]:
     gen.apply_rules([], policy_path="config/default_policy.yaml")
 
     async with httpx.AsyncClient() as client:
-        await client.post(f"{PROXY_BASE}/policy/enable")
-        await client.post(f"{PROXY_BASE}/policy/reload")
+        await client.post(f"{PROXY_BASE}/policy/reload", headers=_admin_headers())
 
     scanner = Scanner()
 
@@ -201,7 +205,7 @@ async def phase3_fix(report: ScanReport, fast: bool) -> None:
         console.print()
 
         async with httpx.AsyncClient() as client:
-            await client.post(f"{PROXY_BASE}/policy/reload")
+            await client.post(f"{PROXY_BASE}/policy/reload", headers=_admin_headers())
 
         console.print(
             f"[green]\u2705 Generated {len(rules)} new security rules[/green]"
@@ -276,6 +280,7 @@ async def main(fast: bool = False) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=cwd,
+            env={**os.environ, "AGENTPARRY_ADMIN_TOKEN": ADMIN_TOKEN},
         )
         _processes.append(proxy_proc)
 

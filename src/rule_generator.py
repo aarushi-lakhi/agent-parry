@@ -50,9 +50,6 @@ class RuleGenerator:
                 rules.append(rule)
         return rules
 
-    # ------------------------------------------------------------------
-    # Policy YAML management
-    # ------------------------------------------------------------------
 
     def apply_rules(
         self,
@@ -74,9 +71,6 @@ class RuleGenerator:
             desc = r.get("description", "")
             console.print(f"  [green]+[/green] {r['name']}: {desc}")
 
-    # ------------------------------------------------------------------
-    # Display
-    # ------------------------------------------------------------------
 
     def print_rules(self, rules: list[dict[str, Any]]) -> None:
         table = Table(title="Generated Rules", show_lines=True)
@@ -97,9 +91,6 @@ class RuleGenerator:
         console.print(table)
         console.print()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _rule_for_result(self, result: AttackResult) -> dict[str, Any] | None:
         payload = result.payload

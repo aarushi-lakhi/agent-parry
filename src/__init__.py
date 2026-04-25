@@ -1,1 +1,1 @@
-"""AgentParry – security toolkit for autonomous AI agents."""
+"""AgentParry - security toolkit for autonomous AI agents."""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
-from typing import Any
+from typing import Any, ClassVar
 
 from src.models import Finding
 
@@ -89,14 +89,14 @@ class InputInspector:
 class OutputInspector:
     """Detect and redact PII from nested JSON-like tool response payloads."""
 
-    _DEFAULT_PATTERNS: dict[str, str] = {
+    _DEFAULT_PATTERNS: ClassVar[dict[str, str]] = {
         "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
         "credit_card": r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b",
         "api_key": r"\b(sk-|pk_|sk_live_|sk_test_)\S{20,}\b",
         "aws_key": r"\bAKIA[0-9A-Z]{16}\b",
         "password_in_url": r"://[^:]+:[^@]+@",
     }
-    _REDACTION_LABELS: dict[str, str] = {
+    _REDACTION_LABELS: ClassVar[dict[str, str]] = {
         "ssn": "SSN",
         "credit_card": "CC",
         "api_key": "API_KEY",

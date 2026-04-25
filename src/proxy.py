@@ -6,33 +6,55 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
 import threading
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from rich.console import Console
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
+from src import audit
 from src.inspector import InputInspector, OutputInspector
-from src.models import MOCK_SERVER_URL, JsonRpcRequest, JsonRpcResponse, PolicyAction, ProxyStats
+from src.models import (
+    MOCK_SERVER_URL,
+    AuditAction,
+    AuditDirection,
+    AuditRecord,
+    Finding,
+    JsonRpcRequest,
+    JsonRpcResponse,
+    PolicyAction,
+    ProxyStats,
+    is_known_mcp_method,
+    is_tools_call,
+)
 from src.policy import PolicyEngine
+
+DEFAULT_POLICY_PATH = "config/default_policy.yaml"
+
+
+def _policy_path() -> str:
+    """Resolve the policy file, matching the stdio proxy's precedence."""
+    return os.environ.get("AGENTPARRY_POLICY", "").strip() or DEFAULT_POLICY_PATH
+
 
 app = FastAPI(title="AgentParry Proxy", version="1.0")
 console = Console()
-policy_engine = PolicyEngine()
+policy_engine = PolicyEngine(policy_path=_policy_path())
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
 stats = ProxyStats()
-_bypass_all: bool = False
 
 _stdio_server: subprocess.Popen[bytes] | None = None
 _stdio_lock = threading.Lock()
@@ -124,12 +146,45 @@ def _forward_via_stdio(payload: dict[str, Any]) -> dict[str, Any]:
                 return msg
 
 
+def _cors_origins(raw: str | None = None) -> list[str]:
+    """Parse AGENTPARRY_CORS_ORIGINS into an explicit origin allowlist."""
+    source = os.environ.get("AGENTPARRY_CORS_ORIGINS", "") if raw is None else raw
+    return [origin.strip() for origin in source.split(",") if origin.strip()]
+
+
+def _admin_token() -> str:
+    return os.environ.get("AGENTPARRY_ADMIN_TOKEN", "").strip()
+
+
+def _bearer_token(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    return auth.removeprefix("Bearer ").strip()
+
+
+def require_admin(request: Request) -> None:
+    """Gate the /policy control plane. Fails closed when no admin token is set."""
+    expected = _admin_token()
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail="AGENTPARRY_ADMIN_TOKEN is not set; the /policy control plane is disabled",
+        )
+    origin = request.headers.get("origin")
+    if origin and origin not in _cors_origins():
+        raise HTTPException(status_code=403, detail="Cross-origin policy request refused")
+    presented = _bearer_token(request)
+    if presented is None or not secrets.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
         expected = os.environ.get("AGENTPARRY_AUTH_TOKEN", "").strip()
         if expected and request.method != "OPTIONS":
-            auth = request.headers.get("authorization", "")
-            if not auth.startswith("Bearer ") or auth.removeprefix("Bearer ").strip() != expected:
+            presented = _bearer_token(request)
+            if presented is None or not secrets.compare_digest(presented, expected):
                 return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
@@ -137,7 +192,7 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(_BearerAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=[
         "Content-Type",
@@ -160,36 +215,53 @@ def _jsonrpc_error(*, request_id: int | str, code: int, message: str, data: Any 
     )
 
 
-def _compact_args(arguments: dict[str, Any]) -> str:
-    return json.dumps(arguments, separators=(", ", ": "), ensure_ascii=True)
-
-
 def _print_log_line(line: str) -> None:
     try:
-        console.print(line)
+        console.print(line, markup=False, highlight=False)
     except UnicodeEncodeError:
         fallback = line.encode("ascii", errors="replace").decode("ascii")
         console.file.write(f"{fallback}\n")
 
 
-def _log_allow(tool_name: str, arguments: dict[str, Any]) -> None:
-    _print_log_line(f"[ALLOW]   {tool_name:<10} {_compact_args(arguments)}")
+def _record(
+    action: AuditAction,
+    *,
+    direction: AuditDirection = AuditDirection.CLIENT_TO_SERVER,
+    method: str | None = None,
+    tool: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    rule: str | None = None,
+    request_id: Any = None,
+    session_id: str | None = None,
+    findings: list[Finding] | None = None,
+    pii_redactions: int | None = None,
+    detail: str = "",
+) -> AuditRecord:
+    """Audit one already-computed decision and print the derived console line.
 
-
-def _log_block(tool_name: str, arguments: dict[str, Any], reason: str) -> None:
-    _print_log_line(f"[BLOCK]   {tool_name:<10} {_compact_args(arguments)}  <- {reason}")
-
-
-def _log_approve(tool_name: str, arguments: dict[str, Any], reason: str) -> None:
-    _print_log_line(f"[APPROVE] {tool_name:<10} {_compact_args(arguments)}  <- {reason}")
-
-
-def _log_redact(tool_name: str, count: int) -> None:
-    _print_log_line(f"[REDACT]  {tool_name:<10} ({count} PII items redacted)")
-
-
-def _log_inject(tool_name: str) -> None:
-    _print_log_line(f"[INJECT]  {tool_name:<10} prompt injection detected (critical)")
+    The single logging path for this module. The five `_log_*` helpers it
+    replaced were one of the two independent formatting paths whose divergence
+    the audit log exists to fix; a third would recreate it.
+    """
+    writer = audit.get_writer()
+    record = writer.build(
+        action=action,
+        direction=direction,
+        method=method,
+        tool=tool,
+        rule=rule,
+        request_id=request_id,
+        session_id=session_id,
+        arguments=arguments,
+        findings=findings,
+        pii_redactions=pii_redactions,
+        detail=detail,
+    )
+    writer.write(record)
+    line = audit.format_console_line(record, arguments=arguments)
+    if line is not None:
+        _print_log_line(line)
+    return record
 
 
 def _get_tool_payload(request: JsonRpcRequest) -> tuple[str | None, dict[str, Any] | None]:
@@ -216,11 +288,22 @@ def _forward_to_upstream(payload: dict[str, Any]) -> dict[str, Any]:
         return response.json()
 
 
-def _mcp_session_response_headers(*, rpc_method: str, incoming_session: str | None) -> dict[str, str]:
+def _resolve_session_id(*, rpc_method: str, incoming_session: str | None) -> str | None:
+    """Resolve the session id before dispatch so audit records can carry it.
+
+    initialize mints its id here rather than in the response-header helper,
+    which is the only way the record and the Mcp-Session-Id header can agree.
+    """
     if rpc_method == "initialize":
-        return {"Mcp-Session-Id": str(uuid.uuid4())}
-    if incoming_session:
-        return {"Mcp-Session-Id": incoming_session}
+        return str(uuid.uuid4())
+    return incoming_session
+
+
+def _mcp_session_response_headers(*, rpc_method: str, session_id: str | None) -> dict[str, str]:
+    if rpc_method == "initialize":
+        return {"Mcp-Session-Id": session_id or str(uuid.uuid4())}
+    if session_id:
+        return {"Mcp-Session-Id": session_id}
     return {}
 
 
@@ -230,31 +313,56 @@ def _safe_scan_truthy(value: str | None) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
-    if request.method in {"initialize", "tools/list"}:
-        upstream_payload = _forward_to_upstream(request.model_dump())
-        return JsonRpcResponse.model_validate(upstream_payload)
+def _validated_response(request_id: int | str, upstream_payload: dict[str, Any]) -> JsonRpcResponse:
+    """Validate an upstream response, surfacing a JSON-RPC error instead of a 500.
 
-    if request.method != "tools/call":
+    JsonRpcResponse requires an id, so an upstream that answers without one
+    would otherwise raise ValidationError out of the request handler.
+    """
+    try:
+        return JsonRpcResponse.model_validate(upstream_payload)
+    except ValidationError:
         return _jsonrpc_error(
-            request_id=request.id,
-            code=-32601,
-            message=f"Method not found: {request.method}",
+            request_id=request_id,
+            code=-32603,
+            message="Malformed response from upstream MCP server",
         )
 
-    if _bypass_all and not safe_scan:
+
+def _handle_mcp_rpc(
+    request: JsonRpcRequest,
+    *,
+    safe_scan: bool = False,
+    session_id: str | None = None,
+) -> JsonRpcResponse:
+    audit_ctx: dict[str, Any] = {
+        "method": request.method,
+        "request_id": request.id,
+        "session_id": session_id,
+    }
+    if not is_tools_call(request.method):
+        if not is_known_mcp_method(request.method):
+            _record(AuditAction.METHOD_NOT_FOUND, detail="method not in the MCP allowlist", **audit_ctx)
+            return _jsonrpc_error(
+                request_id=request.id,
+                code=-32601,
+                message=f"Method not found: {request.method}",
+            )
+        _record(AuditAction.PASSTHROUGH, detail="known MCP method forwarded without tool inspection", **audit_ctx)
         upstream_payload = _forward_to_upstream(request.model_dump())
-        return JsonRpcResponse.model_validate(upstream_payload)
+        return _validated_response(request.id, upstream_payload)
 
     stats.increment(total_requests=1)
     tool_name, arguments = _get_tool_payload(request)
     if tool_name is None:
+        _record(AuditAction.INVALID_PARAMS, detail="'name' must be a string", **audit_ctx)
         return _jsonrpc_error(
             request_id=request.id,
             code=-32602,
             message="Invalid params: 'name' must be a string.",
         )
     if arguments is None:
+        _record(AuditAction.INVALID_PARAMS, tool=tool_name, detail="'arguments' must be an object", **audit_ctx)
         return _jsonrpc_error(
             request_id=request.id,
             code=-32602,
@@ -264,7 +372,14 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     injection_findings = input_inspector.inspect(tool_name, arguments)
     if any(finding.severity == "critical" for finding in injection_findings):
         stats.increment(blocked=1)
-        _log_inject(tool_name)
+        _record(
+            AuditAction.BLOCK_INJECTION,
+            tool=tool_name,
+            arguments=arguments,
+            findings=injection_findings,
+            detail="critical prompt injection pattern",
+            **audit_ctx,
+        )
         return _jsonrpc_error(
             request_id=request.id,
             code=-32001,
@@ -274,18 +389,43 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     decision = policy_engine.evaluate(tool_name, arguments)
     if decision.action == PolicyAction.BLOCK:
         stats.increment(blocked=1)
-        _log_block(tool_name, arguments, decision.rule_name or "policy_block")
+        _record(
+            AuditAction.BLOCK_POLICY,
+            tool=tool_name,
+            arguments=arguments,
+            rule=decision.rule_name or "policy_block",
+            findings=injection_findings,
+            detail=decision.message,
+            **audit_ctx,
+        )
         return _jsonrpc_error(
             request_id=request.id,
             code=-32001,
             message=decision.message or "Blocked by policy",
         )
 
+    forwarding = "policy evaluated only (safe scan)" if safe_scan else "forwarded upstream"
     if decision.action == PolicyAction.REQUIRE_APPROVAL:
         stats.increment(flagged_for_approval=1, approved=1)
-        _log_approve(tool_name, arguments, decision.rule_name or "requires_approval")
+        _record(
+            AuditAction.REQUIRE_APPROVAL,
+            tool=tool_name,
+            arguments=arguments,
+            rule=decision.rule_name or "requires_approval",
+            findings=injection_findings,
+            detail=f"policy asked REQUIRE_APPROVAL; auto-approved and {forwarding}",
+            **audit_ctx,
+        )
     else:
-        _log_allow(tool_name, arguments)
+        _record(
+            AuditAction.ALLOW,
+            tool=tool_name,
+            arguments=arguments,
+            rule=decision.rule_name,
+            findings=injection_findings,
+            detail=f"policy {decision.action.value}; {forwarding}",
+            **audit_ctx,
+        )
 
     if safe_scan:
         return JsonRpcResponse(
@@ -296,15 +436,23 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     upstream_payload = _forward_to_upstream(request.model_dump())
     result_payload = upstream_payload.get("result")
     if not isinstance(result_payload, dict):
-        return JsonRpcResponse.model_validate(upstream_payload)
+        return _validated_response(request.id, upstream_payload)
 
     sanitized_result, pii_findings = output_inspector.inspect(tool_name, result_payload)
     if pii_findings:
         stats.increment(redacted=1)
-        _log_redact(tool_name, len(pii_findings))
+        _record(
+            AuditAction.REDACT_OUTPUT,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            tool=tool_name,
+            findings=pii_findings,
+            pii_redactions=len(pii_findings),
+            detail="PII redacted from tool result",
+            **audit_ctx,
+        )
         upstream_payload["result"] = sanitized_result
 
-    return JsonRpcResponse.model_validate(upstream_payload)
+    return _validated_response(request.id, upstream_payload)
 
 
 @app.get("/health")
@@ -334,27 +482,24 @@ def get_stats() -> dict[str, int]:
     return stats.model_dump()
 
 
-@app.post("/policy/disable")
-def disable_policy() -> dict[str, str]:
-    global _bypass_all
-    _bypass_all = True
-    return {"status": "ok", "policy": "disabled"}
+def set_policy_path(path: str) -> None:
+    """Repoint the live policy engine and reload it.
+
+    The engine is built at import time, so main() has to call this after
+    parsing --policy; setting the env var alone would come too late.
+    """
+    os.environ["AGENTPARRY_POLICY"] = path
+    policy_engine.policy_path = Path(path)
+    policy_engine.reload()
 
 
-@app.post("/policy/enable")
-def enable_policy() -> dict[str, str]:
-    global _bypass_all
-    _bypass_all = False
-    return {"status": "ok", "policy": "enabled"}
-
-
-@app.post("/policy/reload")
+@app.post("/policy/reload", dependencies=[Depends(require_admin)])
 def reload_policy() -> dict[str, Any]:
     policy_engine.reload()
     return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
 
 
-@app.get("/policy/rules")
+@app.get("/policy/rules", dependencies=[Depends(require_admin)])
 def list_rules() -> dict[str, Any]:
     return {"rules": policy_engine.get_rules()}
 
@@ -391,13 +536,14 @@ async def mcp_post(request: Request) -> Response:
 
     safe_hdr = request.headers.get("agentparry-safe-scan") or request.headers.get("AgentParry-Safe-Scan")
     safe_scan = _safe_scan_truthy(safe_hdr)
+    incoming = request.headers.get("mcp-session-id")
+    session_id = _resolve_session_id(rpc_method=rpc_req.method, incoming_session=incoming)
     try:
-        rpc_resp = _handle_mcp_rpc(rpc_req, safe_scan=safe_scan)
+        rpc_resp = _handle_mcp_rpc(rpc_req, safe_scan=safe_scan, session_id=session_id)
     except UpstreamConfigurationError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=503)
     rpc_dict = rpc_resp.model_dump(mode="json")
-    incoming = request.headers.get("mcp-session-id")
-    extra_headers = _mcp_session_response_headers(rpc_method=rpc_req.method, incoming_session=incoming)
+    extra_headers = _mcp_session_response_headers(rpc_method=rpc_req.method, session_id=session_id)
     accept = (request.headers.get("accept") or "").lower()
     wants_sse = "text/event-stream" in accept
 
@@ -423,6 +569,12 @@ def main() -> None:
         metavar="CMD",
         help="Run this command as stdio MCP server (or set AGENTPARRY_UPSTREAM_CMD)",
     )
+    parser.add_argument(
+        "--policy",
+        default=None,
+        metavar="PATH",
+        help=f"Policy YAML (default: {DEFAULT_POLICY_PATH}, or AGENTPARRY_POLICY)",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--port", type=int, default=9090, help="Bind port")
     parser.add_argument("--log-level", default="info", help="Uvicorn log level")
@@ -434,6 +586,12 @@ def main() -> None:
     if _upstream_config_conflict_message():
         print(_upstream_config_conflict_message(), file=sys.stderr)
         sys.exit(1)
+    if args.policy is not None:
+        policy_file = Path(args.policy).expanduser()
+        if not policy_file.exists():
+            print(f"error: policy file not found: {policy_file}", file=sys.stderr)
+            sys.exit(1)
+        set_policy_path(str(policy_file))
     import uvicorn
 
     uvicorn.run("src.proxy:app", host=args.host, port=args.port, log_level=args.log_level)
