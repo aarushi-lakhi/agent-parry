@@ -172,6 +172,217 @@ def test_install_openclaw_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     }
 
 
+def _install_claude_args(server_name: str, policy: Path, command: str | None = None) -> object:
+    argv = ["install-claude", "--server-name", server_name, "--policy", str(policy)]
+    if command is not None:
+        argv.extend(["--command", command])
+    return cli._build_parser().parse_args(argv)
+
+
+def test_install_claude_wraps_existing_unwrapped_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "claude_desktop_config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "fs": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"],
+                        "env": {"TOKEN": "abc"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    pol = tmp_path / "pol.yaml"
+    pol.write_text("x: 1\n", encoding="utf-8")
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    assert entry["command"] == "/fake/python"
+    assert entry["args"] == [
+        "-m",
+        "src.stdio_proxy",
+        "--policy",
+        str(pol.resolve()),
+        "--wrap",
+        "npx",
+        "--",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/data",
+    ]
+    assert entry["env"] == {"TOKEN": "abc", "AGENTPARRY_POLICY": str(pol.resolve())}
+
+
+def test_install_claude_rerun_does_not_nest_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "claude_desktop_config.json"
+    cfg.write_text(
+        json.dumps({"mcpServers": {"fs": {"command": "npx", "args": ["-y", "srv"]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    first = tmp_path / "first.yaml"
+    first.write_text("x: 1\n", encoding="utf-8")
+    second = tmp_path / "second.yaml"
+    second.write_text("x: 2\n", encoding="utf-8")
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude(_install_claude_args("fs", first)) == 0
+        after_first = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+        # Re-run with a different --policy: retargets in place, no second proxy.
+        assert cli.cmd_install_claude(_install_claude_args("fs", second)) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    assert entry["args"].count("src.stdio_proxy") == 1
+    assert entry["args"].count("--wrap") == 1
+    assert entry["args"] == [
+        "-m",
+        "src.stdio_proxy",
+        "--policy",
+        str(second.resolve()),
+        "--wrap",
+        "npx",
+        "--",
+        "-y",
+        "srv",
+    ]
+    assert entry["env"]["AGENTPARRY_POLICY"] == str(second.resolve())
+    # Only the policy moved; the wrapped child command is untouched.
+    assert entry["args"][4:] == after_first["args"][4:]
+
+
+def test_install_claude_rerun_with_same_policy_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "claude_desktop_config.json"
+    cfg.write_text(
+        json.dumps({"mcpServers": {"fs": {"command": "npx", "args": ["srv"]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    pol = tmp_path / "pol.yaml"
+    pol.write_text("x: 1\n", encoding="utf-8")
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+        once = cfg.read_text(encoding="utf-8")
+        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+        twice = cfg.read_text(encoding="utf-8")
+
+    assert once == twice
+
+
+def test_install_claude_preserves_timeout_and_always_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "claude_desktop_config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "fs": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": ["srv"],
+                        "timeout": 60000,
+                        "alwaysLoad": True,
+                        "somethingElse": {"nested": 1},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    pol = tmp_path / "pol.yaml"
+    pol.write_text("x: 1\n", encoding="utf-8")
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    assert entry["timeout"] == 60000
+    assert entry["alwaysLoad"] is True
+    assert entry["somethingElse"] == {"nested": 1}
+    assert "type" not in entry  # we always emit a stdio entry
+
+
+def test_install_claude_preserved_fields_survive_a_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "claude_desktop_config.json"
+    cfg.write_text(
+        json.dumps(
+            {"mcpServers": {"fs": {"command": "npx", "args": ["srv"], "timeout": 1234, "alwaysLoad": False}}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    pol = tmp_path / "pol.yaml"
+    pol.write_text("x: 1\n", encoding="utf-8")
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    assert entry["timeout"] == 1234
+    assert entry["alwaysLoad"] is False
+    assert entry["args"].count("src.stdio_proxy") == 1
+
+
+def test_install_claude_backup_written_when_wrapping_existing_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "claude_desktop_config.json"
+    original = {"mcpServers": {"fs": {"command": "npx", "args": ["srv"]}}}
+    cfg.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    pol = tmp_path / "pol.yaml"
+    pol.write_text("x: 1\n", encoding="utf-8")
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+
+    bak = Path(str(cfg) + ".bak")
+    assert bak.exists()
+    assert json.loads(bak.read_text(encoding="utf-8")) == original
+
+
+def test_is_wrapped_stdio_args_matches_on_shape_not_command() -> None:
+    assert cli._is_wrapped_stdio_args(["-m", "src.stdio_proxy", "--policy", "p"])
+    assert not cli._is_wrapped_stdio_args(["-y", "@modelcontextprotocol/server-filesystem"])
+    assert not cli._is_wrapped_stdio_args([])
+    assert not cli._is_wrapped_stdio_args(None)
+    assert not cli._is_wrapped_stdio_args("-m src.stdio_proxy")
+
+
+def test_repolicy_stdio_args_ignores_child_policy_flag() -> None:
+    wrapped = cli._wrap_stdio_args("/old.yaml", "npx", ["srv", "--policy", "child.yaml"])
+    out = cli._repolicy_stdio_args("/new.yaml", wrapped)
+    assert out == [
+        "-m",
+        "src.stdio_proxy",
+        "--policy",
+        "/new.yaml",
+        "--wrap",
+        "npx",
+        "--",
+        "srv",
+        "--policy",
+        "child.yaml",
+    ]
+
+
 def test_main_dispatches_wrap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["agentparry", "wrap", "--command", "npx x", "--policy", "p.yaml"])
     with patch.object(cli, "stdio_main_argv", return_value=0):
