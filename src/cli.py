@@ -251,6 +251,111 @@ def cmd_install_claude(args: argparse.Namespace) -> int:
     return 0
 
 
+CLAUDE_CODE_SCOPES = ("project", "local", "user")
+
+
+def _claude_code_config_path(scope: str, project_dir: str | None) -> Path:
+    """Resolve the file Claude Code reads for a given scope.
+
+    Layouts verified against `claude mcp add` (CLI v2.1.220) writing into a
+    throwaway HOME: project scope writes ./.mcp.json, while local and user
+    scope both write ~/.claude.json (local nested under projects[cwd]).
+    """
+    if scope == "project":
+        return _project_dir(project_dir) / ".mcp.json"
+    if scope in ("local", "user"):
+        return Path.home() / ".claude.json"
+    raise SystemExit(f"error: unknown scope {scope!r}")
+
+
+def _project_dir(project_dir: str | None) -> Path:
+    return Path(project_dir or ".").expanduser().resolve()
+
+
+def _load_claude_code_config(path: Path) -> dict[str, Any]:
+    """Load a Claude Code config file, preserving every unrelated key."""
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise SystemExit(f"error: root of {path} must be a JSON object")
+    return data
+
+
+def _claude_code_servers(data: dict[str, Any], scope: str, project_dir: str | None) -> dict[str, Any]:
+    """Return the mutable mcpServers mapping for a scope, creating it if absent."""
+    if scope == "local":
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise SystemExit("error: projects must be a JSON object")
+        entry = projects.setdefault(str(_project_dir(project_dir)), {})
+        if not isinstance(entry, dict):
+            raise SystemExit("error: each projects entry must be a JSON object")
+        container: Any = entry
+    else:
+        container = data
+
+    servers = container.get("mcpServers")
+    if servers is None:
+        servers = {}
+        container["mcpServers"] = servers
+    if not isinstance(servers, dict):
+        raise SystemExit("error: mcpServers must be a JSON object")
+    return servers
+
+
+def _claude_code_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Stamp the explicit stdio transport Claude Code records."""
+    return {"type": "stdio", **entry}
+
+
+def cmd_install_claude_code(args: argparse.Namespace) -> int:
+    scope = args.scope
+    path = _claude_code_config_path(scope, args.project_dir)
+    policy_abs = str(Path(args.policy).expanduser().resolve())
+
+    data = _load_claude_code_config(path)
+    servers = _claude_code_servers(data, scope, args.project_dir)
+    name = args.server_name
+
+    already_wrapped = False
+    if name in servers:
+        entry = servers[name]
+        if not isinstance(entry, dict):
+            raise SystemExit(f"error: mcpServers[{name!r}] must be an object")
+        already_wrapped = _is_wrapped_stdio_args(entry.get("args"))
+        new_entry = _stdio_entry_from_existing(policy_abs, entry)
+    else:
+        if not args.command:
+            raise SystemExit("error: --command is required when adding a new server")
+        new_entry = _stdio_entry_from_command(policy_abs, args.command)
+
+    if args.python:
+        new_entry["command"] = args.python
+
+    backup = path.with_suffix(path.suffix + ".bak")
+    if path.exists():
+        shutil.copy2(path, backup)
+
+    servers[name] = _claude_code_entry(new_entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+    if already_wrapped:
+        print(f"{name!r} was already wrapped by AgentParry; kept the same child command and set policy to {policy_abs}")
+    if scope == "project":
+        print(
+            f"warning: {path} is usually committed, and this entry hardcodes "
+            f"{new_entry['command']} and an absolute policy path, so it will not "
+            "work in another checkout"
+        )
+    print("Restart Claude Code (or run /mcp) to activate AgentParry protection")
+    return 0
+
+
 def _openclaw_path() -> Path:
     return Path.home() / ".openclaw" / "openclaw.json"
 
@@ -394,6 +499,51 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Policy YAML path stored as absolute in config (default: config/default_policy.yaml)",
     )
     p_claude.set_defaults(handler=cmd_install_claude)
+
+    p_code = sub.add_parser(
+        "install-claude-code",
+        help="Wrap an MCP server in Claude Code config via AgentParry stdio proxy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Scopes: project writes ./.mcp.json, local writes projects[cwd].mcpServers in\n"
+            "~/.claude.json, user writes top-level mcpServers in ~/.claude.json.\n"
+            "Project scope is normally committed, and the entry hardcodes an interpreter\n"
+            "path and an absolute policy path, so it will not work in another checkout.\n"
+            "Project-scope servers also need in-app approval on first load.\n"
+            "Command-based servers only (not URL-only entries).\n"
+            "Example:\n"
+            '  agentparry install-claude-code --server-name fs --command "npx @scope/fs /tmp"\n'
+        ),
+    )
+    p_code.add_argument("--server-name", required=True, help="Name under mcpServers")
+    p_code.add_argument(
+        "--command",
+        default=None,
+        help="Required for a new server: command line to wrap",
+    )
+    p_code.add_argument(
+        "--policy",
+        default="config/default_policy.yaml",
+        help="Policy YAML path stored as absolute in config (default: config/default_policy.yaml)",
+    )
+    p_code.add_argument(
+        "--scope",
+        choices=CLAUDE_CODE_SCOPES,
+        default="project",
+        help="Which Claude Code config to write (default: project)",
+    )
+    p_code.add_argument(
+        "--project-dir",
+        default=None,
+        help="Project directory for project and local scope (default: cwd)",
+    )
+    p_code.add_argument(
+        "--python",
+        default=None,
+        metavar="PATH",
+        help=f"Interpreter recorded as the entry command (default: {sys.executable})",
+    )
+    p_code.set_defaults(handler=cmd_install_claude_code)
 
     p_open = sub.add_parser(
         "install-openclaw",
