@@ -36,6 +36,19 @@ _PE_PATTERNS: list[tuple[str, str, str]] = [
     ("chmod", r"chmod\s+777|chmod\s+\+s", "dangerous chmod"),
 ]
 
+_TEXT_FIELDS: tuple[str, ...] = (
+    "body",
+    "text",
+    "message",
+    "content",
+    "prompt",
+    "input",
+    "query",
+    "instruction",
+)
+_PATH_FIELDS: tuple[str, ...] = ("path", "filepath", "filename", "file", "url")
+_COMMAND_FIELDS: tuple[str, ...] = ("command", "cmd", "shell", "script", *_PATH_FIELDS)
+
 
 class RuleGenerator:
     """Generates policy rules from scan results."""
@@ -107,6 +120,30 @@ class RuleGenerator:
         return None
 
     @staticmethod
+    def _select_field(
+        arguments: dict[str, Any],
+        candidates: tuple[str, ...],
+        default_field: str,
+    ) -> tuple[str, str]:
+        """Pick the argument a rule condition should inspect, with its value.
+
+        Prefers a known field name, then the longest string argument (an attack
+        string is far longer than the filler values the scanner puts in other
+        required fields), and falls back to the default name when the payload
+        carries no string arguments at all.
+        """
+        by_lower = {key.lower(): key for key in arguments}
+        for candidate in candidates:
+            key = by_lower.get(candidate)
+            if key is not None and isinstance(arguments[key], str):
+                return key, arguments[key]
+
+        strings = [(key, value) for key, value in arguments.items() if isinstance(value, str)]
+        if strings:
+            return max(strings, key=lambda item: len(item[1]))
+        return default_field, ""
+
+    @staticmethod
     def _make_rule(
         attack_id: str,
         tool: str,
@@ -134,7 +171,7 @@ class RuleGenerator:
     def _rule_prompt_injection(
         attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        body: str = arguments.get("body", "")
+        field, body = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
 
         if re.search(_BASE64_PATTERN, body):
             pattern = _BASE64_PATTERN
@@ -152,14 +189,14 @@ class RuleGenerator:
                 pattern = re.escape(first_words)
 
         return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", "body", [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc,
         )
 
     @staticmethod
     def _rule_data_exfiltration(
         attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        command: str = arguments.get("command", "")
+        field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
         pattern = r"curl.*-d"
         desc = "blocks data exfiltration via shell"
@@ -170,14 +207,14 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", "command", [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc,
         )
 
     @staticmethod
     def _rule_privilege_escalation(
         attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        command: str = arguments.get("command", "")
+        field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
         pattern = r"rm\s+-rf\s+/"
         desc = "blocks privilege escalation via shell"
@@ -188,24 +225,26 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", "command", [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc,
         )
 
     @staticmethod
     def _rule_pii_leak(
         attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        if "path" in arguments:
-            file_path: str = arguments.get("path", "")
+        path_keys = {key.lower() for key in arguments} & set(_PATH_FIELDS)
+        if path_keys:
+            field, file_path = RuleGenerator._select_field(arguments, _PATH_FIELDS, "path")
             filename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
             pattern = re.escape(filename)
             return RuleGenerator._make_rule(
-                attack_id, tool, "BLOCK", "path", [pattern],
+                attack_id, tool, "BLOCK", field, [pattern],
                 f"blocks reads of {filename}",
             )
 
+        field, _ = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
         return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", "body",
+            attack_id, tool, "BLOCK", field,
             [r"\d{3}-\d{2}-\d{4}", r"4\d{3}[-\s]?\d{4}"],
             "blocks emails containing SSN or credit card numbers",
         )
