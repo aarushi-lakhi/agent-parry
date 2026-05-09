@@ -362,49 +362,10 @@ class Scanner:
         if safe:
             headers[SAFE_SCAN_HEADER] = "1"
 
-        results: list[AttackResult] = []
-        blocked = 0
-        redacted = 0
-        passed_vuln = 0
-        policy_safe = 0
-
         async with httpx.AsyncClient(timeout=10.0) as client:
-            for idx, payload in enumerate(vulnerable_payloads, start=1):
-                rpc_request: dict[str, Any] = {
-                    "jsonrpc": "2.0",
-                    "method": "tools/call",
-                    "params": {
-                        "name": payload.tool,
-                        "arguments": payload.arguments,
-                    },
-                    "id": idx,
-                }
-
-                try:
-                    resp = await client.post(proxy_url, json=rpc_request, headers=headers)
-                    body = resp.json()
-                except httpx.HTTPError as exc:
-                    results.append(
-                        AttackResult(
-                            payload=payload,
-                            passed_through=True,
-                            notes=f"Connection error: {exc}",
-                        )
-                    )
-                    passed_vuln += 1
-                    continue
-
-                result = self._classify_response(payload, body)
-                results.append(result)
-
-                if result.evaluated_only:
-                    policy_safe += 1
-                elif result.was_blocked:
-                    blocked += 1
-                elif result.was_redacted:
-                    redacted += 1
-                else:
-                    passed_vuln += 1
+            results, blocked, redacted, passed_vuln, policy_safe = await self._execute_payloads(
+                client, proxy_url, headers, vulnerable_payloads
+            )
 
         total = len(vulnerable_payloads)
         score = round((passed_vuln / total) * 100, 1) if total else 0.0
