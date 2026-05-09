@@ -48,6 +48,16 @@ OUTCOME_TRUE_ALLOW = "true_allow"
 OUTCOME_FALSE_POSITIVE = "false_positive"
 OUTCOME_INDETERMINATE = "indeterminate"
 
+_OUTCOME_ORDER: dict[str, int] = {
+    OUTCOME_FALSE_NEGATIVE: 0,
+    OUTCOME_FALSE_POSITIVE: 1,
+    OUTCOME_INDETERMINATE: 2,
+    OUTCOME_TRUE_BLOCK: 3,
+    OUTCOME_TRUE_ALLOW: 4,
+}
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
 _SATISFIES: dict[str, frozenset[str]] = {
     EXPECTED_BLOCK: frozenset({OBSERVED_BLOCK}),
     EXPECTED_REDACT: frozenset({OBSERVED_REDACT, OBSERVED_BLOCK}),
@@ -184,6 +194,44 @@ def compute_confusion_matrix(results: list[AttackResult], *, safe: bool = False)
         else:
             matrix.indeterminate += 1
     return matrix
+
+
+def _result_outcome(result: AttackResult, *, safe: bool) -> str:
+    """Outcome recorded on a result, recomputed when the report predates the field."""
+    if result.outcome:
+        return result.outcome
+    return classify_outcome(
+        result.payload.expected_behavior,
+        observed_from_result(result, safe=safe),
+        safe=safe,
+    )
+
+
+def _format_rate(value: float | None) -> str:
+    """Render a rate, or "n/a" when its denominator was empty."""
+    return "n/a" if value is None else f"{value}%"
+
+
+def _matrix_line(matrix: ConfusionMatrix) -> str:
+    line = (
+        f"Detection: {_format_rate(matrix.detection_rate)} "
+        f"({matrix.true_block}/{matrix.attack_total} attacks stopped) | "
+        f"Over-block: {_format_rate(matrix.false_positive_rate)} "
+        f"({matrix.false_positive}/{matrix.benign_total} benign blocked) | "
+        f"Balanced: {_format_rate(matrix.balanced_score)}"
+    )
+    if matrix.indeterminate:
+        line += f" | {matrix.indeterminate} indeterminate"
+    return line
+
+
+def blocking_rule_message(result: AttackResult) -> str:
+    """The proxy's error message for a blocked call, which names the rule at fault."""
+    response = result.proxy_response if isinstance(result.proxy_response, dict) else {}
+    error = response.get("error")
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return error["message"]
+    return result.notes
 
 
 def is_attack_payload(payload: AttackPayload) -> bool:
@@ -579,8 +627,10 @@ class Scanner:
 
 
     def print_report(self, report: ScanReport) -> None:
+        matrix = report.matrix or compute_confusion_matrix(report.results, safe=report.safe_mode)
+
         summary = (
-            f"Scanned {report.total_attacks} attacks | "
+            f"Scanned {report.total_attacks} payloads | "
             f"{report.blocked} blocked | "
             f"{report.redacted} redacted | "
             f"{report.passed} PASSED THROUGH"
@@ -589,22 +639,33 @@ class Scanner:
             summary += f" | {report.policy_allowed_safe} policy-allowed (safe, not executed)"
 
         score_text = self._score_text(report.vulnerability_score)
+        body = f"{summary}\n\nVulnerability Score: {score_text}\n{_matrix_line(matrix)}"
+        if report.safe_mode:
+            body += (
+                "\nSafe mode: nothing was forwarded upstream, so the matrix above is"
+                " the only measure of what policy did."
+            )
 
         console.print()
         console.print(
             Panel(
-                f"{summary}\n\nVulnerability Score: {score_text}",
+                body,
                 title="[bold]AgentParry Scan Report[/bold]",
                 expand=False,
             )
         )
 
         sorted_results = sorted(
-            report.results, key=lambda r: (not r.passed_through, r.evaluated_only)
+            report.results,
+            key=lambda r: (
+                _OUTCOME_ORDER.get(_result_outcome(r, safe=report.safe_mode), 9),
+                r.payload.name,
+            ),
         )
 
         table = Table(show_lines=True)
         table.add_column("Status", justify="center")
+        table.add_column("Expected", justify="center")
         table.add_column("Severity", justify="center")
         table.add_column("Category")
         table.add_column("Attack Name")
@@ -612,11 +673,10 @@ class Scanner:
         table.add_column("Notes")
 
         for r in sorted_results:
-            status = self._status_cell(r)
-            sev = r.payload.severity.upper()
             table.add_row(
-                status,
-                sev,
+                self._outcome_cell(r, safe=report.safe_mode),
+                normalize_expected(r.payload.expected_behavior),
+                r.payload.severity.upper(),
                 r.payload.category,
                 r.payload.name,
                 r.payload.tool,
@@ -647,13 +707,12 @@ class Scanner:
         table.add_column("After", justify="center")
 
         fixed = 0
-        total_vulnerable = sum(
-            1 for r in before.results if r.passed_through
-        )
+        total_vulnerable = 0
 
         for r_before in before.results:
-            if not r_before.passed_through:
+            if not is_attack_payload(r_before.payload) or not r_before.passed_through:
                 continue
+            total_vulnerable += 1
             r_after = after_lookup.get(r_before.payload.id)
             if r_after is None:
                 continue
@@ -670,6 +729,46 @@ class Scanner:
         console.print(
             f"\nFixed {fixed} of {total_vulnerable} vulnerabilities\n"
         )
+        self._print_benign_comparison(before, after, after_lookup)
+
+    def _print_benign_comparison(
+        self,
+        before: ScanReport,
+        after: ScanReport,
+        after_lookup: dict[str, AttackResult],
+    ) -> None:
+        """Report benign payloads the new rules started blocking.
+
+        Without this pass a rule that closes a vulnerability by over-blocking
+        legitimate traffic looks like a pure win.
+        """
+        benign_before = [r for r in before.results if not is_attack_payload(r.payload)]
+        if not benign_before:
+            return
+
+        table = Table(title="Benign Traffic", show_lines=True)
+        table.add_column("Payload")
+        table.add_column("Before", justify="center")
+        table.add_column("After", justify="center")
+
+        introduced = 0
+        for r_before in benign_before:
+            r_after = after_lookup.get(r_before.payload.id)
+            if r_after is None:
+                continue
+            was_fp = _result_outcome(r_before, safe=before.safe_mode) == OUTCOME_FALSE_POSITIVE
+            now_fp = _result_outcome(r_after, safe=after.safe_mode) == OUTCOME_FALSE_POSITIVE
+            if now_fp and not was_fp:
+                introduced += 1
+            table.add_row(
+                r_before.payload.name,
+                self._status_cell(r_before),
+                self._status_cell(r_after),
+            )
+
+        console.print(table)
+        style = "red" if introduced else "green"
+        console.print(f"[{style}]Introduced {introduced} false positives[/{style}]\n")
 
     def save_report(
         self, report: ScanReport, path: str = "reports/"
@@ -708,6 +807,9 @@ class Scanner:
             lines.append(f"- **Tools discovered:** {tools_line}")
         if report.payload_stats:
             lines.append(f"- **Payload stats:** `{report.payload_stats}`")
+        matrix = report.matrix or compute_confusion_matrix(report.results, safe=report.safe_mode)
+        attack_total = report.attack_total or matrix.attack_total
+        benign_total = report.benign_total or matrix.benign_total
         lines.extend(
             [
                 "",
@@ -715,12 +817,18 @@ class Scanner:
                 "",
                 "| Metric | Value |",
                 "| --- | --- |",
-                f"| Total attacks | {report.total_attacks} |",
+                f"| Total payloads | {report.total_attacks} |",
+                f"| Attack payloads | {attack_total} |",
+                f"| Benign payloads | {benign_total} |",
                 f"| Blocked | {report.blocked} |",
                 f"| Redacted | {report.redacted} |",
                 f"| Passed through (vulnerable) | {report.passed} |",
                 f"| Policy allowed (safe, not executed) | {report.policy_allowed_safe} |",
-                f"| Vulnerability score | {report.vulnerability_score}% |",
+                f"| Vulnerability score (attack payloads only) | {report.vulnerability_score}% |",
+                f"| Detection rate | {_format_rate(matrix.detection_rate)} |",
+                f"| Over-block rate | {_format_rate(matrix.false_positive_rate)} |",
+                f"| Balanced score | {_format_rate(matrix.balanced_score)} |",
+                f"| Indeterminate | {matrix.indeterminate} |",
                 "",
                 "## Findings",
                 "",
@@ -742,7 +850,8 @@ class Scanner:
                 f"| {st} | {_md_cell(r.payload.severity)} | {_md_cell(r.payload.category)} | "
                 f"{_md_cell(r.payload.name)} | {_md_cell(r.payload.tool)} | {notes} |"
             )
-        lines.append("")
+        lines.extend(self._expected_vs_actual_lines(report))
+        lines.extend(self._false_positive_lines(report))
         lines.append("## Recommended rules")
         lines.append("")
         if suggested_rules:
@@ -755,6 +864,60 @@ class Scanner:
         text = "\n".join(lines)
         p.write_text(text, encoding="utf-8")
         return str(p)
+
+    @staticmethod
+    def _expected_vs_actual_lines(report: ScanReport) -> list[str]:
+        lines = [
+            "",
+            "## Expected vs actual",
+            "",
+            "| Payload | Tool | Expected | Observed | Outcome |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        ordered = sorted(
+            report.results,
+            key=lambda r: (
+                _OUTCOME_ORDER.get(_result_outcome(r, safe=report.safe_mode), 9),
+                r.payload.name,
+            ),
+        )
+        for r in ordered:
+            observed = r.observed_behavior or observed_from_result(r, safe=report.safe_mode)
+            lines.append(
+                f"| {_md_cell(r.payload.name)} | {_md_cell(r.payload.tool)} | "
+                f"{_md_cell(normalize_expected(r.payload.expected_behavior))} | "
+                f"{_md_cell(observed)} | {_md_cell(_result_outcome(r, safe=report.safe_mode))} |"
+            )
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _false_positive_lines(report: ScanReport) -> list[str]:
+        lines = ["## False positives", ""]
+        over_blocked = [
+            r
+            for r in report.results
+            if _result_outcome(r, safe=report.safe_mode) == OUTCOME_FALSE_POSITIVE
+        ]
+        if not over_blocked:
+            if not any(not is_attack_payload(r.payload) for r in report.results):
+                lines.append("_No benign payloads in this scan, so over-blocking was not measured._")
+            else:
+                lines.append("_No benign payloads were blocked._")
+            lines.append("")
+            return lines
+
+        lines.append("Legitimate calls the policy refused. The message names the rule to fix.")
+        lines.append("")
+        lines.append("| Payload | Tool | Rule message |")
+        lines.append("| --- | --- | --- |")
+        for r in sorted(over_blocked, key=lambda x: x.payload.name):
+            lines.append(
+                f"| {_md_cell(r.payload.name)} | {_md_cell(r.payload.tool)} | "
+                f"{_md_cell(blocking_rule_message(r))} |"
+            )
+        lines.append("")
+        return lines
 
 
     @staticmethod
@@ -846,7 +1009,37 @@ class Scanner:
         return Text(f"{score}% — CRITICAL", style="bold red underline")
 
     @staticmethod
+    def _outcome_cell(result: AttackResult, *, safe: bool) -> Text:
+        """Status cell keyed by outcome, so a false positive cannot read as a win."""
+        outcome = _result_outcome(result, safe=safe)
+        observed = result.observed_behavior or observed_from_result(result, safe=safe)
+
+        if outcome == OUTCOME_FALSE_NEGATIVE:
+            return Text("[!] MISSED", style="bold red")
+        if outcome == OUTCOME_FALSE_POSITIVE:
+            return Text("[x] OVER-BLOCKED", style="bold magenta")
+        if outcome == OUTCOME_INDETERMINATE:
+            return Text("[?] UNKNOWN", style="yellow")
+        if outcome == OUTCOME_TRUE_ALLOW:
+            if observed == OBSERVED_EVALUATED:
+                return Text("[=] ALLOWED (safe)", style="cyan")
+            return Text("[.] ALLOWED", style="green")
+        if observed == OBSERVED_REDACT:
+            return Text("[~] REDACTED", style="blue")
+        return Text("[+] BLOCKED", style="green")
+
+    @staticmethod
     def _status_cell(result: AttackResult) -> Text:
+        """Legacy flag-based status cell.
+
+        Thin wrapper: results that carry an outcome render through
+        _outcome_cell, and reports written before outcomes existed fall back to
+        the flags they do have.
+        """
+        if result.outcome:
+            return Scanner._outcome_cell(
+                result, safe=result.observed_behavior == OBSERVED_EVALUATED
+            )
         if result.evaluated_only:
             return Text("[=] SAFE OK", style="cyan")
         if result.was_blocked:
@@ -857,7 +1050,12 @@ class Scanner:
 
 
 def _md_cell(s: str) -> str:
-    return str(s).replace("|", "\\|").replace("\n", " ")
+    """Escape a value for a Markdown table cell.
+
+    Strips C0 controls (a raw newline or ESC in a tool response breaks the table
+    or bleeds terminal escapes into the rendered report) and escapes pipes.
+    """
+    return _CONTROL_CHARS.sub(" ", str(s)).replace("|", "\\|")
 
 
 def save_scan_outputs(
