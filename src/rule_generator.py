@@ -50,6 +50,19 @@ _PATH_FIELDS: tuple[str, ...] = ("path", "filepath", "filename", "file", "url")
 _COMMAND_FIELDS: tuple[str, ...] = ("command", "cmd", "shell", "script", *_PATH_FIELDS)
 
 
+def _is_benign(result: AttackResult) -> bool:
+    """True for payloads that were supposed to be allowed.
+
+    Benign payloads pass through by design, and generate_rules keys off
+    passed_through, so without this gate save_scan_outputs emits autogen rules
+    built from legitimate traffic and demo phase 3 writes them into the policy
+    file. Both the expectation and the category are checked, since a payload set
+    can carry one without the other.
+    """
+    payload = result.payload
+    return payload.expected_behavior.strip().lower() == "allow" or payload.category == "benign"
+
+
 class RuleGenerator:
     """Generates policy rules from scan results."""
 
@@ -57,6 +70,8 @@ class RuleGenerator:
         rules: list[dict[str, Any]] = []
         for result in report.results:
             if not result.passed_through:
+                continue
+            if _is_benign(result):
                 continue
             rule = self._rule_for_result(result)
             if rule is not None:
