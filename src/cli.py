@@ -1,22 +1,49 @@
-"""AgentParry CLI: wrap, scan, and install helpers."""
+"""AgentParry CLI: wrap, scan, harden, verify, and install helpers."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import shlex
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 import json5
 
 from src.models import PROXY_URL, ScanReport
-from src.scanner import Scanner, save_scan_outputs
+from src.scanner import (
+    OUTCOME_FALSE_NEGATIVE,
+    OUTCOME_FALSE_POSITIVE,
+    OUTCOME_TRUE_ALLOW,
+    OUTCOME_TRUE_BLOCK,
+    SAFE_SCAN_HEADER,
+    Scanner,
+    is_attack_payload,
+    result_outcome,
+    save_scan_outputs,
+)
 from src.stdio_proxy import main_argv as stdio_main_argv
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2  # argparse's own code for a bad command line
+EXIT_VULNERABLE = 3
+EXIT_ABORTED = 4
+EXIT_INTERRUPTED = 130
+
+STDIO_RESTART_NOTE = (
+    "Note: the stdio proxy (agentparry wrap) builds its policy engine once at startup and has no "
+    "reload path, so a running wrap session keeps the old rules. Restart your MCP client to pick "
+    "up this policy."
+)
 
 
 def _split_command(command: str) -> tuple[str, list[str]]:
@@ -87,6 +114,204 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return asyncio.run(_cmd_scan_live(args))
     except KeyboardInterrupt:
         return 130
+
+
+def vulnerability_exit_code(remaining: int, max_vulns: int = 0, *, regression: bool = False) -> int:
+    """Map a post-hardening result onto an exit code.
+
+    `cmd_scan` still returns 0 whatever it finds, so its contract does not change
+    under anyone's feet; the threshold lives here so it can adopt it later
+    without a second implementation.
+    """
+    if regression or remaining > max_vulns:
+        return EXIT_VULNERABLE
+    return EXIT_OK
+
+
+def _is_loopback_target(url: str) -> bool:
+    """True when a scan target resolves to this machine.
+
+    Anything unparseable reads as remote. Firing `rm -rf /` at a host because its
+    URL did not parse is not a tolerable default.
+    """
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _guard_live_target(target: str, *, safe: bool, allow_remote: bool) -> None:
+    """Refuse to fire real payloads at a non-loopback target by accident.
+
+    Outside `--safe` the proxy forwards the calls upstream, so the payload set
+    genuinely runs `rm -rf /` and `curl ... | bash` against whatever is behind
+    the target.
+    """
+    if safe or allow_remote or _is_loopback_target(target):
+        return
+    raise SystemExit(
+        f"error: {target} is not a loopback address. Without --safe the payloads execute upstream "
+        "(rm -rf /, curl-pipe-bash). Re-run with --safe, or --allow-remote if you mean it."
+    )
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        answer = input(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+async def _probe_target(target: str, *, safe: bool) -> None:
+    """Check the target answers at all before firing payloads at it.
+
+    `Scanner._execute_payloads` records a connection error as `passed_through`,
+    so an unreachable proxy reports every payload as a vulnerability and the
+    generated rules are built from nothing. Any HTTP response counts as reachable
+    here, including a JSON-RPC error.
+    """
+    headers = {SAFE_SCAN_HEADER: "1"} if safe else {}
+    rpc = {"jsonrpc": "2.0", "method": "tools/list", "id": 0, "params": {}}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(target, json=rpc, headers=headers)
+    except httpx.HTTPError as exc:
+        raise SystemExit(f"error: target {target} is unreachable ({exc}); nothing was scanned") from exc
+
+
+def _policy_reload_url(target: str) -> str:
+    parsed = urlparse(target)
+    return f"{parsed.scheme}://{parsed.netloc}/policy/reload"
+
+
+async def _reload_policy(target: str) -> bool:
+    """Ask the HTTP proxy at `target` to reload its policy. Never fatal.
+
+    The control plane fails closed when `AGENTPARRY_ADMIN_TOKEN` is unset, and
+    the target may not be an AgentParry HTTP proxy at all, so a failure is a
+    warning: the policy file on disk is already updated either way.
+    """
+    url = _policy_reload_url(target)
+    headers: dict[str, str] = {}
+    token = os.environ.get("AGENTPARRY_ADMIN_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, headers=headers)
+    except httpx.HTTPError as exc:
+        print(f"warning: policy reload at {url} failed ({exc}); the proxy is still on the old rules", file=sys.stderr)
+        return False
+    if resp.status_code >= 400:
+        hint = ""
+        if resp.status_code in (401, 403):
+            hint = " set AGENTPARRY_ADMIN_TOKEN to the proxy's admin token and retry, or reload it yourself."
+        print(
+            f"warning: policy reload at {url} returned HTTP {resp.status_code};"
+            f" the proxy is still on the old rules.{hint}",
+            file=sys.stderr,
+        )
+        return False
+    print(f"Policy reloaded at {url}")
+    return True
+
+
+@dataclass(frozen=True)
+class RescanAnalysis:
+    """What changed between a before scan and the scan taken after hardening."""
+
+    remaining: int
+    fixed: int
+    introduced_false_positives: int
+    regressed_attacks: int
+    unreplayed_correct: int
+
+    @property
+    def regression(self) -> bool:
+        return self.regressed_attacks > 0 or self.introduced_false_positives > 0
+
+
+def _analyze_rescan(before: ScanReport, after: ScanReport) -> RescanAnalysis:
+    """Compare two reports by outcome rather than by flags.
+
+    `false_negative` is the portable measure of "attack still gets through": in
+    safe mode an allowed attack is `evaluated`, never `passed_through`, so
+    counting the flag would report a clean sheet.
+    """
+    after_by_id = {r.payload.id: r for r in after.results}
+
+    remaining = sum(
+        1
+        for r in after.results
+        if result_outcome(r, safe=after.safe_mode) == OUTCOME_FALSE_NEGATIVE
+    )
+
+    fixed = 0
+    regressed = 0
+    introduced_fp = 0
+    unreplayed = 0
+
+    for r_before in before.results:
+        outcome_before = result_outcome(r_before, safe=before.safe_mode)
+        r_after = after_by_id.get(r_before.payload.id)
+        if r_after is None:
+            if outcome_before in (OUTCOME_TRUE_BLOCK, OUTCOME_TRUE_ALLOW):
+                unreplayed += 1
+            continue
+        outcome_after = result_outcome(r_after, safe=after.safe_mode)
+        if is_attack_payload(r_before.payload):
+            if outcome_before == OUTCOME_FALSE_NEGATIVE and outcome_after != OUTCOME_FALSE_NEGATIVE:
+                fixed += 1
+            elif outcome_before == OUTCOME_TRUE_BLOCK and outcome_after == OUTCOME_FALSE_NEGATIVE:
+                regressed += 1
+        if outcome_after == OUTCOME_FALSE_POSITIVE and outcome_before != OUTCOME_FALSE_POSITIVE:
+            introduced_fp += 1
+
+    return RescanAnalysis(
+        remaining=remaining,
+        fixed=fixed,
+        introduced_false_positives=introduced_fp,
+        regressed_attacks=regressed,
+        unreplayed_correct=unreplayed,
+    )
+
+
+def _print_analysis(analysis: RescanAnalysis, *, full: bool, max_vulns: int) -> None:
+    print(f"Fixed: {analysis.fixed}")
+    print(f"Vulnerabilities remaining: {analysis.remaining} (threshold {max_vulns})")
+    print(f"False positives introduced by the new rules: {analysis.introduced_false_positives}")
+    print(f"Previously blocked attacks that now get through: {analysis.regressed_attacks}")
+    if not full:
+        print(
+            f"Not replayed: {analysis.unreplayed_correct} payloads that behaved correctly before. "
+            "A rescan only replays payloads that got through, so it cannot see regressions or "
+            "over-blocking among the rest. Use --full in CI."
+        )
+
+
+async def _run_after_scan(
+    scanner: Scanner,
+    before: ScanReport,
+    *,
+    target: str,
+    full: bool,
+    discover: bool,
+    safe: bool,
+) -> ScanReport:
+    """Take the post-hardening scan: a complete scan with `full`, else a rescan."""
+    if full:
+        return await scanner.run_scan(proxy_url=target, discover=discover, safe=safe)
+    return await scanner.run_rescan(target, before, safe=safe)
 
 
 def _claude_config_path() -> Path:

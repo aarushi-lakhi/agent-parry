@@ -196,7 +196,7 @@ def compute_confusion_matrix(results: list[AttackResult], *, safe: bool = False)
     return matrix
 
 
-def _result_outcome(result: AttackResult, *, safe: bool) -> str:
+def result_outcome(result: AttackResult, *, safe: bool) -> str:
     """Outcome recorded on a result, recomputed when the report predates the field."""
     if result.outcome:
         return result.outcome
@@ -658,7 +658,7 @@ class Scanner:
         sorted_results = sorted(
             report.results,
             key=lambda r: (
-                _OUTCOME_ORDER.get(_result_outcome(r, safe=report.safe_mode), 9),
+                _OUTCOME_ORDER.get(result_outcome(r, safe=report.safe_mode), 9),
                 r.payload.name,
             ),
         )
@@ -756,8 +756,8 @@ class Scanner:
             r_after = after_lookup.get(r_before.payload.id)
             if r_after is None:
                 continue
-            was_fp = _result_outcome(r_before, safe=before.safe_mode) == OUTCOME_FALSE_POSITIVE
-            now_fp = _result_outcome(r_after, safe=after.safe_mode) == OUTCOME_FALSE_POSITIVE
+            was_fp = result_outcome(r_before, safe=before.safe_mode) == OUTCOME_FALSE_POSITIVE
+            now_fp = result_outcome(r_after, safe=after.safe_mode) == OUTCOME_FALSE_POSITIVE
             if now_fp and not was_fp:
                 introduced += 1
             table.add_row(
@@ -877,7 +877,7 @@ class Scanner:
         ordered = sorted(
             report.results,
             key=lambda r: (
-                _OUTCOME_ORDER.get(_result_outcome(r, safe=report.safe_mode), 9),
+                _OUTCOME_ORDER.get(result_outcome(r, safe=report.safe_mode), 9),
                 r.payload.name,
             ),
         )
@@ -886,7 +886,7 @@ class Scanner:
             lines.append(
                 f"| {_md_cell(r.payload.name)} | {_md_cell(r.payload.tool)} | "
                 f"{_md_cell(normalize_expected(r.payload.expected_behavior))} | "
-                f"{_md_cell(observed)} | {_md_cell(_result_outcome(r, safe=report.safe_mode))} |"
+                f"{_md_cell(observed)} | {_md_cell(result_outcome(r, safe=report.safe_mode))} |"
             )
         lines.append("")
         return lines
@@ -897,7 +897,7 @@ class Scanner:
         over_blocked = [
             r
             for r in report.results
-            if _result_outcome(r, safe=report.safe_mode) == OUTCOME_FALSE_POSITIVE
+            if result_outcome(r, safe=report.safe_mode) == OUTCOME_FALSE_POSITIVE
         ]
         if not over_blocked:
             if not any(not is_attack_payload(r.payload) for r in report.results):
@@ -1011,7 +1011,7 @@ class Scanner:
     @staticmethod
     def _outcome_cell(result: AttackResult, *, safe: bool) -> Text:
         """Status cell keyed by outcome, so a false positive cannot read as a win."""
-        outcome = _result_outcome(result, safe=safe)
+        outcome = result_outcome(result, safe=safe)
         observed = result.observed_behavior or observed_from_result(result, safe=safe)
 
         if outcome == OUTCOME_FALSE_NEGATIVE:
