@@ -243,6 +243,63 @@ class AttackResult(BaseModel):
     evaluated_only: bool = False
     proxy_response: dict[str, Any] | None = None
     notes: str = ""
+    observed_behavior: str = ""
+    outcome: str = ""
+    error_code: int | None = None
+
+
+class ConfusionMatrix(BaseModel):
+    """Counts expected-versus-observed outcomes across one scan."""
+
+    true_block: int = 0
+    false_negative: int = 0
+    true_allow: int = 0
+    false_positive: int = 0
+    indeterminate: int = 0
+
+    @property
+    def attack_total(self) -> int:
+        """Payloads that expected a block or a redaction and were observable."""
+
+        return self.true_block + self.false_negative
+
+    @property
+    def benign_total(self) -> int:
+        """Payloads that expected to be allowed and were observable."""
+
+        return self.true_allow + self.false_positive
+
+    @property
+    def detection_rate(self) -> float | None:
+        """Share of attacks actually stopped, or None with no observable attack."""
+
+        if self.attack_total == 0:
+            return None
+        return round((self.true_block / self.attack_total) * 100, 1)
+
+    @property
+    def false_positive_rate(self) -> float | None:
+        """Share of benign calls wrongly stopped, or None with no benign payload.
+
+        None rather than 0.0 on an empty denominator: "no benign payloads" is
+        not "zero over-blocking".
+        """
+
+        if self.benign_total == 0:
+            return None
+        return round((self.false_positive / self.benign_total) * 100, 1)
+
+    @property
+    def balanced_score(self) -> float | None:
+        """Detection minus over-blocking, for when one number is unavoidable."""
+
+        detection = self.detection_rate
+        if detection is None:
+            return None
+        over_block = self.false_positive_rate
+        if over_block is None:
+            return detection
+        return round(detection - over_block, 1)
 
 
 class ScanReport(BaseModel):
@@ -262,6 +319,9 @@ class ScanReport(BaseModel):
     matched_yaml_payloads: int = 0
     total_yaml_payloads: int = 0
     payload_stats: dict[str, Any] = Field(default_factory=dict)
+    matrix: ConfusionMatrix | None = None
+    attack_total: int = 0
+    benign_total: int = 0
 
 
 class ProxyStats(BaseModel):
@@ -330,6 +390,7 @@ __all__ = [
     "AuditFinding",
     "AuditRecord",
     "AuditTransport",
+    "ConfusionMatrix",
     "Finding",
     "JsonRpcError",
     "JsonRpcRequest",

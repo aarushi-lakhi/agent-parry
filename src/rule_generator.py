@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import difflib
 import re
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -12,6 +16,8 @@ from rich.table import Table
 from src.models import AttackResult, ScanReport
 
 console = Console()
+
+AUTOGEN_PREFIX = "autogen_"
 
 _PI_PATTERNS: list[tuple[str, str, str]] = [
     ("ignore.*instructions", "ignore.*instructions", "instruction override"),
@@ -36,14 +42,210 @@ _PE_PATTERNS: list[tuple[str, str, str]] = [
     ("chmod", r"chmod\s+777|chmod\s+\+s", "dangerous chmod"),
 ]
 
+_TEXT_FIELDS: tuple[str, ...] = (
+    "body",
+    "text",
+    "message",
+    "content",
+    "prompt",
+    "input",
+    "query",
+    "instruction",
+)
+_PATH_FIELDS: tuple[str, ...] = ("path", "filepath", "filename", "file", "url")
+_COMMAND_FIELDS: tuple[str, ...] = ("command", "cmd", "shell", "script", *_PATH_FIELDS)
+
+_MAX_ESCAPED_VALUE = 200
+
+
+def _patterns_for_value(patterns: list[str], value: str) -> list[str]:
+    """Return `patterns`, or an escape of `value` when none of them can match it.
+
+    The keyword tables select a pattern by substring, so they happily pick one
+    the argument that produced the finding cannot contain: a `dyn-path-` probe
+    carrying `../../../etc/passwd` hits no _PE_PATTERNS keyword and takes the
+    `rm\\s+-rf\\s+/` fallback, which emits a plausible-looking rule that can
+    never fire. Escaping the observed value only blocks that exact payload, but
+    that beats a rule which blocks nothing. Generalising the literal is future
+    work.
+
+    PolicyEngine compiles rule patterns with re.IGNORECASE, so the check uses
+    the same flag; otherwise a pattern that will fire at runtime reads as dead.
+    """
+    if not value.strip():
+        return patterns
+    for pattern in patterns:
+        try:
+            if re.search(pattern, value, flags=re.IGNORECASE):
+                return patterns
+        except re.error:
+            continue
+    return [re.escape(value[:_MAX_ESCAPED_VALUE])]
+
+
+def _is_benign(result: AttackResult) -> bool:
+    """True for payloads that were supposed to be allowed.
+
+    Benign payloads pass through by design, and generate_rules keys off
+    passed_through, so without this gate save_scan_outputs emits autogen rules
+    built from legitimate traffic and demo phase 3 writes them into the policy
+    file. Both the expectation and the category are checked, since a payload set
+    can carry one without the other.
+    """
+    payload = result.payload
+    return payload.expected_behavior.strip().lower() == "allow" or payload.category == "benign"
+
+
+def is_autogen_rule(rule: dict[str, Any]) -> bool:
+    """True for a rule this module owns, identified by its name prefix."""
+    name = rule.get("name")
+    return isinstance(name, str) and name.startswith(AUTOGEN_PREFIX)
+
+
+def merge_autogen_rules(
+    existing: list[dict[str, Any]],
+    new: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge freshly generated autogen rules into an existing rule list, additively.
+
+    This diverges from `RuleGenerator.apply_rules` on purpose. `apply_rules`
+    drops every existing `autogen_*` rule and prepends the new list, which is
+    what `src/demo.py` needs: `apply_rules([])` resets the committed policy to
+    its handwritten rules so the demo's phase 2 scan finds vulnerabilities to
+    fix. Run that same replace against a real policy and the autogen rules that
+    were already blocking payloads disappear, the fresh scan therefore reports
+    no findings, no replacement rules are generated, and the vulnerabilities are
+    silently back. This function keeps them instead: a new rule replaces the
+    existing rule of the same name, every other rule survives.
+
+    Ordering matches `apply_rules`: generated rules first, then surviving
+    autogen rules, then handwritten rules in their original relative order.
+    `PolicyEngine` is first-match-wins, so a generated BLOCK shadows a
+    handwritten ALLOW for the same tool. That is pre-existing behavior, kept
+    deliberately so merging cannot change which rule decides a call.
+    """
+    new_names = {r["name"] for r in new if isinstance(r.get("name"), str)}
+    kept_autogen = [r for r in existing if is_autogen_rule(r) and r.get("name") not in new_names]
+    handwritten = [r for r in existing if not is_autogen_rule(r)]
+    return [*new, *kept_autogen, *handwritten]
+
+
+def load_policy(policy_path: str | Path) -> dict[str, Any]:
+    """Load a policy YAML file. Raises FileNotFoundError when it is missing."""
+    path = Path(policy_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"policy file not found: {path}")
+    with path.open(encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def render_policy(policy: dict[str, Any]) -> str:
+    """Serialize a policy dict the way `apply_rules` writes it."""
+    return yaml.dump(policy, default_flow_style=False, sort_keys=False)
+
+
+def policy_diff(before_text: str, after_text: str, *, path: str | Path) -> str:
+    """Unified diff between a policy file's current text and its rewritten text.
+
+    Diffs the raw file text, not a re-render of it, so the diff shows everything
+    the write will do, including the comments and formatting `yaml.safe_load`
+    plus `yaml.dump` discard.
+    """
+    diff = difflib.unified_diff(
+        before_text.splitlines(keepends=True),
+        after_text.splitlines(keepends=True),
+        fromfile=f"{path} (current)",
+        tofile=f"{path} (hardened)",
+    )
+    return "".join(diff)
+
+
+@dataclass(frozen=True)
+class AutogenMergePlan:
+    """A pending additive merge: what it would write, and what it would change."""
+
+    policy: dict[str, Any]
+    before_text: str
+    after_text: str
+    added: list[str] = field(default_factory=list)
+    replaced: list[str] = field(default_factory=list)
+    kept_autogen: list[str] = field(default_factory=list)
+    handwritten: list[str] = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return self.before_text != self.after_text
+
+    def diff(self, path: str | Path) -> str:
+        return policy_diff(self.before_text, self.after_text, path=path)
+
+
+def plan_autogen_merge(
+    rules: list[dict[str, Any]],
+    policy_path: str | Path,
+) -> AutogenMergePlan:
+    """Compute the additive merge of `rules` into `policy_path` without writing."""
+    path = Path(policy_path)
+    policy = load_policy(path)
+    existing: list[dict[str, Any]] = policy.get("rules") or []
+    existing_autogen = {r["name"] for r in existing if is_autogen_rule(r) and isinstance(r.get("name"), str)}
+
+    merged = merge_autogen_rules(existing, rules)
+    new_policy = dict(policy)
+    new_policy["rules"] = merged
+
+    new_names = [r["name"] for r in rules if isinstance(r.get("name"), str)]
+    return AutogenMergePlan(
+        policy=new_policy,
+        before_text=path.read_text(encoding="utf-8"),
+        after_text=render_policy(new_policy),
+        added=[n for n in new_names if n not in existing_autogen],
+        replaced=[n for n in new_names if n in existing_autogen],
+        kept_autogen=[n for n in sorted(existing_autogen) if n not in set(new_names)],
+        handwritten=[r["name"] for r in existing if not is_autogen_rule(r) and isinstance(r.get("name"), str)],
+    )
+
+
+def write_policy_text(text: str, policy_path: str | Path) -> str | None:
+    """Write policy text, backing the current file up to a `.bak` sibling first.
+
+    Same convention as `cli.cmd_install_claude`: the backup lands next to the
+    original with `.bak` appended, and is taken before anything is mutated.
+    Returns the backup path, or None when there was no file to back up.
+    """
+    path = Path(policy_path)
+    backup: Path | None = None
+    if path.exists():
+        backup = path.with_suffix(path.suffix + ".bak")
+        shutil.copy2(path, backup)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(backup) if backup is not None else None
+
 
 class RuleGenerator:
     """Generates policy rules from scan results."""
 
-    def generate_rules(self, report: ScanReport) -> list[dict[str, Any]]:
+    def generate_rules(
+        self,
+        report: ScanReport,
+        *,
+        include_policy_allowed: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Build autogen rules from a scan report.
+
+        `include_policy_allowed` also considers results the proxy only evaluated
+        instead of forwarding, which is every allowed result of a `--safe` scan.
+        Without it a safe scan generates nothing, because `evaluated_only`
+        results never set `passed_through`. Off by default so `save_scan_outputs`
+        and `src/demo.py` keep emitting exactly the rules they did before.
+        """
         rules: list[dict[str, Any]] = []
         for result in report.results:
-            if not result.passed_through:
+            eligible = result.passed_through or (include_policy_allowed and result.evaluated_only)
+            if not eligible:
+                continue
+            if _is_benign(result):
                 continue
             rule = self._rule_for_result(result)
             if rule is not None:
@@ -56,6 +258,16 @@ class RuleGenerator:
         rules: list[dict[str, Any]],
         policy_path: str = "config/default_policy.yaml",
     ) -> None:
+        """Replace every autogen rule in the policy with `rules`, in place.
+
+        Destructive and unconditional: no backup, no diff, no confirmation, and
+        every pre-existing `autogen_*` rule is dropped. `src/demo.py` depends on
+        exactly that, calling `apply_rules([])` to reset the committed policy
+        before its phase 2 scan. Anything user-facing wants the additive path:
+        `plan_autogen_merge` plus `write_policy_text`, which is what
+        `agentparry harden` uses. See `merge_autogen_rules` for why replacing
+        silently reintroduces vulnerabilities.
+        """
         with open(policy_path) as f:
             policy = yaml.safe_load(f) or {}
 
@@ -97,14 +309,38 @@ class RuleGenerator:
         category = payload.category
 
         if category == "prompt_injection":
-            return self._rule_prompt_injection(payload.id, payload.arguments)
+            return self._rule_prompt_injection(payload.id, payload.tool, payload.arguments)
         if category == "data_exfiltration":
-            return self._rule_data_exfiltration(payload.id, payload.arguments)
+            return self._rule_data_exfiltration(payload.id, payload.tool, payload.arguments)
         if category == "privilege_escalation":
-            return self._rule_privilege_escalation(payload.id, payload.arguments)
+            return self._rule_privilege_escalation(payload.id, payload.tool, payload.arguments)
         if category == "pii_leak":
             return self._rule_pii_leak(payload.id, payload.tool, payload.arguments)
         return None
+
+    @staticmethod
+    def _select_field(
+        arguments: dict[str, Any],
+        candidates: tuple[str, ...],
+        default_field: str,
+    ) -> tuple[str, str]:
+        """Pick the argument a rule condition should inspect, with its value.
+
+        Prefers a known field name, then the longest string argument (an attack
+        string is far longer than the filler values the scanner puts in other
+        required fields), and falls back to the default name when the payload
+        carries no string arguments at all.
+        """
+        by_lower = {key.lower(): key for key in arguments}
+        for candidate in candidates:
+            key = by_lower.get(candidate)
+            if key is not None and isinstance(arguments[key], str):
+                return key, arguments[key]
+
+        strings = [(key, value) for key, value in arguments.items() if isinstance(value, str)]
+        if strings:
+            return max(strings, key=lambda item: len(item[1]))
+        return default_field, ""
 
     @staticmethod
     def _make_rule(
@@ -114,7 +350,13 @@ class RuleGenerator:
         field: str,
         patterns: list[str],
         description: str,
+        value: str,
     ) -> dict[str, Any]:
+        """Build a pattern_match rule, validating the patterns against `value`.
+
+        `value` is the argument the condition inspects, so every category gets
+        the same guarantee: the emitted rule matches the payload it came from.
+        """
         return {
             "name": f"autogen_{attack_id}",
             "tool": tool,
@@ -125,16 +367,16 @@ class RuleGenerator:
                 {
                     "type": "pattern_match",
                     "field": field,
-                    "patterns": patterns,
+                    "patterns": _patterns_for_value(patterns, value),
                 }
             ],
         }
 
     @staticmethod
     def _rule_prompt_injection(
-        attack_id: str, arguments: dict[str, Any]
+        attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        body: str = arguments.get("body", "")
+        field, body = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
 
         if re.search(_BASE64_PATTERN, body):
             pattern = _BASE64_PATTERN
@@ -152,14 +394,14 @@ class RuleGenerator:
                 pattern = re.escape(first_words)
 
         return RuleGenerator._make_rule(
-            attack_id, "email_send", "BLOCK", "body", [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc, body,
         )
 
     @staticmethod
     def _rule_data_exfiltration(
-        attack_id: str, arguments: dict[str, Any]
+        attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        command: str = arguments.get("command", "")
+        field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
         pattern = r"curl.*-d"
         desc = "blocks data exfiltration via shell"
@@ -170,14 +412,14 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, "shell_exec", "BLOCK", "command", [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc, command,
         )
 
     @staticmethod
     def _rule_privilege_escalation(
-        attack_id: str, arguments: dict[str, Any]
+        attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        command: str = arguments.get("command", "")
+        field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
         pattern = r"rm\s+-rf\s+/"
         desc = "blocks privilege escalation via shell"
@@ -188,24 +430,26 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, "shell_exec", "BLOCK", "command", [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc, command,
         )
 
     @staticmethod
     def _rule_pii_leak(
         attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        if tool == "file_read":
-            file_path: str = arguments.get("path", "")
+        path_keys = {key.lower() for key in arguments} & set(_PATH_FIELDS)
+        if path_keys:
+            field, file_path = RuleGenerator._select_field(arguments, _PATH_FIELDS, "path")
             filename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
             pattern = re.escape(filename)
             return RuleGenerator._make_rule(
-                attack_id, "file_read", "BLOCK", "path", [pattern],
-                f"blocks reads of {filename}",
+                attack_id, tool, "BLOCK", field, [pattern],
+                f"blocks reads of {filename}", file_path,
             )
 
+        field, body = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
         return RuleGenerator._make_rule(
-            attack_id, "email_send", "BLOCK", "body",
+            attack_id, tool, "BLOCK", field,
             [r"\d{3}-\d{2}-\d{4}", r"4\d{3}[-\s]?\d{4}"],
-            "blocks emails containing SSN or credit card numbers",
+            "blocks emails containing SSN or credit card numbers", body,
         )
