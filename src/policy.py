@@ -18,6 +18,7 @@ from src.models import Finding, PolicyAction, PolicyDecision
 logger = logging.getLogger(__name__)
 
 _SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
+_TOKEN_SPLIT_RE = re.compile(r"[,;\s]+")
 
 
 @dataclass(slots=True)
@@ -314,16 +315,16 @@ class PolicyEngine:
                     )
                 )
                 return True
-            host = None if value is None else self._host_from_token(str(value))
-            if host is None or host not in condition.allowed_domains:
-                findings.append(
-                    Finding(
-                        severity="medium",
-                        description=f"Domain not allowlisted: {host or 'unknown'}",
-                        field=condition.field,
+            for host in self._extract_hosts(value) or [None]:
+                if host is None or host not in condition.allowed_domains:
+                    findings.append(
+                        Finding(
+                            severity="medium",
+                            description=f"Domain not allowlisted: {host or 'unknown'}",
+                            field=condition.field,
+                        )
                     )
-                )
-                return True
+                    return True
             return False
 
         if condition.type == "pii_detection":
@@ -398,6 +399,27 @@ class PolicyEngine:
             return cls._host_from_url(f"//{candidate}")
 
         return cls._normalize_host(candidate)
+
+    @classmethod
+    def _extract_hosts(cls, value: Any) -> list[str | None]:
+        """Extract every host referenced by one argument value.
+
+        Lists and tuples recurse per element, so a multi-recipient field is checked
+        entry by entry instead of being stringified whole. Strings split on commas,
+        semicolons, and whitespace. A token that cannot be parsed contributes None so
+        callers can fail closed.
+        """
+        if isinstance(value, (list, tuple)):
+            hosts: list[str | None] = []
+            for item in value:
+                hosts.extend(cls._extract_hosts(item))
+            return hosts
+        if value is None:
+            return [None]
+        tokens = [token for token in _TOKEN_SPLIT_RE.split(str(value)) if token]
+        if not tokens:
+            return [None]
+        return [cls._host_from_token(token) for token in tokens]
 
     @classmethod
     def _host_from_url(cls, url: str) -> str | None:
