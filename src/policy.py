@@ -29,6 +29,8 @@ class Condition:
     field: str | None = None
     patterns: list[str] = dc_field(default_factory=list)
     allowed_domains: set[str] = dc_field(default_factory=set)
+    include_subdomains: bool = False
+    subdomain_domains: set[str] = dc_field(default_factory=set)
     compiled_patterns: list[re.Pattern[str]] = dc_field(default_factory=list)
 
 
@@ -218,7 +220,26 @@ class PolicyEngine:
                     )
                     continue
                 normalized_domains.add(normalized)
-            return Condition(type=cond_type, field=field_name, allowed_domains=normalized_domains)
+            include_subdomains = bool(raw_condition.get("include_subdomains", False))
+            subdomain_domains: set[str] = set()
+            if include_subdomains:
+                for allowed in sorted(normalized_domains):
+                    if not self._suffix_eligible(allowed):
+                        logger.warning(
+                            "Ignoring include_subdomains for this entry rule=%s condition=%s domain=%s",
+                            rule_name,
+                            cond_index,
+                            allowed,
+                        )
+                        continue
+                    subdomain_domains.add(allowed)
+            return Condition(
+                type=cond_type,
+                field=field_name,
+                allowed_domains=normalized_domains,
+                include_subdomains=include_subdomains,
+                subdomain_domains=subdomain_domains,
+            )
 
         if cond_type == "pii_detection":
             raw_patterns = raw_condition.get("patterns")
@@ -316,7 +337,7 @@ class PolicyEngine:
                 )
                 return True
             for host in self._extract_hosts(value) or [None]:
-                if host is None or host not in condition.allowed_domains:
+                if host is None or not self._host_allowlisted(host, condition):
                     findings.append(
                         Finding(
                             severity="medium",
@@ -343,6 +364,32 @@ class PolicyEngine:
             return False
 
         logger.warning("Unhandled condition type during evaluate type=%s", condition.type)
+        return False
+
+    @staticmethod
+    def _host_allowlisted(host: str, condition: Condition) -> bool:
+        """Match a host against the allowlist, exact by default.
+
+        ``include_subdomains: true`` opts a condition into suffix matching. It stays
+        opt-in because suffix matching by default would silently stop flagging hosts
+        like ``mail.company.com`` that an exact allowlist flags today.
+
+        There is no public-suffix list here, so allowlisting something like ``co.uk``
+        with ``include_subdomains`` stays the operator's problem.
+        """
+        if host in condition.allowed_domains:
+            return True
+        return any(host.endswith(f".{allowed}") for allowed in condition.subdomain_domains)
+
+    @staticmethod
+    def _suffix_eligible(allowed: str) -> bool:
+        """Reject IP literals and dotless entries so a bare TLD cannot become a suffix rule."""
+        if "." not in allowed:
+            return False
+        try:
+            ipaddress.ip_address(allowed)
+        except ValueError:
+            return True
         return False
 
     @staticmethod
