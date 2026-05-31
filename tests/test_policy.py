@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,10 @@ import yaml
 
 from src.models import PolicyAction
 from src.policy import PolicyEngine
+
+ZWSP = "\u200b"
+NBSP = "\u00a0"
+CYRILLIC_O = "\u043e"
 
 
 class TestPolicyEngine(unittest.TestCase):
@@ -459,6 +464,195 @@ class TestDomainAllowlistHosts(unittest.TestCase):
         external = engine.evaluate("email_send", {"to": "dev@example.com", "subject": "hi", "body": "hi"})
         self.assertEqual(external.action, PolicyAction.REQUIRE_APPROVAL)
         self.assertEqual(external.rule_name, "flag_external_email")
+
+
+class TestNormalizedRuleMatching(unittest.TestCase):
+    """Views apply to pattern_match and pii_detection only."""
+
+    def _engine(
+        self,
+        root: Path,
+        *,
+        settings: dict | None = None,
+        rule_extra: dict | None = None,
+        condition_extra: dict | None = None,
+    ) -> PolicyEngine:
+        condition: dict = {
+            "type": "pattern_match",
+            "field": "command",
+            "patterns": [r"rm\s+-rf\s+/"],
+            **(condition_extra or {}),
+        }
+        rule: dict = {
+            "name": "block_shell",
+            "tool": "shell_exec",
+            "action": "block",
+            "message": "blocked",
+            "conditions": [condition],
+            **(rule_extra or {}),
+        }
+        policy_path = root / "policy.yaml"
+        with policy_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump({"rules": [rule], "settings": settings or {}}, handle, sort_keys=False)
+        return PolicyEngine(policy_path=str(policy_path))
+
+    def _action(self, engine: PolicyEngine, command: str) -> PolicyAction:
+        return engine.evaluate("shell_exec", {"command": command}).action
+
+    def test_canonical_view_is_on_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            for label, command in {
+                "plain": "rm -rf /",
+                "zero-width": f"rm{ZWSP} -rf /",
+                "fullwidth": "\uff52\uff4d -rf /",
+                "nbsp": f"rm{NBSP}-rf /",
+                "tab-run": "rm \t -rf /",
+            }.items():
+                with self.subTest(label=label):
+                    self.assertEqual(PolicyAction.BLOCK, self._action(engine, command))
+
+    def test_decoded_views_are_off_by_default(self) -> None:
+        """BLOCK cannot be undone over stdio, so decoding stays opt-in."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            encoded = base64.b64encode(b"rm -rf / --no-preserve-root").decode()
+            self.assertEqual(PolicyAction.ALLOW, self._action(engine, encoded))
+
+    def test_rule_level_normalize_can_enable_decoded_views(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), rule_extra={"normalize": {"decoded": True}})
+            encoded = base64.b64encode(b"rm -rf / --no-preserve-root").decode()
+            self.assertEqual(PolicyAction.BLOCK, self._action(engine, encoded))
+            self.assertEqual(PolicyAction.BLOCK, self._action(engine, "rm -rf /"))
+
+    def test_rule_level_normalize_false_restores_raw_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), rule_extra={"normalize": False})
+            self.assertEqual(PolicyAction.ALLOW, self._action(engine, f"rm{ZWSP} -rf /"))
+            self.assertEqual(PolicyAction.BLOCK, self._action(engine, "rm -rf /"))
+
+    def test_condition_level_normalize_overrides_the_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(
+                Path(tmpdir),
+                rule_extra={"normalize": False},
+                condition_extra={"normalize": True},
+            )
+            self.assertEqual(PolicyAction.BLOCK, self._action(engine, f"rm{ZWSP} -rf /"))
+
+    def test_global_setting_can_disable_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), settings={"normalization": {"enabled": False}})
+            self.assertEqual(PolicyAction.ALLOW, self._action(engine, f"rm{ZWSP} -rf /"))
+            self.assertEqual(PolicyAction.BLOCK, self._action(engine, "rm -rf /"))
+
+    def test_global_setting_can_enable_decoded_views(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), settings={"normalization": {"decoded": True}})
+            encoded = base64.b64encode(b"rm -rf / --no-preserve-root").decode()
+            self.assertEqual(PolicyAction.BLOCK, self._action(engine, encoded))
+
+    def test_unusable_normalization_block_falls_back_to_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), settings={"normalization": "yes please"})
+            self.assertEqual(PolicyAction.BLOCK, self._action(engine, f"rm{ZWSP} -rf /"))
+
+    def test_finding_records_the_view_it_matched_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            with self.assertLogs("src.policy", level="INFO") as captured:
+                self._action(engine, f"rm{ZWSP} -rf /")
+            self.assertIn("canonical", "".join(captured.output))
+
+    def test_pii_detection_uses_views(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy_path = Path(tmpdir) / "policy.yaml"
+            with policy_path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(
+                    {
+                        "rules": [
+                            {
+                                "name": "block_pii",
+                                "tool": "email_send",
+                                "action": "block",
+                                "message": "pii",
+                                "conditions": [
+                                    {"type": "pii_detection", "patterns": [r"\b\d{3}-\d{2}-\d{4}\b"]}
+                                ],
+                            }
+                        ],
+                        "settings": {},
+                    },
+                    handle,
+                    sort_keys=False,
+                )
+            engine = PolicyEngine(policy_path=str(policy_path))
+            decision = engine.evaluate("email_send", {"body": f"ssn 123-45{ZWSP}-6789"})
+            self.assertEqual(PolicyAction.BLOCK, decision.action)
+
+
+class TestDomainAllowlistIsNeverNormalized(unittest.TestCase):
+    """Folding is fail-safe for a denylist and fail-OPEN for an allowlist.
+
+    Folding a Cyrillic-o spelling of an allowlisted domain onto its ASCII spelling
+    would make an attacker's confusable domain pass. The correct treatment for an
+    allowlist is the inverse, flagging mixed-script hosts, and belongs in a
+    follow-up. These tests exist so nobody "fixes" this by reflex.
+    """
+
+    def _engine(self, root: Path, *, settings: dict | None = None) -> PolicyEngine:
+        policy_path = root / "policy.yaml"
+        with policy_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(
+                {
+                    "rules": [
+                        {
+                            "name": "external_email",
+                            "tool": "email_send",
+                            "action": "require_approval",
+                            "message": "external",
+                            "normalize": {"canonical": True, "decoded": True},
+                            "conditions": [
+                                {
+                                    "type": "domain_allowlist",
+                                    "field": "to",
+                                    "allowed_domains": ["company.com"],
+                                }
+                            ],
+                        }
+                    ],
+                    "settings": settings or {},
+                },
+                handle,
+                sort_keys=False,
+            )
+        return PolicyEngine(policy_path=str(policy_path))
+
+    def test_confusable_domain_is_still_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            spoofed = f"alice@c{CYRILLIC_O}mpany.com"
+            self.assertNotEqual("alice@company.com", spoofed)
+            decision = engine.evaluate("email_send", {"to": spoofed})
+            self.assertEqual(PolicyAction.REQUIRE_APPROVAL, decision.action)
+
+    def test_allowlisted_and_external_hosts_are_unaffected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            self.assertEqual(
+                PolicyAction.ALLOW, engine.evaluate("email_send", {"to": "alice@company.com"}).action
+            )
+            self.assertEqual(
+                PolicyAction.REQUIRE_APPROVAL,
+                engine.evaluate("email_send", {"to": "alice@evil.com"}).action,
+            )
+
+    def test_allowlist_condition_carries_no_view_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), settings={"normalization": {"decoded": True}})
+            rule = engine._rules[0]
+            self.assertEqual((False, False), rule.conditions[0].normalize)
 
 
 if __name__ == "__main__":
