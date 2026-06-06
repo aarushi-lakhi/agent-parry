@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import logging
 import re
@@ -178,6 +179,15 @@ class PolicyEngine:
     def get_rules(self) -> list[dict[str, Any]]:
         """Return current raw rule definitions."""
         return list(self._raw_rules)
+
+    def get_settings(self) -> dict[str, Any]:
+        """Return the raw ``settings`` block, for consumers other than the rules.
+
+        A copy, so a caller cannot mutate loaded policy and have ``_save`` persist
+        it on the next ``add_rule``.
+        """
+        settings = self._raw_policy.get("settings")
+        return copy.deepcopy(settings) if isinstance(settings, dict) else {}
 
     def _load_policy(self) -> dict[str, Any]:
         if not self.policy_path.exists():
