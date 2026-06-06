@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from src.audit import AuditWriter
-from src.inspector import InputInspector, OutputInspector
+from src.inspector import InputInspector, OutputInspector, ResultInspector
 from src.models import (
+    INJECTION_BLOCK_ERROR_CODE,
+    RESULT_INJECTION_ERROR_CODE,
     TOOLS_CALL_METHOD,
     AuditAction,
     AuditDirection,
@@ -195,10 +197,12 @@ class StdioMcpProxy:
         output_inspector: OutputInspector,
         stdout_lock: asyncio.Lock,
         audit: AuditWriter,
+        result_inspector: ResultInspector | None = None,
     ) -> None:
         self._policy = policy_engine
         self._input_inspector = input_inspector
         self._output_inspector = output_inspector
+        self._result_inspector = result_inspector or ResultInspector()
         self._stdout_lock = stdout_lock
         self._audit = audit
         self._pending_forwarded: dict[Any, str] = {}
@@ -372,7 +376,7 @@ class StdioMcpProxy:
             await self.write_stdout(
                 _error_response(
                     req_id,
-                    code=-32001,
+                    code=INJECTION_BLOCK_ERROR_CODE,
                     message="Blocked: critical prompt injection pattern detected",
                 )
             )
@@ -419,7 +423,7 @@ class StdioMcpProxy:
                 await self.write_stdout(
                     _error_response(
                         req_id,
-                        code=-32001,
+                        code=INJECTION_BLOCK_ERROR_CODE,
                         message=decision.message or "Blocked by policy",
                     )
                 )
@@ -495,18 +499,6 @@ class StdioMcpProxy:
             if isinstance(result, dict):
                 try:
                     sanitized, pii_findings = self._output_inspector.inspect(tool_name, result)
-                    if pii_findings:
-                        msg = dict(msg)
-                        msg["result"] = sanitized
-                        self._record(
-                            AuditAction.REDACT_OUTPUT,
-                            findings=pii_findings,
-                            pii_redactions=len(pii_findings),
-                            detail="PII redacted from tool result",
-                            **inbound,
-                        )
-                    else:
-                        self._record(AuditAction.ALLOW, detail="tool result inspected, no findings", **inbound)
                 except Exception as exc:
                     logger.exception("OutputInspector failed for %s; forwarding raw (fail-open)", tool_name)
                     self._record(
@@ -517,6 +509,61 @@ class StdioMcpProxy:
                         ),
                         **inbound,
                     )
+                    return msg
+
+                if pii_findings:
+                    self._record(
+                        AuditAction.REDACT_OUTPUT,
+                        findings=pii_findings,
+                        pii_redactions=len(pii_findings),
+                        detail="PII redacted from tool result",
+                        **inbound,
+                    )
+
+                # PII first, so the injection scan sees what the model will see.
+                try:
+                    inspection = self._result_inspector.inspect(tool_name, sanitized)
+                except Exception as exc:
+                    logger.exception("ResultInspector failed for %s; forwarding raw (fail-open)", tool_name)
+                    self._record(
+                        AuditAction.FAIL_OPEN,
+                        detail=(
+                            f"ResultInspector raised {type(exc).__name__}; "
+                            "result forwarded without an injection scan (fail-open)"
+                        ),
+                        **inbound,
+                    )
+                    if pii_findings:
+                        msg = dict(msg)
+                        msg["result"] = sanitized
+                    return msg
+
+                if inspection.findings:
+                    self._record(
+                        AuditAction.BLOCK_RESULT_INJECTION
+                        if inspection.blocked
+                        else AuditAction.NEUTRALIZE_RESULT,
+                        findings=inspection.findings,
+                        detail=(
+                            f"{inspection.action}: {len(inspection.findings)} "
+                            "injection finding(s) in tool result"
+                        ),
+                        **inbound,
+                    )
+                if inspection.blocked:
+                    return {
+                        "jsonrpc": msg.get("jsonrpc", "2.0"),
+                        "id": rid,
+                        "error": {
+                            "code": RESULT_INJECTION_ERROR_CODE,
+                            "message": inspection.block_message,
+                        },
+                    }
+                if pii_findings or inspection.findings:
+                    msg = dict(msg)
+                    msg["result"] = inspection.result
+                else:
+                    self._record(AuditAction.ALLOW, detail="tool result inspected, no findings", **inbound)
             else:
                 self._record(AuditAction.ALLOW, detail="tool result is not an object; not inspected", **inbound)
             return msg
@@ -655,6 +702,7 @@ async def _run_proxy(argv: list[str]) -> int:
         policy_engine = PolicyEngine(policy_path=str(policy_path))
         input_inspector = InputInspector()
         output_inspector = OutputInspector()
+        result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
     except Exception:
         logger.exception("Failed to initialize policy/inspectors; exiting")
         return 1
@@ -697,6 +745,7 @@ async def _run_proxy(argv: list[str]) -> int:
         policy_engine=policy_engine,
         input_inspector=input_inspector,
         output_inspector=output_inspector,
+        result_inspector=result_inspector,
         stdout_lock=stdout_lock,
         audit=audit_writer,
     )
