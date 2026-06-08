@@ -26,6 +26,13 @@ Deliberately distinct from -32001 so an operator reading a log, and the scanner
 reading a response, can tell which direction the block came from.
 """
 
+METADATA_BLOCK_ERROR_CODE = -32003
+"""Discovery-side block: a ``tools/list`` or ``initialize`` result was refused.
+
+Its own code rather than -32002 because nothing was called: the poison is in the
+tool catalogue, so an operator seeing this knows discovery failed, not a tool.
+"""
+
 TOOLS_CALL_METHOD = "tools/call"
 
 MCP_EXACT_METHODS = frozenset(
@@ -265,6 +272,25 @@ class ResultInspection(BaseModel):
     block_message: str = ""
 
 
+class MetadataInspection(BaseModel):
+    """Outcome of scanning a ``tools/list`` or ``initialize`` result for poisoning.
+
+    ``action`` is what was actually done, not what was configured: ``redact``
+    escalates to ``drop`` for a finding in a structurally load-bearing value, and
+    findings below the configured threshold are recorded without rewriting
+    anything. ``dropped_tools`` and ``redacted_tools`` name the tools affected so
+    an operator can tell which capability the agent just lost.
+    """
+
+    result: dict[str, Any] = Field(default_factory=dict)
+    findings: list[Finding] = Field(default_factory=list)
+    action: Literal["none", "annotate", "redact", "drop", "block"] = "none"
+    blocked: bool = False
+    block_message: str = ""
+    redacted_tools: list[str] = Field(default_factory=list)
+    dropped_tools: list[str] = Field(default_factory=list)
+
+
 class AttackPayload(BaseModel):
     """Defines one scanner attack payload and expected behavior."""
 
@@ -379,6 +405,8 @@ class ProxyStats(BaseModel):
     flagged_for_approval: int = 0
     result_injections: int = 0
     neutralized: int = 0
+    metadata_injections: int = 0
+    metadata_tools_dropped: int = 0
 
     def increment(
         self,
@@ -390,6 +418,8 @@ class ProxyStats(BaseModel):
         flagged_for_approval: int = 0,
         result_injections: int = 0,
         neutralized: int = 0,
+        metadata_injections: int = 0,
+        metadata_tools_dropped: int = 0,
     ) -> None:
         """Increment one or more counters by non-negative deltas."""
 
@@ -401,6 +431,8 @@ class ProxyStats(BaseModel):
             "flagged_for_approval": flagged_for_approval,
             "result_injections": result_injections,
             "neutralized": neutralized,
+            "metadata_injections": metadata_injections,
+            "metadata_tools_dropped": metadata_tools_dropped,
         }
 
         for name, delta in deltas.items():
@@ -414,6 +446,8 @@ class ProxyStats(BaseModel):
         self.flagged_for_approval += flagged_for_approval
         self.result_injections += result_injections
         self.neutralized += neutralized
+        self.metadata_injections += metadata_injections
+        self.metadata_tools_dropped += metadata_tools_dropped
 
     def reset(self) -> None:
         """Reset all counters to zero."""
@@ -425,6 +459,8 @@ class ProxyStats(BaseModel):
         self.flagged_for_approval = 0
         self.result_injections = 0
         self.neutralized = 0
+        self.metadata_injections = 0
+        self.metadata_tools_dropped = 0
 
 
 __all__ = [
@@ -434,6 +470,7 @@ __all__ = [
     "MATCHED_TEXT_LIMIT",
     "MCP_EXACT_METHODS",
     "MCP_PASSTHROUGH_PREFIXES",
+    "METADATA_BLOCK_ERROR_CODE",
     "MOCK_SERVER_PORT",
     "MOCK_SERVER_URL",
     "PROXY_PORT",
@@ -453,6 +490,7 @@ __all__ = [
     "JsonRpcError",
     "JsonRpcRequest",
     "JsonRpcResponse",
+    "MetadataInspection",
     "PolicyAction",
     "PolicyDecision",
     "ProxyStats",
