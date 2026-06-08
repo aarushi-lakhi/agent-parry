@@ -983,6 +983,8 @@ class MetadataInspector:
         if not isinstance(raw, dict):
             return cls(**kwargs)
         overrides = {key: value for key, value in raw.items() if key in MetadataInspectorSettings.model_fields}
+        if overrides.get("action") is False:
+            overrides["action"] = "off"
         try:
             parsed = MetadataInspectorSettings(**overrides)
         except ValidationError:

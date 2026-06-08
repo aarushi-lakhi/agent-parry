@@ -407,6 +407,10 @@ class TestFromPolicySettings(unittest.TestCase):
         self.assertEqual("redact", MetadataInspector.from_policy_settings({}).settings.action)
         self.assertEqual("redact", MetadataInspector.from_policy_settings(None).settings.action)
 
+    def test_yaml_boolean_off_is_coerced(self) -> None:
+        inspector = MetadataInspector.from_policy_settings({"metadata_inspection": {"action": False}})
+        self.assertEqual("off", inspector.settings.action)
+
     def test_unknown_keys_are_ignored(self) -> None:
         inspector = MetadataInspector.from_policy_settings({"metadata_inspection": {"nope": 1, "action": "drop"}})
         self.assertEqual("drop", inspector.settings.action)

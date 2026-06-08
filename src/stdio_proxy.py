@@ -14,9 +14,16 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from src.audit import AuditWriter
-from src.inspector import InputInspector, OutputInspector, ResultInspector
+from src.inspector import (
+    METADATA_METHODS,
+    InputInspector,
+    MetadataInspector,
+    OutputInspector,
+    ResultInspector,
+)
 from src.models import (
     INJECTION_BLOCK_ERROR_CODE,
+    METADATA_BLOCK_ERROR_CODE,
     RESULT_INJECTION_ERROR_CODE,
     TOOLS_CALL_METHOD,
     AuditAction,
@@ -198,11 +205,13 @@ class StdioMcpProxy:
         stdout_lock: asyncio.Lock,
         audit: AuditWriter,
         result_inspector: ResultInspector | None = None,
+        metadata_inspector: MetadataInspector | None = None,
     ) -> None:
         self._policy = policy_engine
         self._input_inspector = input_inspector
         self._output_inspector = output_inspector
         self._result_inspector = result_inspector or ResultInspector()
+        self._metadata_inspector = metadata_inspector or MetadataInspector()
         self._stdout_lock = stdout_lock
         self._audit = audit
         self._pending_forwarded: dict[Any, str] = {}
@@ -481,8 +490,9 @@ class StdioMcpProxy:
         rid = msg.get("id")
         is_request = isinstance(msg.get("method"), str)
 
+        pending_method: str | None = None
         if rid is not None and not is_request:
-            self._pending_forwarded.pop(rid, None)
+            pending_method = self._pending_forwarded.pop(rid, None)
 
         if rid is not None and not is_request and rid in self._pending_tools:
             tool_name = self._pending_tools.pop(rid)
@@ -568,6 +578,9 @@ class StdioMcpProxy:
                 self._record(AuditAction.ALLOW, detail="tool result is not an object; not inspected", **inbound)
             return msg
 
+        if pending_method in METADATA_METHODS and msg.get("error") is None:
+            return await self._inspect_metadata(msg, rid, pending_method)
+
         if is_request:
             method = msg.get("method")
             self._record(
@@ -586,6 +599,67 @@ class StdioMcpProxy:
             )
 
         return msg
+
+    async def _inspect_metadata(self, msg: dict[str, Any], rid: Any, method: str) -> dict[str, Any]:
+        """Scan a discovery response for poisoned metadata, failing open on error.
+
+        The scan runs on a worker thread: a deeply nested inputSchema walked on
+        the event loop would stall the handshake this response is part of, and the
+        handshake is exactly when a client is least tolerant of a delay.
+        """
+        logger = logging.getLogger(__name__)
+        inbound: dict[str, Any] = {
+            "direction": AuditDirection.SERVER_TO_CLIENT,
+            "method": method,
+            "request_id": rid,
+        }
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            self._record(AuditAction.ALLOW, detail="discovery result is not an object; not inspected", **inbound)
+            return msg
+
+        try:
+            inspection = await asyncio.to_thread(self._metadata_inspector.inspect, method, result)
+        except Exception as exc:
+            logger.exception("Metadata inspection failed for %s; forwarding raw (fail-open)", method)
+            self._record(
+                AuditAction.FAIL_OPEN,
+                detail=(
+                    f"MetadataInspector raised {type(exc).__name__}; "
+                    "discovery result forwarded uninspected (fail-open)"
+                ),
+                **inbound,
+            )
+            return msg
+
+        if not inspection.findings:
+            self._record(AuditAction.ALLOW, detail="discovery metadata inspected, no findings", **inbound)
+            return msg
+
+        affected = inspection.dropped_tools + inspection.redacted_tools
+        detail = f"{inspection.action}: {len(inspection.findings)} poisoned metadata finding(s)"
+        if affected:
+            detail += f" tools={','.join(affected)}"
+        self._record(
+            AuditAction.BLOCK_METADATA if inspection.blocked else AuditAction.REDACT_METADATA,
+            findings=inspection.findings,
+            detail=detail,
+            **inbound,
+        )
+
+        if inspection.blocked:
+            return {
+                "jsonrpc": msg.get("jsonrpc", "2.0"),
+                "id": rid,
+                "error": {
+                    "code": METADATA_BLOCK_ERROR_CODE,
+                    "message": inspection.block_message,
+                },
+            }
+
+        updated = dict(msg)
+        updated["result"] = inspection.result
+        return updated
 
 
 async def _drain_stderr(proc: asyncio.subprocess.Process, log_file: TextIO) -> None:
@@ -703,6 +777,7 @@ async def _run_proxy(argv: list[str]) -> int:
         input_inspector = InputInspector()
         output_inspector = OutputInspector()
         result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+        metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
     except Exception:
         logger.exception("Failed to initialize policy/inspectors; exiting")
         return 1
@@ -746,6 +821,7 @@ async def _run_proxy(argv: list[str]) -> int:
         input_inspector=input_inspector,
         output_inspector=output_inspector,
         result_inspector=result_inspector,
+        metadata_inspector=metadata_inspector,
         stdout_lock=stdout_lock,
         audit=audit_writer,
     )
