@@ -4,7 +4,7 @@ AgentParry helps you **scan**, **protect**, and **verify** autonomous AI agents 
 
 ## Features
 
-- **HTTP proxy** (`src/proxy.py`): FastAPI service that inspects JSON-RPC to an upstream MCP-style endpoint, applies policy, redacts sensitive output, and fences injected instructions found in tool results.
+- **HTTP proxy** (`src/proxy.py`): FastAPI service that inspects JSON-RPC to an upstream MCP-style endpoint, applies policy, redacts sensitive output, fences injected instructions found in tool results, and scans the tool catalogue itself for poisoned metadata.
 - **Stdio MCP proxy** (`src/stdio_proxy.py`): Drop-in wrapper for real MCP servers over stdin/stdout—intended for **Claude Desktop** and **Claude Code**, where the client spawns the MCP process and speaks newline-delimited JSON-RPC (and optionally `Content-Length` framing).
 - **Audit log** (`src/audit.py`): one JSONL line per policy decision, same schema from both transports.
 - **Closed loop** (`agentparry harden` / `agentparry verify`): scan, generate policy rules from the findings, re-scan, and report both what got fixed and what the new rules broke.
@@ -185,6 +185,46 @@ settings:
 ```
 
 Findings and the action taken are recorded on the result itself under `_agentparry.result_injection`, which is also the annotation `annotate` mode leaves behind. `POST /policy/reload` rebuilds the inspector from the file.
+
+## Tool metadata poisoning
+
+`initialize` and `tools/list` used to be forwarded with zero inspection, which left the most-used real-world MCP attack completely uncovered: the malicious instruction lives in the tool's own description or `inputSchema`, the client hands it straight to the model, and it never appears in any `tools/call` argument. `initialize`'s `result.instructions` is worse still, because clients splice it directly into the system prompt.
+
+`MetadataInspector` walks the whole tool object generically rather than an allowlist of keys, so it reaches the name, descriptions at any depth, enum members, defaults, `const`, examples and the property key names, and spec additions like `title`, `annotations` or `outputSchema` are covered without a code change.
+
+On top of the shared `INJECTION_PATTERNS` table it adds signatures that argument injection does not look like:
+
+| Severity | Signal |
+|---|---|
+| critical | Pseudo-tags: `<IMPORTANT>`, `<critical>`, `<system>`, `<note-to-ai>` |
+| critical | Concealment: "do not tell the user", "do not mention", "without informing the user", "keep this secret" |
+| critical | Any invisible character present at all, using the same table `src/normalize.py` strips |
+| high | Preconditions: "before using this tool", "first, you must", "always call X first" |
+| high | A sensitive path in prose: `~/.ssh`, `id_rsa`, `.env`, `mcp.json`, `~/.aws` |
+| medium | An absurdly long description, or a whitespace run long enough to scroll content out of a reviewer's view |
+
+The opaque-blob signal is suppressed when the leaf key is `pattern`, `format` or `$schema`, because a JSON Schema regex is long, mixed-case, punctuation-heavy and does not decode to text, which is exactly the shape that rule looks for.
+
+### Metadata inspection settings
+
+```yaml
+settings:
+  metadata_inspection:
+    enabled: true
+    action: redact          # off | annotate | redact | drop | block
+    severity_threshold: critical  # medium | high | critical
+    exempt_tools: []
+```
+
+The default is **redact at a critical-only threshold**. Prose (description, title, nested descriptions) is replaced with a short marker saying the metadata failed an injection scan, while `type`, `required`, property key names and enum members stay structurally intact, so the tool is still callable and the model is told why it looks empty. Redaction **escalates to dropping that one tool** when the finding sits in a structurally load-bearing value (an enum member, a default, `const`, or the tool name) that cannot be rewritten without breaking client-side schema validation. On `initialize`, `redact` replaces `instructions` and `drop` removes the field.
+
+`block` is not the default because it bricks discovery: a client that cannot list tools has no capabilities at all, and several retry the handshake in a loop. `drop` is not the default because the agent silently loses a capability and then fails later at something that looks unrelated.
+
+**Biggest risk, stated plainly:** real tool descriptions legitimately contain imperative prose, and redacting on a false positive silently degrades a working tool. The critical-only default and the `annotate` escape hatch are the mitigation, but the pattern set needs tuning against a corpus of real MCP servers before anyone should trust `redact` in production. Note also that YAML reads a bare `off` as the boolean `false`; that is coerced rather than rejected, so `action: off` does what it says.
+
+Findings are recorded under `_agentparry.metadata_injection` on the result, carrying no matched text so annotating cannot smuggle the payload back into the model's context. Both transports run the same `MetadataInspector.inspect(method, result)`, both fail open on an inspector error, and the stdio side runs the scan on a worker thread so a deep schema cannot stall the handshake. A block returns `-32003`, distinct from `-32001` (input-side) and `-32002` (result-side).
+
+`src/mock_server.py` always advertises a poisoned `customer_lookup` tool, with poison in the top-level description, a nested property description, an enum member and a default, plus one zero-width-obfuscated span, and returns poisoned `initialize` instructions. The scanner's metadata phase runs on every scan, not only under `--discover`, and its verdict comes from re-running the inspector over whatever came back rather than from any marker the proxy self-reports.
 
 ## Normalization
 
