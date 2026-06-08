@@ -501,6 +501,8 @@ def format_console_line(record: AuditRecord, *, arguments: dict[str, Any] | None
         return f"[REDACT]  {tool:<10} ({record.pii_redactions or 0} PII items redacted)"
     if record.action in (AuditAction.BLOCK_RESULT_INJECTION, AuditAction.NEUTRALIZE_RESULT):
         return f"[RESULT]  {tool:<10} {record.detail}"
+    if record.action in (AuditAction.BLOCK_METADATA, AuditAction.REDACT_METADATA):
+        return f"[META]    {record.method or '-':<10} {record.detail}"
     args_text = json.dumps(arguments or {}, separators=(", ", ": "), ensure_ascii=True, default=str)
     if record.action is AuditAction.BLOCK_POLICY:
         return f"[BLOCK]   {tool:<10} {args_text}  <- {record.rule or 'policy_block'}"
