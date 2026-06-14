@@ -442,10 +442,11 @@ class RuleGenerator:
     ) -> dict[str, Any] | None:
         field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
+        haystack = command.lower()
         pattern = r"curl.*-d"
         desc = "blocks data exfiltration via shell"
         for keyword, pat, label in _DE_PATTERNS:
-            if keyword in command:
+            if keyword.lower() in haystack:
                 pattern = pat
                 desc = f"blocks {label}"
                 break
@@ -460,10 +461,11 @@ class RuleGenerator:
     ) -> dict[str, Any] | None:
         field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
+        haystack = command.lower()
         pattern = r"rm\s+-rf\s+/"
         desc = "blocks privilege escalation via shell"
         for keyword, pat, label in _PE_PATTERNS:
-            if keyword in command:
+            if keyword.lower() in haystack:
                 pattern = pat
                 desc = f"blocks {label}"
                 break
