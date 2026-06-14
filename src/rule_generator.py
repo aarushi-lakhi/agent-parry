@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import logging
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ from rich.console import Console
 from rich.table import Table
 
 from src.models import AttackResult, ScanReport
+
+logger = logging.getLogger(__name__)
 
 console = Console()
 
@@ -69,6 +72,9 @@ def _patterns_for_value(patterns: list[str], value: str) -> list[str]:
     that beats a rule which blocks nothing. Generalising the literal is future
     work.
 
+    A blank value takes the table pattern untouched, so the escape path here can
+    never produce the empty pattern. `_usable_patterns` handles what is left.
+
     PolicyEngine compiles rule patterns with re.IGNORECASE, so the check uses
     the same flag; otherwise a pattern that will fire at runtime reads as dead.
     """
@@ -81,6 +87,27 @@ def _patterns_for_value(patterns: list[str], value: str) -> list[str]:
         except re.error:
             continue
     return [re.escape(value[:_MAX_ESCAPED_VALUE])]
+
+
+def _usable_patterns(patterns: list[str], value: str) -> list[str]:
+    """Resolve patterns for `value`, dropping any that matches every request.
+
+    A pattern that matches the empty string is found in every input by
+    re.search, so a rule carrying one blocks all traffic to its tool. That is
+    what a payload with a blank or absent text argument produced, via
+    `re.escape("")`. An unparseable pattern is kept, because PolicyEngine
+    already refuses the whole rule when a pattern will not compile.
+    """
+    resolved = _patterns_for_value(patterns, value)
+    kept: list[str] = []
+    for pattern in resolved:
+        try:
+            if re.search(pattern, "") is not None:
+                continue
+        except re.error:
+            pass
+        kept.append(pattern)
+    return kept
 
 
 def _is_benign(result: AttackResult) -> bool:
@@ -351,12 +378,24 @@ class RuleGenerator:
         patterns: list[str],
         description: str,
         value: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Build a pattern_match rule, validating the patterns against `value`.
 
         `value` is the argument the condition inspects, so every category gets
         the same guarantee: the emitted rule matches the payload it came from.
+
+        Returns None when nothing usable is left, rather than a rule whose
+        condition matches every call to the tool.
         """
+        usable = _usable_patterns(patterns, value)
+        if not usable:
+            logger.warning(
+                "Refusing to generate a match-all rule attack_id=%s tool=%s field=%s",
+                attack_id,
+                tool,
+                field,
+            )
+            return None
         return {
             "name": f"autogen_{attack_id}",
             "tool": tool,
@@ -367,7 +406,7 @@ class RuleGenerator:
                 {
                     "type": "pattern_match",
                     "field": field,
-                    "patterns": _patterns_for_value(patterns, value),
+                    "patterns": usable,
                 }
             ],
         }
@@ -375,7 +414,7 @@ class RuleGenerator:
     @staticmethod
     def _rule_prompt_injection(
         attack_id: str, tool: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         field, body = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
 
         if re.search(_BASE64_PATTERN, body):
@@ -400,13 +439,14 @@ class RuleGenerator:
     @staticmethod
     def _rule_data_exfiltration(
         attack_id: str, tool: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
+        haystack = command.lower()
         pattern = r"curl.*-d"
         desc = "blocks data exfiltration via shell"
         for keyword, pat, label in _DE_PATTERNS:
-            if keyword in command:
+            if keyword.lower() in haystack:
                 pattern = pat
                 desc = f"blocks {label}"
                 break
@@ -418,13 +458,14 @@ class RuleGenerator:
     @staticmethod
     def _rule_privilege_escalation(
         attack_id: str, tool: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         field, command = RuleGenerator._select_field(arguments, _COMMAND_FIELDS, "command")
 
+        haystack = command.lower()
         pattern = r"rm\s+-rf\s+/"
         desc = "blocks privilege escalation via shell"
         for keyword, pat, label in _PE_PATTERNS:
-            if keyword in command:
+            if keyword.lower() in haystack:
                 pattern = pat
                 desc = f"blocks {label}"
                 break
@@ -436,7 +477,7 @@ class RuleGenerator:
     @staticmethod
     def _rule_pii_leak(
         attack_id: str, tool: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         path_keys = {key.lower() for key in arguments} & set(_PATH_FIELDS)
         if path_keys:
             field, file_path = RuleGenerator._select_field(arguments, _PATH_FIELDS, "path")
