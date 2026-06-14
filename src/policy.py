@@ -16,7 +16,13 @@ import yaml
 from pydantic import ValidationError
 
 from src.models import Finding, PolicyAction, PolicyDecision
-from src.normalize import VIEW_ORIGINAL, Normalizer, NormalizerSettings, TextView
+from src.normalize import (
+    VIEW_ORIGINAL,
+    Normalizer,
+    NormalizerSettings,
+    TextView,
+    find_invisible,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -518,10 +524,20 @@ class PolicyEngine:
         ``::1`` compare equal. Names are IDNA-encoded so a Unicode spelling and its
         punycode spelling compare equal.
 
+        A host carrying an invisible or format character is refused outright,
+        before IDNA encoding, because the ``idna`` codec's nameprep silently strips
+        those: ``comp<ZWSP>any.com`` would otherwise normalize to ``company.com``
+        and satisfy an allowlist for it, while the downstream mail or HTTP client
+        is free to read the same string as a different host. None here means the
+        caller flags the value, so the rule's action applies.
+
         Deliberately no Unicode normalization or homoglyph folding: folding is
         fail-open for an allowlist, since folding a Cyrillic-o spelling of
         ``company.com`` onto the ASCII one would let a confusable domain through.
-        Flagging mixed-script hosts is the inverse job and belongs in its own check.
+        Refusing an invisible character is the opposite move, flagging the host
+        rather than making it comparable. Flagging mixed-script hosts is the same
+        idea again and belongs in its own check, since unlike an invisible
+        character a mixed-script host can be legitimate.
 
         Never raises. ``src.stdio_proxy`` fails open on policy exceptions, so a raise
         out of here would silently disable enforcement for that call.
@@ -532,6 +548,9 @@ class PolicyEngine:
         if candidate.startswith("[") and candidate.endswith("]"):
             candidate = candidate[1:-1]
         if not candidate:
+            return None
+        if find_invisible(candidate):
+            logger.warning("Refusing host with invisible characters host=%r", host)
             return None
         try:
             return ipaddress.ip_address(candidate).compressed
