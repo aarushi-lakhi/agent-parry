@@ -2,18 +2,33 @@
 
 from __future__ import annotations
 
+import copy
+import ipaddress
 import logging
 import re
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
+from pydantic import ValidationError
 
 from src.models import Finding, PolicyAction, PolicyDecision
+from src.normalize import VIEW_ORIGINAL, Normalizer, NormalizerSettings, TextView
 
 logger = logging.getLogger(__name__)
+
+_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
+_TOKEN_SPLIT_RE = re.compile(r"[,;\s]+")
+
+_NORMALIZABLE_TYPES = frozenset({"pattern_match", "pii_detection"})
+
+ViewFlags = tuple[bool, bool]
+"""Resolved (canonical, decoded) view switches for one condition."""
+
+_NO_VIEWS: ViewFlags = (False, False)
 
 
 @dataclass(slots=True)
@@ -24,7 +39,10 @@ class Condition:
     field: str | None = None
     patterns: list[str] = dc_field(default_factory=list)
     allowed_domains: set[str] = dc_field(default_factory=set)
+    include_subdomains: bool = False
+    subdomain_domains: set[str] = dc_field(default_factory=set)
     compiled_patterns: list[re.Pattern[str]] = dc_field(default_factory=list)
+    normalize: ViewFlags = _NO_VIEWS
 
 
 @dataclass(slots=True)
@@ -46,18 +64,46 @@ class PolicyEngine:
         self._raw_policy: dict[str, Any] = {"rules": [], "settings": {}}
         self._raw_rules: list[dict[str, Any]] = []
         self._rules: list[Rule] = []
+        self._default_views: ViewFlags = (True, False)
+        self._base_settings = NormalizerSettings()
+        self._normalizers: dict[ViewFlags, Normalizer] = {}
         self.reload()
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PolicyDecision:
         """Evaluate one tool call against loaded rules in-memory."""
+        view_cache: dict[tuple[bool, bool, str], list[TextView]] = {}
         for rule in self._rules:
             if not self._tool_matches(rule.tool, tool_name):
                 continue
             findings: list[Finding] = []
-            if self._rule_matches(rule, arguments, findings):
+            if self._rule_matches(rule, arguments, findings, view_cache):
                 self._log_rule_match(rule=rule, tool_name=tool_name, findings=findings)
                 return PolicyDecision(action=rule.action, rule_name=rule.name, message=rule.message)
         return PolicyDecision(action=PolicyAction.ALLOW)
+
+    def _views(
+        self,
+        condition: Condition,
+        text: str,
+        view_cache: dict[tuple[bool, bool, str], list[TextView]],
+    ) -> list[TextView]:
+        if condition.normalize == _NO_VIEWS:
+            return [TextView(name=VIEW_ORIGINAL, text=text, original_length=len(text))]
+        key = (condition.normalize[0], condition.normalize[1], text)
+        cached = view_cache.get(key)
+        if cached is None:
+            cached = self._normalizer_for(condition.normalize).views(text)
+            view_cache[key] = cached
+        return cached
+
+    def _normalizer_for(self, flags: ViewFlags) -> Normalizer:
+        normalizer = self._normalizers.get(flags)
+        if normalizer is None:
+            normalizer = Normalizer(
+                self._base_settings.model_copy(update={"canonical": flags[0], "decoded": flags[1]})
+            )
+            self._normalizers[flags] = normalizer
+        return normalizer
 
     def add_rule(self, rule: dict[str, Any]) -> None:
         """Append a rule and persist policy YAML."""
@@ -82,11 +128,66 @@ class PolicyEngine:
         loaded = self._load_policy()
         self._raw_policy = loaded
         self._raw_rules = list(loaded.get("rules") or [])
+        self._load_normalization_settings(loaded.get("settings") or {})
         self._rebuild_compiled_rules()
+
+    def _load_normalization_settings(self, settings: Any) -> None:
+        """Read the ``settings.normalization`` block.
+
+        Canonical views default ON: they only ever make a rule match text a human
+        reads as identical to what they typed, and the surprise direction is more
+        blocking, which is the fail-safe direction.
+
+        Decoded views default OFF. Matching an ``rm -rf /`` rule against the
+        plaintext inside an opaque base64 string is a semantic leap the rule
+        author did not ask for, and BLOCK cannot be recovered from over stdio.
+        Turn them on per rule once you have decided that is what you want.
+        """
+        self._normalizers.clear()
+        raw = settings.get("normalization") if isinstance(settings, dict) else None
+        if not isinstance(raw, dict):
+            self._base_settings = NormalizerSettings()
+            self._default_views = (True, False)
+            return
+
+        overrides = {key: value for key, value in raw.items() if key in NormalizerSettings.model_fields}
+        try:
+            self._base_settings = NormalizerSettings(**overrides)
+        except ValidationError:
+            logger.exception("Invalid settings.normalization block, using defaults")
+            self._base_settings = NormalizerSettings()
+
+        enabled = raw.get("enabled", True)
+        if not enabled:
+            self._default_views = _NO_VIEWS
+            return
+        self._default_views = (self._base_settings.canonical, self._base_settings.decoded)
+
+    def _resolve_normalize(self, raw: Any, rule_name: str, inherited: ViewFlags) -> ViewFlags:
+        """Resolve a ``normalize:`` override against the value it inherits."""
+        if raw is None:
+            return inherited
+        if isinstance(raw, bool):
+            return (True, inherited[1]) if raw else _NO_VIEWS
+        if isinstance(raw, dict):
+            canonical = raw.get("canonical", inherited[0])
+            decoded = raw.get("decoded", inherited[1])
+            return (bool(canonical), bool(decoded))
+        logger.warning("Ignoring unusable normalize override rule=%s value=%r", rule_name, raw)
+        return inherited
 
     def get_rules(self) -> list[dict[str, Any]]:
         """Return current raw rule definitions."""
         return list(self._raw_rules)
+
+    def get_settings(self) -> dict[str, Any]:
+        """Return the raw ``settings`` block, for consumers other than the rules.
+
+        A copy, so a caller cannot mutate loaded policy and have ``_save`` persist
+        it on the next ``add_rule``.
+        """
+        settings = self._raw_policy.get("settings")
+        return copy.deepcopy(settings) if isinstance(settings, dict) else {}
 
     def _load_policy(self) -> dict[str, Any]:
         if not self.policy_path.exists():
@@ -140,9 +241,11 @@ class PolicyEngine:
             logger.warning("Skipping rule with invalid conditions name=%s", name)
             return None
 
+        rule_views = self._resolve_normalize(raw_rule.get("normalize"), name, self._default_views)
+
         conditions: list[Condition] = []
         for cond_index, raw_condition in enumerate(raw_conditions):
-            parsed_condition = self._parse_condition(raw_condition, name, cond_index)
+            parsed_condition = self._parse_condition(raw_condition, name, cond_index, rule_views)
             if parsed_condition is None:
                 logger.warning("Skipping malformed rule name=%s", name)
                 return None
@@ -169,6 +272,7 @@ class PolicyEngine:
         raw_condition: Any,
         rule_name: str,
         cond_index: int,
+        rule_views: ViewFlags,
     ) -> Condition | None:
         if not isinstance(raw_condition, dict):
             logger.warning("Condition is not a dict rule=%s condition=%s", rule_name, cond_index)
@@ -177,6 +281,10 @@ class PolicyEngine:
         if cond_type == "":
             logger.warning("Condition missing type rule=%s condition=%s", rule_name, cond_index)
             return None
+
+        views = self._resolve_normalize(raw_condition.get("normalize"), rule_name, rule_views)
+        if cond_type not in _NORMALIZABLE_TYPES:
+            views = _NO_VIEWS
 
         if cond_type == "always":
             return Condition(type=cond_type)
@@ -194,19 +302,47 @@ class PolicyEngine:
                 field=field_name,
                 patterns=[str(pattern) for pattern in raw_patterns],
                 compiled_patterns=compiled,
+                normalize=views,
             )
 
         if cond_type == "domain_allowlist":
+            # Deliberately never normalized, see _condition_matches.
             field_name = raw_condition.get("field")
             raw_domains = raw_condition.get("allowed_domains")
             if not isinstance(field_name, str) or not isinstance(raw_domains, list):
                 return None
-            normalized_domains = {
-                str(domain).strip().lower()
-                for domain in raw_domains
-                if str(domain).strip()
-            }
-            return Condition(type=cond_type, field=field_name, allowed_domains=normalized_domains)
+            normalized_domains: set[str] = set()
+            for domain in raw_domains:
+                normalized = self._normalize_host(str(domain))
+                if normalized is None:
+                    logger.warning(
+                        "Dropping unusable allowlist domain rule=%s condition=%s domain=%s",
+                        rule_name,
+                        cond_index,
+                        domain,
+                    )
+                    continue
+                normalized_domains.add(normalized)
+            include_subdomains = bool(raw_condition.get("include_subdomains", False))
+            subdomain_domains: set[str] = set()
+            if include_subdomains:
+                for allowed in sorted(normalized_domains):
+                    if not self._suffix_eligible(allowed):
+                        logger.warning(
+                            "Ignoring include_subdomains for this entry rule=%s condition=%s domain=%s",
+                            rule_name,
+                            cond_index,
+                            allowed,
+                        )
+                        continue
+                    subdomain_domains.add(allowed)
+            return Condition(
+                type=cond_type,
+                field=field_name,
+                allowed_domains=normalized_domains,
+                include_subdomains=include_subdomains,
+                subdomain_domains=subdomain_domains,
+            )
 
         if cond_type == "pii_detection":
             raw_patterns = raw_condition.get("patterns")
@@ -219,6 +355,7 @@ class PolicyEngine:
                 type=cond_type,
                 patterns=[str(pattern) for pattern in raw_patterns],
                 compiled_patterns=compiled,
+                normalize=views,
             )
 
         logger.warning(
@@ -259,9 +396,10 @@ class PolicyEngine:
         rule: Rule,
         arguments: dict[str, Any],
         findings: list[Finding],
+        view_cache: dict[tuple[bool, bool, str], list[TextView]],
     ) -> bool:
         return all(
-            self._condition_matches(condition, arguments, findings)
+            self._condition_matches(condition, arguments, findings, view_cache)
             for condition in rule.conditions
         )
 
@@ -270,6 +408,7 @@ class PolicyEngine:
         condition: Condition,
         arguments: dict[str, Any],
         findings: list[Finding],
+        view_cache: dict[tuple[bool, bool, str], list[TextView]],
     ) -> bool:
         if condition.type == "always":
             findings.append(Finding(severity="low", description="Always condition matched"))
@@ -279,13 +418,19 @@ class PolicyEngine:
             value = arguments.get(condition.field or "")
             candidate = "" if value is None else str(value)
             for idx, compiled in enumerate(condition.compiled_patterns):
-                if compiled.search(candidate):
+                for view in self._views(condition, candidate, view_cache):
+                    match = compiled.search(view.text)
+                    if match is None:
+                        continue
                     findings.append(
                         Finding(
                             severity="high",
                             description=f"Pattern matched in {condition.field}",
                             field=condition.field,
                             matched_pattern=condition.patterns[idx] if idx < len(condition.patterns) else None,
+                            view=view.name,
+                            matched_text=match.group(0),
+                            span=view.map_span(*match.span()),
                         )
                     )
                     return True
@@ -293,7 +438,6 @@ class PolicyEngine:
 
         if condition.type == "domain_allowlist":
             value = arguments.get(condition.field or "")
-            domain = self._extract_domain(value)
             # Empty allowlist intentionally flags everything.
             if not condition.allowed_domains:
                 findings.append(
@@ -304,27 +448,34 @@ class PolicyEngine:
                     )
                 )
                 return True
-            if domain is None or domain not in condition.allowed_domains:
-                findings.append(
-                    Finding(
-                        severity="medium",
-                        description=f"Domain not allowlisted: {domain or 'unknown'}",
-                        field=condition.field,
+            for host in self._extract_hosts(value) or [None]:
+                if host is None or not self._host_allowlisted(host, condition):
+                    findings.append(
+                        Finding(
+                            severity="medium",
+                            description=f"Domain not allowlisted: {host or 'unknown'}",
+                            field=condition.field,
+                        )
                     )
-                )
-                return True
+                    return True
             return False
 
         if condition.type == "pii_detection":
             flattened_values = self._flatten_values(arguments)
             for candidate in flattened_values:
                 for idx, compiled in enumerate(condition.compiled_patterns):
-                    if compiled.search(candidate):
+                    for view in self._views(condition, candidate, view_cache):
+                        match = compiled.search(view.text)
+                        if match is None:
+                            continue
                         findings.append(
                             Finding(
                                 severity="high",
                                 description="PII pattern matched in arguments",
                                 matched_pattern=condition.patterns[idx] if idx < len(condition.patterns) else None,
+                                view=view.name,
+                                matched_text=match.group(0),
+                                span=view.map_span(*match.span()),
                             )
                         )
                         return True
@@ -334,15 +485,116 @@ class PolicyEngine:
         return False
 
     @staticmethod
-    def _extract_domain(value: Any) -> str | None:
+    def _host_allowlisted(host: str, condition: Condition) -> bool:
+        """Match a host against the allowlist, exact by default.
+
+        ``include_subdomains: true`` opts a condition into suffix matching. It stays
+        opt-in because suffix matching by default would silently stop flagging hosts
+        like ``mail.company.com`` that an exact allowlist flags today.
+
+        There is no public-suffix list here, so allowlisting something like ``co.uk``
+        with ``include_subdomains`` stays the operator's problem.
+        """
+        if host in condition.allowed_domains:
+            return True
+        return any(host.endswith(f".{allowed}") for allowed in condition.subdomain_domains)
+
+    @staticmethod
+    def _suffix_eligible(allowed: str) -> bool:
+        """Reject IP literals and dotless entries so a bare TLD cannot become a suffix rule."""
+        if "." not in allowed:
+            return False
+        try:
+            ipaddress.ip_address(allowed)
+        except ValueError:
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_host(host: str) -> str | None:
+        """Return a comparable host string, or None when nothing usable is left.
+
+        IP literals collapse to their canonical form so ``[0:0:0:0:0:0:0:1]`` and
+        ``::1`` compare equal. Names are IDNA-encoded so a Unicode spelling and its
+        punycode spelling compare equal.
+
+        Deliberately no Unicode normalization or homoglyph folding: folding is
+        fail-open for an allowlist, since folding a Cyrillic-o spelling of
+        ``company.com`` onto the ASCII one would let a confusable domain through.
+        Flagging mixed-script hosts is the inverse job and belongs in its own check.
+
+        Never raises. ``src.stdio_proxy`` fails open on policy exceptions, so a raise
+        out of here would silently disable enforcement for that call.
+        """
+        candidate = host.strip().casefold()
+        if candidate.endswith("."):
+            candidate = candidate[:-1]
+        if candidate.startswith("[") and candidate.endswith("]"):
+            candidate = candidate[1:-1]
+        if not candidate:
+            return None
+        try:
+            return ipaddress.ip_address(candidate).compressed
+        except ValueError:
+            pass
+        try:
+            # The idna codec rejects empty labels and labels over 63 chars.
+            return candidate.encode("idna").decode("ascii")
+        except (UnicodeError, UnicodeDecodeError):
+            return candidate
+
+    @classmethod
+    def _host_from_token(cls, token: str) -> str | None:
+        """Extract the host from one URL, email address, or bare hostname token."""
+        candidate = token.strip()
+        if not candidate:
+            return None
+
+        if _SCHEME_RE.match(candidate) or candidate.startswith("//"):
+            return cls._host_from_url(candidate)
+
+        at_index = candidate.find("@")
+        if at_index != -1 and "/" not in candidate[:at_index]:
+            remainder = candidate.rsplit("@", 1)[1]
+            if any(char in remainder for char in "/:?@"):
+                return None
+            return cls._normalize_host(remainder)
+
+        if "/" in candidate or ":" in candidate:
+            return cls._host_from_url(f"//{candidate}")
+
+        return cls._normalize_host(candidate)
+
+    @classmethod
+    def _extract_hosts(cls, value: Any) -> list[str | None]:
+        """Extract every host referenced by one argument value.
+
+        Lists and tuples recurse per element, so a multi-recipient field is checked
+        entry by entry instead of being stringified whole. Strings split on commas,
+        semicolons, and whitespace. A token that cannot be parsed contributes None so
+        callers can fail closed.
+        """
+        if isinstance(value, (list, tuple)):
+            hosts: list[str | None] = []
+            for item in value:
+                hosts.extend(cls._extract_hosts(item))
+            return hosts
         if value is None:
+            return [None]
+        tokens = [token for token in _TOKEN_SPLIT_RE.split(str(value)) if token]
+        if not tokens:
+            return [None]
+        return [cls._host_from_token(token) for token in tokens]
+
+    @classmethod
+    def _host_from_url(cls, url: str) -> str | None:
+        try:
+            hostname = urlsplit(url).hostname
+        except ValueError:
             return None
-        address = str(value).strip()
-        if "@" not in address:
+        if not hostname:
             return None
-        _, domain = address.rsplit("@", 1)
-        normalized = domain.strip().lower()
-        return normalized or None
+        return cls._normalize_host(hostname)
 
     @classmethod
     def _flatten_values(cls, value: Any) -> list[str]:
@@ -365,6 +617,8 @@ class PolicyEngine:
                 "field": finding.field,
                 "pattern": finding.matched_pattern,
                 "description": finding.description,
+                "view": finding.view,
+                "span": finding.span,
             }
             for finding in findings
         ]

@@ -80,3 +80,17 @@ rules:
 settings:
   log_all_calls: true
   log_file: agentparry.log
+  normalization:
+    enabled: true
+    canonical: true
+    decoded: false
+  result_inspection:
+    enabled: true
+    action: neutralize
+    severity_threshold: high
+    exempt_tools: []
+  metadata_inspection:
+    enabled: true
+    action: redact
+    severity_threshold: critical
+    exempt_tools: []

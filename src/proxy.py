@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import secrets
 import shlex
@@ -25,9 +26,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 from src import audit
-from src.inspector import InputInspector, OutputInspector
+from src.inspector import (
+    METADATA_METHODS,
+    InputInspector,
+    MetadataInspector,
+    OutputInspector,
+    ResultInspector,
+)
 from src.models import (
+    INJECTION_BLOCK_ERROR_CODE,
+    METADATA_BLOCK_ERROR_CODE,
     MOCK_SERVER_URL,
+    RESULT_INJECTION_ERROR_CODE,
     AuditAction,
     AuditDirection,
     AuditRecord,
@@ -40,6 +50,8 @@ from src.models import (
     is_tools_call,
 )
 from src.policy import PolicyEngine
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_POLICY_PATH = "config/default_policy.yaml"
 
@@ -54,6 +66,8 @@ console = Console()
 policy_engine = PolicyEngine(policy_path=_policy_path())
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
+result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
 stats = ProxyStats()
 
 _stdio_server: subprocess.Popen[bytes] | None = None
@@ -329,6 +343,71 @@ def _validated_response(request_id: int | str, upstream_payload: dict[str, Any])
         )
 
 
+def _inspect_metadata(
+    request: JsonRpcRequest,
+    upstream_payload: dict[str, Any],
+    audit_ctx: dict[str, Any],
+) -> JsonRpcResponse:
+    """Scan a discovery result for poisoned metadata, failing open on error.
+
+    Fail-open matches the rest of the proxy: an inspector bug must not make a
+    client unable to list tools.
+    """
+    result_payload = upstream_payload.get("result")
+    if not isinstance(result_payload, dict):
+        return _validated_response(request.id, upstream_payload)
+
+    try:
+        inspection = metadata_inspector.inspect(request.method, result_payload)
+    except Exception as exc:
+        logger.exception("Metadata inspection failed for %s; forwarding raw (fail-open)", request.method)
+        _record(
+            AuditAction.FAIL_OPEN,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            detail=(
+                f"MetadataInspector raised {type(exc).__name__}; "
+                "discovery result forwarded uninspected (fail-open)"
+            ),
+            **audit_ctx,
+        )
+        return _validated_response(request.id, upstream_payload)
+
+    if not inspection.findings:
+        _record(
+            AuditAction.ALLOW,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            detail="discovery metadata inspected, no findings",
+            **audit_ctx,
+        )
+        return _validated_response(request.id, upstream_payload)
+
+    affected = inspection.dropped_tools + inspection.redacted_tools
+    stats.increment(
+        metadata_injections=1,
+        metadata_tools_dropped=len(inspection.dropped_tools),
+    )
+    detail = f"{inspection.action}: {len(inspection.findings)} poisoned metadata finding(s)"
+    if affected:
+        detail += f" tools={','.join(affected)}"
+    _record(
+        AuditAction.BLOCK_METADATA if inspection.blocked else AuditAction.REDACT_METADATA,
+        direction=AuditDirection.SERVER_TO_CLIENT,
+        findings=inspection.findings,
+        detail=detail,
+        **audit_ctx,
+    )
+    if inspection.blocked:
+        stats.increment(blocked=1)
+        return _jsonrpc_error(
+            request_id=request.id,
+            code=METADATA_BLOCK_ERROR_CODE,
+            message=inspection.block_message,
+        )
+
+    upstream_payload["result"] = inspection.result
+    return _validated_response(request.id, upstream_payload)
+
+
 def _handle_mcp_rpc(
     request: JsonRpcRequest,
     *,
@@ -340,6 +419,15 @@ def _handle_mcp_rpc(
         "request_id": request.id,
         "session_id": session_id,
     }
+    if request.method in METADATA_METHODS:
+        _record(
+            AuditAction.PASSTHROUGH,
+            detail="discovery method forwarded for metadata inspection",
+            **audit_ctx,
+        )
+        upstream_payload = _forward_to_upstream(request.model_dump())
+        return _inspect_metadata(request, upstream_payload, audit_ctx)
+
     if not is_tools_call(request.method):
         if not is_known_mcp_method(request.method):
             _record(AuditAction.METHOD_NOT_FOUND, detail="method not in the MCP allowlist", **audit_ctx)
@@ -382,7 +470,7 @@ def _handle_mcp_rpc(
         )
         return _jsonrpc_error(
             request_id=request.id,
-            code=-32001,
+            code=INJECTION_BLOCK_ERROR_CODE,
             message="Blocked: critical prompt injection pattern detected",
         )
 
@@ -400,7 +488,7 @@ def _handle_mcp_rpc(
         )
         return _jsonrpc_error(
             request_id=request.id,
-            code=-32001,
+            code=INJECTION_BLOCK_ERROR_CODE,
             message=decision.message or "Blocked by policy",
         )
 
@@ -450,8 +538,30 @@ def _handle_mcp_rpc(
             detail="PII redacted from tool result",
             **audit_ctx,
         )
-        upstream_payload["result"] = sanitized_result
 
+    # PII first, so the injection scan sees the text the model will actually see.
+    inspection = result_inspector.inspect(tool_name, sanitized_result)
+    if inspection.findings:
+        stats.increment(result_injections=1)
+        if inspection.action in ("neutralize", "redact"):
+            stats.increment(neutralized=1)
+        _record(
+            AuditAction.BLOCK_RESULT_INJECTION if inspection.blocked else AuditAction.NEUTRALIZE_RESULT,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            tool=tool_name,
+            findings=inspection.findings,
+            detail=f"{inspection.action}: {len(inspection.findings)} injection finding(s) in tool result",
+            **audit_ctx,
+        )
+    if inspection.blocked:
+        stats.increment(blocked=1)
+        return _jsonrpc_error(
+            request_id=request.id,
+            code=RESULT_INJECTION_ERROR_CODE,
+            message=inspection.block_message,
+        )
+
+    upstream_payload["result"] = inspection.result
     return _validated_response(request.id, upstream_payload)
 
 
@@ -482,6 +592,13 @@ def get_stats() -> dict[str, int]:
     return stats.model_dump()
 
 
+def _rebuild_inspectors() -> None:
+    """Rebuild the settings-derived inspectors after a policy load."""
+    global result_inspector, metadata_inspector
+    result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+    metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
+
+
 def set_policy_path(path: str) -> None:
     """Repoint the live policy engine and reload it.
 
@@ -491,11 +608,13 @@ def set_policy_path(path: str) -> None:
     os.environ["AGENTPARRY_POLICY"] = path
     policy_engine.policy_path = Path(path)
     policy_engine.reload()
+    _rebuild_inspectors()
 
 
 @app.post("/policy/reload", dependencies=[Depends(require_admin)])
 def reload_policy() -> dict[str, Any]:
     policy_engine.reload()
+    _rebuild_inspectors()
     return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
 
 
