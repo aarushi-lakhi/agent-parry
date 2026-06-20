@@ -23,6 +23,8 @@ from src.models import (
     PROXY_URL,
     AttackPayload,
     AttackResult,
+    AttackStep,
+    AttackStepResult,
     ConfusionMatrix,
     Finding,
     ScanReport,
@@ -92,6 +94,25 @@ _SATISFIES: dict[str, frozenset[str]] = {
     EXPECTED_REDACT: _OUTPUT_SIDE_ACTIONS,
     EXPECTED_NEUTRALIZE: _OUTPUT_SIDE_ACTIONS,
 }
+
+STEP_REF_PATTERN = re.compile(r"\{\{\s*step(\d+)(?:\.([^{}\s]+))?\s*\}\}")
+"""One ``{{stepN.path}}`` reference inside a sequence step's arguments."""
+
+_SEQUENCE_PRECEDENCE: tuple[str, ...] = (
+    OBSERVED_BLOCK,
+    OBSERVED_REDACT,
+    OBSERVED_NEUTRALIZE,
+    OBSERVED_UNAVAILABLE,
+    OBSERVED_EVALUATED,
+    OBSERVED_ALLOW,
+)
+"""Which step observation decides a whole sequence, most decisive first.
+
+The strictest action the proxy took on any step wins, because stopping the chain
+anywhere stops the attack. ``unavailable`` ranks below every action and above
+``allow``: a step that could not run leaves the sequence unjudged rather than
+missed, but it cannot override a step the proxy really did act on.
+"""
 
 METADATA_CATEGORY = "tool_poisoning"
 """Category for the discovery-side rows, so rule generation skips them.
@@ -168,6 +189,80 @@ def normalize_expected(expected: str) -> str:
     if value in VALID_EXPECTATIONS:
         return value
     return EXPECTED_BLOCK
+
+
+class StepReferenceError(LookupError):
+    """A ``{{stepN.path}}`` reference that no earlier step response can satisfy."""
+
+
+def _lookup_step_path(root: Any, path: str, step_number: int) -> Any:
+    segments = [segment for segment in path.split(".") if segment]
+    value = root
+    for segment in segments:
+        if isinstance(value, dict) and segment in value:
+            value = value[segment]
+        elif isinstance(value, list) and segment.isdigit() and int(segment) < len(value):
+            value = value[int(segment)]
+        else:
+            raise StepReferenceError(f"step{step_number} result has no path '{path}'")
+    return value
+
+
+def _render_step_value(value: Any) -> str:
+    """Render a referenced value for interpolation into a string argument."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True)
+
+
+def substitute_step_refs(value: Any, step_results: dict[int, Any]) -> Any:
+    """Resolve every ``{{stepN.path}}`` reference in a JSON value.
+
+    ``stepN`` is 1-based over the payload's own ``steps``, and ``path`` is a
+    dot-separated path into that step's JSON-RPC ``result``: ``{{step1.content}}``
+    reads ``result.content``, ``{{step1.content.0.text}}`` indexes a list on the
+    way down, and a bare ``{{step1}}`` takes the whole result. A non-string value
+    interpolates as compact JSON, and a reference is substituted wherever it
+    appears inside a larger string.
+
+    ``step_results`` maps a step number to that step's ``result``. Raises
+    :class:`StepReferenceError` when a reference names a step that produced no
+    result, or a path that result does not contain, which is how the executor
+    learns the chain is broken.
+    """
+    if isinstance(value, str):
+        return _substitute_step_refs_in_text(value, step_results)
+    if isinstance(value, dict):
+        return {key: substitute_step_refs(item, step_results) for key, item in value.items()}
+    if isinstance(value, list):
+        return [substitute_step_refs(item, step_results) for item in value]
+    return value
+
+
+def _substitute_step_refs_in_text(text: str, step_results: dict[int, Any]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        step_number = int(match.group(1))
+        if step_number not in step_results:
+            raise StepReferenceError(f"step{step_number} produced no result to reference")
+        path = match.group(2)
+        root = step_results[step_number]
+        resolved = root if path is None else _lookup_step_path(root, path, step_number)
+        return _render_step_value(resolved)
+
+    return STEP_REF_PATTERN.sub(replace, text)
+
+
+def sequence_observed(step_observations: list[str]) -> str:
+    """Reduce a sequence's per-step observations to one observation for the payload.
+
+    The payload's ``expected_behavior`` applies to the sequence as a whole, so the
+    sequence is blocked when any step is blocked. See ``_SEQUENCE_PRECEDENCE``.
+    """
+    present = set(step_observations)
+    for candidate in _SEQUENCE_PRECEDENCE:
+        if candidate in present:
+            return candidate
+    return OBSERVED_UNAVAILABLE
 
 
 def result_injection_observed(result_value: dict[str, Any]) -> str | None:
@@ -367,6 +462,30 @@ def vulnerability_score(results: list[AttackResult]) -> float:
     return round((passed / len(attacks)) * 100, 1)
 
 
+def remap_payload(payload: AttackPayload, server_tool_names: list[str]) -> AttackPayload | None:
+    """Remap a payload's tool, and every step's tool, onto server tool names.
+
+    Returns None when the payload cannot run, which for a sequence includes any
+    single step whose tool has no counterpart: a chain missing a link is not a
+    weaker version of the same attack.
+    """
+    mapped = map_yaml_tool_to_server(payload.tool, server_tool_names)
+    if mapped is None:
+        return None
+    if not payload.steps:
+        return payload if mapped == payload.tool else payload.model_copy(update={"tool": mapped})
+
+    mapped_steps: list[AttackStep] = []
+    for step in payload.steps:
+        mapped_step = map_yaml_tool_to_server(step.tool, server_tool_names)
+        if mapped_step is None:
+            return None
+        mapped_steps.append(
+            step if mapped_step == step.tool else step.model_copy(update={"tool": mapped_step})
+        )
+    return payload.model_copy(update={"tool": mapped, "steps": mapped_steps})
+
+
 def filter_and_remap_payloads(
     payloads: list[AttackPayload], server_tool_names: list[str]
 ) -> tuple[list[AttackPayload], int]:
@@ -374,14 +493,11 @@ def filter_and_remap_payloads(
     matched = 0
     out: list[AttackPayload] = []
     for p in payloads:
-        mapped = map_yaml_tool_to_server(p.tool, server_tool_names)
-        if mapped is None:
+        remapped = remap_payload(p, server_tool_names)
+        if remapped is None:
             continue
         matched += 1
-        if mapped != p.tool:
-            out.append(p.model_copy(update={"tool": mapped}))
-        else:
-            out.append(p)
+        out.append(remapped)
     return out, matched
 
 
@@ -820,6 +936,14 @@ class Scanner:
         tallies = _Tallies()
 
         for idx, payload in enumerate(payloads_to_run, start=1):
+            if payload.steps:
+                sequence = await self._execute_sequence(
+                    client, proxy_url, headers, payload, idx, safe=safe
+                )
+                results.append(sequence)
+                tallies.record(sequence)
+                continue
+
             rpc_request: dict[str, Any] = {
                 "jsonrpc": "2.0",
                 "method": "tools/call",
@@ -850,6 +974,130 @@ class Scanner:
             tallies.record(result)
 
         return results, tallies
+
+    async def _execute_sequence(
+        self,
+        client: httpx.AsyncClient,
+        proxy_url: str,
+        headers: dict[str, str],
+        payload: AttackPayload,
+        base_id: int,
+        *,
+        safe: bool = False,
+    ) -> AttackResult:
+        """Run a multi-step payload in order, threading each result into the next.
+
+        The chain stops at the first step the proxy blocked or the target could
+        not run, and every remaining step scores `indeterminate` rather than a
+        miss: nothing was measured about a call that was never made.
+        """
+        step_results: list[AttackStepResult] = []
+        bodies: dict[int, dict[str, Any]] = {}
+        resolved: dict[int, Any] = {}
+        halted_at = 0
+
+        for number, step in enumerate(payload.steps, start=1):
+            if halted_at:
+                step_results.append(
+                    self._skipped_step(
+                        number, step, f"Not run: the chain stopped at step{halted_at}"
+                    )
+                )
+                continue
+
+            try:
+                arguments = substitute_step_refs(step.arguments, resolved)
+            except StepReferenceError as exc:
+                step_results.append(self._skipped_step(number, step, f"Not run: {exc}"))
+                halted_at = number
+                continue
+
+            rpc_request = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": step.tool, "arguments": arguments},
+                "id": f"{base_id}.{number}",
+            }
+            try:
+                resp = await client.post(proxy_url, json=rpc_request, headers=headers)
+                body = resp.json()
+            except httpx.HTTPError as exc:
+                step_results.append(
+                    self._skipped_step(number, step, f"Connection error: {exc}", arguments=arguments)
+                )
+                halted_at = number
+                continue
+
+            probe = self._classify_observed(payload, body)
+            observed = probe.observed_behavior
+            bodies[number] = body
+            step_results.append(
+                AttackStepResult(
+                    index=number,
+                    tool=step.tool,
+                    arguments=arguments,
+                    observed_behavior=observed,
+                    outcome=classify_outcome(payload.expected_behavior, observed, safe=safe),
+                    executed=True,
+                    notes=probe.notes,
+                    error_code=probe.error_code,
+                )
+            )
+            if observed in (OBSERVED_BLOCK, OBSERVED_UNAVAILABLE):
+                halted_at = number
+            else:
+                resolved[number] = body.get("result")
+
+        return self._sequence_result(payload, step_results, bodies, safe=safe)
+
+    @staticmethod
+    def _skipped_step(
+        number: int,
+        step: AttackStep,
+        notes: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+    ) -> AttackStepResult:
+        """One step that never reached the target, scored indeterminate."""
+        return AttackStepResult(
+            index=number,
+            tool=step.tool,
+            arguments=arguments or {},
+            observed_behavior=OBSERVED_UNAVAILABLE,
+            outcome=OUTCOME_INDETERMINATE,
+            notes=notes,
+        )
+
+    @staticmethod
+    def _sequence_result(
+        payload: AttackPayload,
+        step_results: list[AttackStepResult],
+        bodies: dict[int, dict[str, Any]],
+        *,
+        safe: bool,
+    ) -> AttackResult:
+        """Fold per-step observations into the one row the payload contributes."""
+        observed = sequence_observed([s.observed_behavior for s in step_results])
+        decisive_step = next(
+            (s for s in step_results if s.observed_behavior == observed and s.index in bodies),
+            None,
+        )
+        decisive = decisive_step.index if decisive_step else None
+        summary = ", ".join(f"step{s.index} {s.observed_behavior}" for s in step_results)
+        return AttackResult(
+            payload=payload,
+            was_blocked=observed in (OBSERVED_BLOCK, OBSERVED_UNAVAILABLE),
+            was_redacted=observed == OBSERVED_REDACT,
+            was_neutralized=observed == OBSERVED_NEUTRALIZE,
+            evaluated_only=observed == OBSERVED_EVALUATED,
+            passed_through=observed == OBSERVED_ALLOW,
+            proxy_response=bodies.get(decisive) if decisive else None,
+            observed_behavior=observed,
+            outcome=classify_outcome(payload.expected_behavior, observed, safe=safe),
+            error_code=decisive_step.error_code if decisive_step else None,
+            notes=f"{len(step_results)}-step sequence: {summary}",
+            step_results=step_results,
+        )
 
     async def run_rescan(
         self,
