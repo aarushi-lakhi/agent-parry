@@ -293,8 +293,33 @@ class MetadataInspection(BaseModel):
     dropped_tools: list[str] = Field(default_factory=list)
 
 
+class AttackStep(BaseModel):
+    """One ``tools/call`` inside a multi-step attack payload.
+
+    ``arguments`` may carry ``{{stepN.path}}`` references, resolved against an
+    earlier step's response before the call goes out. See
+    :func:`src.scanner.substitute_step_refs` for the syntax.
+    """
+
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    name: str = ""
+    description: str = ""
+
+
 class AttackPayload(BaseModel):
-    """Defines one scanner attack payload and expected behavior."""
+    """Defines one scanner attack payload and expected behavior.
+
+    ``steps`` turns the payload into a sequence: the scanner runs each step in
+    order against the same target instead of issuing ``arguments`` as a single
+    call. Empty for a single-step payload, so every payload and every persisted
+    report written before sequences existed still validates.
+
+    ``known_gap`` marks a payload no detection exists for yet. Those still run and
+    still appear in the report, but they are held out of ``detection_rate`` unless
+    asked for, so landing a batch of them cannot silently collapse the number CI
+    gates on.
+    """
 
     id: str
     name: str
@@ -304,14 +329,40 @@ class AttackPayload(BaseModel):
     expected_behavior: str = ""
     severity: str = "low"
     description: str = ""
+    steps: list[AttackStep] = Field(default_factory=list)
+    known_gap: bool = False
+
+
+class AttackStepResult(BaseModel):
+    """What the target did with one step of a sequence payload.
+
+    ``arguments`` are the substituted ones actually sent, so a report shows what
+    an earlier step fed forward. Empty on a step that never ran.
+    """
+
+    index: int
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    observed_behavior: str = ""
+    outcome: str = ""
+    executed: bool = False
+    notes: str = ""
+    error_code: int | None = None
 
 
 class AttackResult(BaseModel):
-    """Captures the observed result for a single attack payload."""
+    """Captures the observed result for a single attack payload.
+
+    ``was_neutralized`` is its own flag rather than a second meaning for
+    ``was_redacted``: an untrusted-content fence keeps the offending text and
+    warns the model, while redaction removes it. Defaulted, so a report
+    persisted before the flag existed still validates.
+    """
 
     payload: AttackPayload
     was_blocked: bool = False
     was_redacted: bool = False
+    was_neutralized: bool = False
     passed_through: bool = False
     evaluated_only: bool = False
     proxy_response: dict[str, Any] | None = None
@@ -319,16 +370,29 @@ class AttackResult(BaseModel):
     observed_behavior: str = ""
     outcome: str = ""
     error_code: int | None = None
+    step_results: list[AttackStepResult] = Field(default_factory=list)
 
 
 class ConfusionMatrix(BaseModel):
-    """Counts expected-versus-observed outcomes across one scan."""
+    """Counts expected-versus-observed outcomes across one scan.
+
+    ``neutralized`` cuts across the other five: it counts results the proxy
+    fenced instead of blocking or redacting, whatever they scored. Without it a
+    neutralize against an ``expected_behavior: block`` payload is a bare
+    false_negative, indistinguishable from a payload nothing touched.
+
+    ``known_gap`` also cuts across: it counts ``known_gap`` payloads whether or
+    not they were folded into the other five, so a report can never show a
+    detection rate without showing how many payloads it declined to grade.
+    """
 
     true_block: int = 0
     false_negative: int = 0
     true_allow: int = 0
     false_positive: int = 0
     indeterminate: int = 0
+    neutralized: int = 0
+    known_gap: int = 0
 
     @property
     def attack_total(self) -> int:
@@ -382,6 +446,7 @@ class ScanReport(BaseModel):
     blocked: int = 0
     passed: int = 0
     redacted: int = 0
+    neutralized: int = 0
     policy_allowed_safe: int = 0
     results: list[AttackResult] = Field(default_factory=list)
     vulnerability_score: float = 0.0
@@ -395,6 +460,8 @@ class ScanReport(BaseModel):
     matrix: ConfusionMatrix | None = None
     attack_total: int = 0
     benign_total: int = 0
+    known_gap_total: int = 0
+    include_known_gaps: bool = False
 
 
 class ProxyStats(BaseModel):
@@ -481,6 +548,8 @@ __all__ = [
     "TOOLS_CALL_METHOD",
     "AttackPayload",
     "AttackResult",
+    "AttackStep",
+    "AttackStepResult",
     "AuditAction",
     "AuditArgsMode",
     "AuditDirection",
