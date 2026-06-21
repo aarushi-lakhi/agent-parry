@@ -7,6 +7,7 @@ AgentParry helps you **scan**, **protect**, and **verify** autonomous AI agents 
 - **HTTP proxy** (`src/proxy.py`): FastAPI service that inspects JSON-RPC to an upstream MCP-style endpoint, applies policy, redacts sensitive output, fences injected instructions found in tool results, and scans the tool catalogue itself for poisoned metadata.
 - **Stdio MCP proxy** (`src/stdio_proxy.py`): Drop-in wrapper for real MCP servers over stdin/stdout—intended for **Claude Desktop** and **Claude Code**, where the client spawns the MCP process and speaks newline-delimited JSON-RPC (and optionally `Content-Length` framing).
 - **Audit log** (`src/audit.py`): one JSONL line per policy decision, same schema from both transports.
+- **Replay** (`agentparry replay`): reads the audit log back, reports what actually happened, and gates CI on `FAIL_OPEN`.
 - **Closed loop** (`agentparry harden` / `agentparry verify`): scan, generate policy rules from the findings, re-scan, and report both what got fixed and what the new rules broke.
 
 ## Stdio proxy (Claude / MCP)
@@ -180,6 +181,33 @@ Tool arguments are the sensitive part, so the default records no values at all.
 Every record stamps `args_mode`, so any single line tells you whether the file is sensitive. Response payloads are never recorded at any tier, only a redaction count and finding summaries; a finding's `pattern` is the regex source, never the matched text.
 
 The console output of the HTTP proxy still shows raw arguments. That is deliberate: the console is ephemeral and local, the file is persistent and may be shipped somewhere.
+
+### Reading it back
+
+`agentparry replay` is the reader.
+
+```bash
+agentparry replay                                                    # default audit path
+agentparry replay --policy config/default_policy.yaml --bucket day
+agentparry replay --format json --fail-on-fail-open                  # exit 3 if any FAIL_OPEN
+agentparry replay --policy config/default_policy.yaml --against candidate.yaml
+```
+
+Reported from the log alone, with no policy file: the `FAIL_OPEN` count, `REQUIRE_APPROVAL` decisions made over stdio, which rules fired and on which tools, which tools were called, response-side result and metadata decisions, and a day/hour/minute decision histogram. With `--policy`, also the rules in that policy that never fired anywhere in the log. `--format json` prints the whole report for CI.
+
+**`--fail-on-fail-open` is the gate worth wiring into CI.** A `FAIL_OPEN` record means a rule crashed and the call was forwarded unchecked. Nothing else reports it, and it must be zero.
+
+Reading is defensive because the writer never `fsync`s: a torn final line is flagged separately from a mid-file corruption, unknown future fields are dropped and the record kept, an unknown `action` value is rejected and counted, and mixed `schema_version`s, blank lines and the rotated `.1` sibling (`--rotated`) all read. Nothing in that list is fatal.
+
+Dead rules are absence of evidence. A rule can be silent because nothing triggered it, because an earlier rule shadows it, or because the log predates it, and replay cannot tell those apart. Replay describes traffic that happened; it says nothing about an attack nobody tried. `harden` and `verify` still own that.
+
+### Replaying a candidate policy
+
+`--against` re-evaluates every recorded policy decision against a candidate policy and labels each one `unchanged`, `newly_blocked`, `no_longer_blocked`, `action_changed` or `indeterminate`.
+
+Read the `indeterminate` count first. A default record stores a keyed hash of the arguments, not the arguments, so a `pattern_match` rule has no input to re-run. Those decisions are reported `indeterminate` and are never counted as a pass. What makes the rest answerable is that a recorded decision constrains the policy that produced it: first-match-wins means the rule that fired had every condition match and every earlier rule for that tool did not, so an identical condition in the candidate policy inherits that answer. Pass `--policy` as well as `--against`, or almost nothing is settleable.
+
+Coverage therefore tracks how much the two policies share. Action changes, renames and reordering settle cleanly. A brand-new pattern rule, or one whose regex you edited by a single character, is a different condition and does not settle at all, which is the edit people make most. Records written with `AGENTPARRY_AUDIT_ARGS=full` replay exactly, but that is not a reason to turn it on.
 
 ## Result injection detection
 

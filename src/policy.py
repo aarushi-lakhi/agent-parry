@@ -195,6 +195,11 @@ class PolicyEngine:
         settings = self._raw_policy.get("settings")
         return copy.deepcopy(settings) if isinstance(settings, dict) else {}
 
+    @property
+    def compiled_rules(self) -> list[Rule]:
+        """Parsed rules in first-match-wins order, malformed ones already dropped."""
+        return list(self._rules)
+
     def _load_policy(self) -> dict[str, Any]:
         if not self.policy_path.exists():
             logger.warning("Policy file does not exist, using empty policy path=%s", self.policy_path)
