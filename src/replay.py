@@ -12,6 +12,11 @@ count, and raw arguments when the log was recorded with `args_mode=full`). A
 decision whose outcome depends on an `UNKNOWN` rule is reported as
 indeterminate, never guessed.
 
+Every `AuditAction` lands in exactly one reported group: policy decisions, input
+decisions no rule produced, and the response-side result, metadata and output
+actions. Nothing is folded into an "other" bucket, and an action value this
+build does not know is rejected at parse time and counted.
+
 Reading is defensive. A JSONL log can have a torn final line, unknown future
 fields and mixed schema versions; unparseable lines are counted, not fatal.
 """
@@ -56,6 +61,33 @@ POLICY_SCOPE_ACTIONS = frozenset(
     {AuditAction.ALLOW, AuditAction.BLOCK_POLICY, AuditAction.REQUIRE_APPROVAL}
 )
 
+UNPOLICED_INPUT_ACTIONS = frozenset(
+    {
+        AuditAction.BLOCK_INJECTION,
+        AuditAction.INVALID_PARAMS,
+        AuditAction.METHOD_NOT_FOUND,
+        AuditAction.PASSTHROUGH,
+        AuditAction.FAIL_OPEN,
+    }
+)
+
+RESULT_ACTIONS = frozenset({AuditAction.BLOCK_RESULT_INJECTION, AuditAction.NEUTRALIZE_RESULT})
+
+METADATA_ACTIONS = frozenset({AuditAction.BLOCK_METADATA, AuditAction.REDACT_METADATA})
+
+OUTPUT_ACTIONS = frozenset({AuditAction.REDACT_OUTPUT})
+
+RESPONSE_SIDE_ACTIONS = RESULT_ACTIONS | METADATA_ACTIONS | OUTPUT_ACTIONS
+
+BLOCKING_ACTIONS = frozenset(
+    {
+        AuditAction.BLOCK_POLICY,
+        AuditAction.BLOCK_INJECTION,
+        AuditAction.BLOCK_RESULT_INJECTION,
+        AuditAction.BLOCK_METADATA,
+    }
+)
+
 STOPPING_ACTIONS = frozenset({PolicyAction.BLOCK, PolicyAction.REQUIRE_APPROVAL})
 
 BUCKET_WIDTHS = {"day": 10, "hour": 13, "minute": 16}
@@ -63,6 +95,7 @@ DEFAULT_BUCKET = "hour"
 
 MAX_SAMPLES = 20
 DEFAULT_TOP = 10
+RUN_ID_CHARS = 8
 EMPTY_ARGS_BYTES = 2
 UNKNOWN_BUCKET = "unknown"
 
@@ -111,6 +144,26 @@ class TimeBucket(BaseModel):
     blocks: int = 0
     approvals: int = 0
     fail_open: int = 0
+    response_side: int = 0
+
+
+class ResponseSideCounts(BaseModel):
+    """Server-to-client decisions, none of which a policy rule produced.
+
+    Result-injection and metadata actions are inspector verdicts on what the
+    upstream server sent back, so they are outside every policy replay and are
+    reported on their own rather than folded into the policy totals.
+    """
+
+    total: int = 0
+    result_injection_blocked: int = 0
+    result_neutralized: int = 0
+    metadata_blocked: int = 0
+    metadata_redacted: int = 0
+    output_redacted: int = 0
+    pii_redactions: int = 0
+    tools: dict[str, int] = Field(default_factory=dict)
+    methods: dict[str, int] = Field(default_factory=dict)
 
 
 class LogSummary(BaseModel):
@@ -133,15 +186,21 @@ class LogSummary(BaseModel):
     fail_open_samples: list[str] = Field(default_factory=list)
     stdio_require_approval: int = 0
     stdio_require_approval_tools: dict[str, int] = Field(default_factory=dict)
+    response_side: ResponseSideCounts = Field(default_factory=ResponseSideCounts)
     buckets: list[TimeBucket] = Field(default_factory=list)
     policy_decisions: int = 0
     with_arguments: int = 0
 
 
 class DecisionChange(BaseModel):
-    """One recorded decision re-evaluated against a candidate policy."""
+    """One recorded decision re-evaluated against a candidate policy.
+
+    `seq` restarts at 1 in every run, so `run` is what makes a sample line
+    identify a single decision.
+    """
 
     seq: int = 0
+    run: str = ""
     ts: str = ""
     tool: str | None = None
     recorded_action: str = ""
@@ -160,6 +219,7 @@ class PolicyDiff(BaseModel):
     rules: int = 0
     considered: int = 0
     out_of_scope: int = 0
+    out_of_scope_actions: dict[str, int] = Field(default_factory=dict)
     counts: dict[str, int] = Field(default_factory=dict)
     samples: list[DecisionChange] = Field(default_factory=list)
     blocking_rules: dict[str, int] = Field(default_factory=dict)
@@ -301,6 +361,34 @@ def fired_rules(log: AuditLog) -> set[str]:
     return {r.rule for r in log.records if r.rule}
 
 
+_RESPONSE_FIELDS = {
+    AuditAction.BLOCK_RESULT_INJECTION: "result_injection_blocked",
+    AuditAction.NEUTRALIZE_RESULT: "result_neutralized",
+    AuditAction.BLOCK_METADATA: "metadata_blocked",
+    AuditAction.REDACT_METADATA: "metadata_redacted",
+    AuditAction.REDACT_OUTPUT: "output_redacted",
+}
+
+
+def _tally_response_side(
+    record: AuditRecord,
+    counts: ResponseSideCounts,
+    tools: Counter[str],
+    methods: Counter[str],
+) -> None:
+    """Add one server-to-client decision to the response-side totals."""
+    field = _RESPONSE_FIELDS.get(record.action)
+    if field is None:
+        return
+    counts.total += 1
+    setattr(counts, field, getattr(counts, field) + 1)
+    counts.pii_redactions += record.pii_redactions or 0
+    if record.tool:
+        tools[record.tool] += 1
+    if record.action in METADATA_ACTIONS and record.method:
+        methods[record.method] += 1
+
+
 def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT_TOP) -> LogSummary:
     """Aggregate a log into the questions answerable without any policy file."""
     actions: Counter[str] = Counter()
@@ -312,7 +400,10 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
     args_modes: Counter[str] = Counter()
     key_ids: Counter[str] = Counter()
     approval_tools: Counter[str] = Counter()
+    response_tools: Counter[str] = Counter()
+    response_methods: Counter[str] = Counter()
     buckets: dict[str, TimeBucket] = {}
+    response = ResponseSideCounts()
     runs: set[str] = set()
     fail_open_samples: list[str] = []
     fail_open = 0
@@ -352,20 +443,26 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
         ):
             stdio_approvals += 1
             approval_tools[record.tool or "-"] += 1
+        if record.action in RESPONSE_SIDE_ACTIONS:
+            _tally_response_side(record, response, response_tools, response_methods)
 
         slot = buckets.setdefault(bucket_key(record.ts, bucket), TimeBucket(bucket=bucket_key(record.ts, bucket)))
         slot.total += 1
-        if record.action in (AuditAction.BLOCK_POLICY, AuditAction.BLOCK_INJECTION):
+        if record.action in BLOCKING_ACTIONS:
             slot.blocks += 1
         if record.action is AuditAction.REQUIRE_APPROVAL:
             slot.approvals += 1
         if record.action is AuditAction.FAIL_OPEN:
             slot.fail_open += 1
+        if record.action in RESPONSE_SIDE_ACTIONS:
+            slot.response_side += 1
 
     usage = [
         RuleUsage(rule=name, count=count, tools=dict(rule_tools.get(name, Counter()).most_common()))
         for name, count in rule_counts.most_common(top)
     ]
+    response.tools = dict(response_tools.most_common(top))
+    response.methods = dict(response_methods.most_common(top))
 
     return LogSummary(
         sources=list(log.sources),
@@ -385,6 +482,7 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
         fail_open_samples=fail_open_samples,
         stdio_require_approval=stdio_approvals,
         stdio_require_approval_tools=dict(approval_tools.most_common()),
+        response_side=response,
         buckets=[buckets[key] for key in sorted(buckets)],
         policy_decisions=policy_decisions,
         with_arguments=with_arguments,
@@ -564,12 +662,19 @@ def _equivalent(recorded: AuditAction, new: PolicyAction) -> bool:
         return new in (PolicyAction.ALLOW, PolicyAction.REDACT_OUTPUT)
     if recorded is AuditAction.BLOCK_POLICY:
         return new is PolicyAction.BLOCK
-    return new is PolicyAction.REQUIRE_APPROVAL
+    if recorded is AuditAction.REQUIRE_APPROVAL:
+        return new is PolicyAction.REQUIRE_APPROVAL
+    return False
 
 
 def classify(recorded: AuditAction, new: PolicyAction | None) -> str:
-    """Label how a candidate policy's action differs from what was recorded."""
-    if new is None:
+    """Label how a candidate policy's action differs from what was recorded.
+
+    An action no policy rule produced, including every response-side action, has
+    nothing to compare against and is reported indeterminate rather than being
+    forced into a block/allow verdict.
+    """
+    if recorded not in POLICY_SCOPE_ACTIONS or new is None:
         return VERDICT_INDETERMINATE
     if _equivalent(recorded, new):
         return VERDICT_UNCHANGED
@@ -612,6 +717,7 @@ def replay_policy(
     counts: Counter[str] = Counter()
     blocking: Counter[str] = Counter()
     unreplayable: Counter[str] = Counter()
+    out_of_scope_actions: Counter[str] = Counter()
     samples: list[DecisionChange] = []
     considered = 0
     out_of_scope = 0
@@ -620,6 +726,7 @@ def replay_policy(
     for record in log.records:
         if not is_policy_decision(record):
             out_of_scope += 1
+            out_of_scope_actions[record.action.value] += 1
             continue
         considered += 1
         facts = condition_facts(baseline, record) if baseline else {}
@@ -636,6 +743,7 @@ def replay_policy(
             samples.append(
                 DecisionChange(
                     seq=record.seq,
+                    run=record.run_id[:RUN_ID_CHARS],
                     ts=record.ts,
                     tool=record.tool,
                     recorded_action=record.action.value,
@@ -654,6 +762,7 @@ def replay_policy(
         rules=len(rules),
         considered=considered,
         out_of_scope=out_of_scope,
+        out_of_scope_actions=dict(out_of_scope_actions.most_common()),
         counts={name: counts.get(name, 0) for name in VERDICT_ORDER},
         samples=samples,
         blocking_rules=dict(blocking.most_common()),
@@ -671,6 +780,7 @@ def build_report(
     top: int = DEFAULT_TOP,
     baseline_policy: Path | str | None = None,
     candidate_policy: Path | str | None = None,
+    max_samples: int = MAX_SAMPLES,
 ) -> ReplayReport:
     """Summarize a log, plus dead-rule and candidate-policy analysis if asked."""
     summary = summarize(log, bucket=bucket, top=top)
@@ -683,13 +793,33 @@ def build_report(
         report.dead_rules = [rule.name for rule in rules if rule.name not in fired]
         report.unmatched_fired_rules = sorted(fired - known)
     if candidate_policy is not None:
-        report.diff = replay_policy(log, candidate_policy, baseline_path=baseline_policy)
+        report.diff = replay_policy(
+            log, candidate_policy, baseline_path=baseline_policy, max_samples=max_samples
+        )
     return report
 
 
 def _counter_line(counts: dict[str, int], limit: int = DEFAULT_TOP) -> str:
     items = list(counts.items())[:limit]
     return ", ".join(f"{name} {count}" for name, count in items) or "none"
+
+
+def _render_response_side(counts: ResponseSideCounts) -> list[str]:
+    out = [f"Response-side decisions (no policy rule produced these): {counts.total}"]
+    out.append(
+        f"  tool results: {counts.result_injection_blocked} blocked, "
+        f"{counts.result_neutralized} neutralized"
+    )
+    out.append(
+        f"  tool metadata: {counts.metadata_blocked} blocked, {counts.metadata_redacted} redacted"
+    )
+    out.append(f"  outputs redacted: {counts.output_redacted} ({counts.pii_redactions} PII items)")
+    if counts.tools:
+        out.append(f"  tools: {_counter_line(counts.tools)}")
+    if counts.methods:
+        out.append(f"  metadata methods: {_counter_line(counts.methods)}")
+    out.append("")
+    return out
 
 
 def render_text(report: ReplayReport) -> str:
@@ -725,7 +855,7 @@ def render_text(report: ReplayReport) -> str:
 
     out.append("Decisions by action:")
     for action, count in summary.actions.items():
-        out.append(f"  {action:<18} {count}")
+        out.append(f"  {action:<22} {count}")
     out.append("")
 
     out.append(f"FAIL_OPEN (a rule crashed and traffic was allowed unchecked): {summary.fail_open}")
@@ -737,6 +867,8 @@ def render_text(report: ReplayReport) -> str:
     if summary.stdio_require_approval_tools:
         out.append(f"  {_counter_line(summary.stdio_require_approval_tools)}")
     out.append("")
+
+    out.extend(_render_response_side(summary.response_side))
 
     out.append("Rules that fired:")
     if not summary.rules:
@@ -750,7 +882,8 @@ def render_text(report: ReplayReport) -> str:
     for slot in summary.buckets:
         out.append(
             f"  {slot.bucket:<18} {slot.total:>5} total  {slot.blocks:>4} block  "
-            f"{slot.approvals:>4} approval  {slot.fail_open:>3} fail-open"
+            f"{slot.approvals:>4} approval  {slot.fail_open:>3} fail-open  "
+            f"{slot.response_side:>4} response-side"
         )
     out.append("")
 
@@ -775,8 +908,10 @@ def _render_diff(diff: PolicyDiff) -> list[str]:
     out.append(f"Replay against {diff.policy} ({diff.rules} rules)")
     out.append(
         f"  {diff.considered} policy decisions replayed, {diff.out_of_scope} records out of scope "
-        "(injection blocks, passthrough, invalid params, fail-open, output-side)"
+        "(no policy rule produced them)"
     )
+    if diff.out_of_scope_actions:
+        out.append(f"    out of scope by action: {_counter_line(diff.out_of_scope_actions)}")
     if diff.baseline_policy is None:
         out.append(
             "  no --policy baseline given, so nothing is known about the arguments and almost "
@@ -801,7 +936,7 @@ def _render_diff(diff: PolicyDiff) -> list[str]:
         out.append("  changed decisions (sample):")
         for change in diff.samples:
             out.append(
-                f"    seq={change.seq} {change.tool or '-'}: {change.recorded_action}"
+                f"    run={change.run or '-'} seq={change.seq} {change.tool or '-'}: {change.recorded_action}"
                 f"({change.recorded_rule or '-'}) -> {change.new_action or 'indeterminate'}"
                 f"({change.new_rule or '-'}) [{change.verdict}] {change.reason}"
             )
@@ -809,10 +944,17 @@ def _render_diff(diff: PolicyDiff) -> list[str]:
 
 
 __all__ = [
+    "BLOCKING_ACTIONS",
     "MATCH",
     "MAX_SAMPLES",
+    "METADATA_ACTIONS",
     "NO_MATCH",
+    "OUTPUT_ACTIONS",
+    "POLICY_SCOPE_ACTIONS",
+    "RESPONSE_SIDE_ACTIONS",
+    "RESULT_ACTIONS",
     "UNKNOWN",
+    "UNPOLICED_INPUT_ACTIONS",
     "VERDICT_ACTION_CHANGED",
     "VERDICT_INDETERMINATE",
     "VERDICT_NEWLY_BLOCKED",
@@ -824,6 +966,7 @@ __all__ = [
     "LogSummary",
     "PolicyDiff",
     "ReplayReport",
+    "ResponseSideCounts",
     "RuleUsage",
     "SkipStats",
     "TimeBucket",

@@ -24,6 +24,7 @@ from src.replay import (
     BUCKET_WIDTHS,
     DEFAULT_BUCKET,
     DEFAULT_TOP,
+    MAX_SAMPLES,
     build_report,
     read_log,
     render_text,
@@ -539,6 +540,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         top=args.top,
         baseline_policy=args.policy,
         candidate_policy=args.against,
+        max_samples=args.max_samples,
     )
 
     if args.format == "json":
@@ -1047,8 +1049,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Reads the JSONL audit log written by both proxies. Always reports dead rules,\n"
             "which rules fired on which tools, FAIL_OPEN decisions (a rule crashed and traffic\n"
-            "was allowed unchecked), REQUIRE_APPROVAL over stdio (allowed, never prompted), and\n"
-            "a decision histogram.\n"
+            "was allowed unchecked), REQUIRE_APPROVAL over stdio (allowed, never prompted),\n"
+            "response-side result and metadata decisions, and a decision histogram.\n"
             "A default log stores a keyed HMAC of the arguments, not the arguments, so a\n"
             "pattern_match rule cannot be re-run. Those decisions are reported as\n"
             "indeterminate, never as allowed.\n"
@@ -1095,6 +1097,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOP,
         metavar="N",
         help=f"How many rules and tools to list (default: {DEFAULT_TOP})",
+    )
+    p_replay.add_argument(
+        "--max-samples",
+        type=int,
+        default=MAX_SAMPLES,
+        dest="max_samples",
+        metavar="N",
+        help=f"With --against, how many changed decisions to list (default: {MAX_SAMPLES})",
     )
     p_replay.add_argument(
         "--format",
