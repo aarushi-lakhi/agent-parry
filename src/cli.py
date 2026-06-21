@@ -138,6 +138,7 @@ async def _cmd_scan_live(args: argparse.Namespace) -> int:
         proxy_url=args.target,
         discover=args.discover,
         safe=args.safe,
+        include_known_gaps=args.include_known_gaps,
     )
     scanner.print_report(report)
     paths = save_scan_outputs(scanner, report, args.output, args.format)
@@ -358,11 +359,19 @@ async def _run_after_scan(
     full: bool,
     discover: bool,
     safe: bool,
+    include_known_gaps: bool = False,
 ) -> ScanReport:
     """Take the post-hardening scan: a complete scan with `full`, else a rescan."""
     if full:
-        return await scanner.run_scan(proxy_url=target, discover=discover, safe=safe)
-    return await scanner.run_rescan(target, before, safe=safe)
+        return await scanner.run_scan(
+            proxy_url=target,
+            discover=discover,
+            safe=safe,
+            include_known_gaps=include_known_gaps,
+        )
+    return await scanner.run_rescan(
+        target, before, safe=safe, include_known_gaps=include_known_gaps
+    )
 
 
 async def _cmd_harden_live(args: argparse.Namespace) -> int:
@@ -373,6 +382,7 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
         proxy_url=args.target,
         discover=args.discover,
         safe=args.safe,
+        include_known_gaps=args.include_known_gaps,
     )
     scanner.print_report(before)
     if args.output:
@@ -423,6 +433,7 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
         full=args.full,
         discover=args.discover,
         safe=args.safe,
+        include_known_gaps=args.include_known_gaps,
     )
     scanner.print_comparison(before, after)
     analysis = _analyze_rescan(before, after)
@@ -466,6 +477,7 @@ async def _cmd_verify_live(args: argparse.Namespace, before: ScanReport) -> int:
         full=args.full,
         discover=args.discover,
         safe=args.safe,
+        include_known_gaps=args.include_known_gaps,
     )
     scanner.print_comparison(before, after)
     analysis = _analyze_rescan(before, after)
@@ -780,6 +792,16 @@ def cmd_install_openclaw(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_known_gap_arg(parser: argparse.ArgumentParser) -> None:
+    """The flag that folds known_gap payloads back into the rates."""
+    parser.add_argument(
+        "--include-known-gaps",
+        action="store_true",
+        dest="include_known_gaps",
+        help="Count known_gap payloads in the detection rate and vulnerability score too",
+    )
+
+
 def _add_scan_target_args(parser: argparse.ArgumentParser, *, target_default: str) -> None:
     """Target selection and payload-execution safety flags, shared by harden and verify."""
     parser.add_argument(
@@ -805,6 +827,7 @@ def _add_scan_target_args(parser: argparse.ArgumentParser, *, target_default: st
         dest="allow_remote",
         help="Permit a non-loopback --target without --safe. The payloads really execute upstream",
     )
+    _add_known_gap_arg(parser)
 
 
 def _add_verify_scope_args(parser: argparse.ArgumentParser) -> None:
@@ -908,6 +931,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Input-side checks only: proxy evaluates policy but does not forward tool calls",
     )
+    _add_known_gap_arg(p_scan)
     p_scan.set_defaults(handler=cmd_scan)
 
     p_harden = sub.add_parser(

@@ -64,15 +64,15 @@ def _run_checks() -> list[CheckResult]:
     with httpx.Client(timeout=10.0) as client:
         _require_server_health(client)
 
-        # 1) tools/list -> the three baseline tools survive discovery
+        # 1) tools/list -> the baseline tools survive discovery; a superset is fine
         list_payload = _rpc_request(client, req_id=1, method="tools/list")
         tools = _result_obj(list_payload).get("tools", [])
         names = {t.get("name") for t in tools if isinstance(t, dict)} if isinstance(tools, list) else set()
-        baseline = {"email_send", "shell_exec", "file_read"}
+        baseline = {"email_send", "shell_exec", "file_read", "http_fetch"}
         results.append(
             CheckResult(
                 name="tools/list pass-through",
-                expected="email_send, shell_exec, file_read returned",
+                expected=f"at least {', '.join(sorted(baseline))} returned",
                 actual=f"{len(names)} tools: {', '.join(sorted(str(n) for n in names))}",
                 passed=baseline <= names,
             )

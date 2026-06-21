@@ -126,16 +126,29 @@ def _fake_scanner(
             *,
             discover: bool = False,
             safe: bool = False,
+            include_known_gaps: bool = False,
         ) -> ScanReport:
             calls.setdefault("scans", []).append(
-                {"target": proxy_url, "discover": discover, "safe": safe}
+                {
+                    "target": proxy_url,
+                    "discover": discover,
+                    "safe": safe,
+                    "include_known_gaps": include_known_gaps,
+                }
             )
             return queued.pop(0)
 
         async def run_rescan(
-            self, proxy_url: str, original: ScanReport, *, safe: bool = False
+            self,
+            proxy_url: str,
+            original: ScanReport,
+            *,
+            safe: bool = False,
+            include_known_gaps: bool | None = None,
         ) -> ScanReport:
-            calls.setdefault("rescans", []).append({"target": proxy_url, "safe": safe})
+            calls.setdefault("rescans", []).append(
+                {"target": proxy_url, "safe": safe, "include_known_gaps": include_known_gaps}
+            )
             assert rescan is not None, "test did not script a rescan report"
             return rescan
 
@@ -1011,7 +1024,7 @@ def test_harden_default_uses_the_rescan_and_prints_unreplayed_count(
 
     assert cli.cmd_harden(_harden_args(policy, "--yes")) == cli.EXIT_OK
     assert len(calls["scans"]) == 1
-    assert calls["rescans"] == [{"target": LOCAL_TARGET, "safe": False}]
+    assert calls["rescans"] == [{"target": LOCAL_TARGET, "safe": False, "include_known_gaps": False}]
     assert "Not replayed: 2 payloads that behaved correctly before" in capsys.readouterr().out
 
 
@@ -1065,7 +1078,7 @@ def test_verify_target_defaults_to_the_before_report_url(
 
     args = cli._build_parser().parse_args(["verify", "--before", str(path)])
     assert cli.cmd_verify(args) == cli.EXIT_OK
-    assert calls["rescans"] == [{"target": "http://127.0.0.5:7777/mcp", "safe": False}]
+    assert calls["rescans"] == [{"target": "http://127.0.0.5:7777/mcp", "safe": False, "include_known_gaps": False}]
     assert calls["probes"] == [{"target": "http://127.0.0.5:7777/mcp", "safe": False}]
 
 
@@ -1080,7 +1093,7 @@ def test_verify_explicit_target_overrides_the_report(
         ["verify", "--before", str(path), "--target", LOCAL_TARGET]
     )
     assert cli.cmd_verify(args) == cli.EXIT_OK
-    assert calls["rescans"] == [{"target": LOCAL_TARGET, "safe": False}]
+    assert calls["rescans"] == [{"target": LOCAL_TARGET, "safe": False, "include_known_gaps": False}]
 
 
 def test_verify_refuses_a_safe_before_report_without_full(
@@ -1116,7 +1129,7 @@ def test_verify_full_uses_a_full_scan(tmp_path: Path, monkeypatch: pytest.Monkey
 
     args = cli._build_parser().parse_args(["verify", "--before", str(path), "--full"])
     assert cli.cmd_verify(args) == cli.EXIT_OK
-    assert calls["scans"] == [{"target": LOCAL_TARGET, "discover": False, "safe": False}]
+    assert calls["scans"] == [{"target": LOCAL_TARGET, "discover": False, "safe": False, "include_known_gaps": False}]
     assert "rescans" not in calls
 
 
@@ -1210,7 +1223,7 @@ def test_verify_remote_target_allowed_with_allow_remote(
         ["verify", "--before", str(path), "--allow-remote"]
     )
     assert cli.cmd_verify(args) == cli.EXIT_OK
-    assert calls["rescans"] == [{"target": "https://prod.example/mcp", "safe": False}]
+    assert calls["rescans"] == [{"target": "https://prod.example/mcp", "safe": False, "include_known_gaps": False}]
 
 
 def test_verify_keyboard_interrupt_exits_130(

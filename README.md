@@ -60,6 +60,21 @@ Only error code `-32001` counts as a proxy block. `-32601` and `-32602` mean the
 
 A result the proxy neutralized is observed as `neutralize`, read off the `_agentparry.result_injection` marker rather than a redaction marker. Strictness runs allow < neutralize < redact < block, so a neutralize satisfies `expected: redact` and `expected: neutralize` but not `expected: block`: fencing alters what the model reads without stopping the call, and it is advisory. Those rows are counted separately in `ConfusionMatrix.neutralized` and rendered "NEUTRALIZED ONLY" when they still miss.
 
+### Known gaps
+
+`attacks/payloads.yaml` carries 65 payloads across twelve categories, and 23 of them describe attacks nothing detects yet. Those declare `known_gap: true`: they still run, they still appear in every report, and they are counted on their own line rather than folded into `detection_rate`, `false_positive_rate` or `vulnerability_score`. Landing them without that flag would drop detection from 100% to roughly 55% in one commit, which is the point at which the number stops being usable as a CI gate and the gaps become invisible rather than merely unfixed.
+
+```bash
+agentparry scan --target http://localhost:9090/mcp                        # gaps held out
+agentparry scan --target http://localhost:9090/mcp --include-known-gaps   # gaps counted
+```
+
+The Markdown report gets a "Known gaps" table naming each one, and the console panel prints the count plus the flag that folds them in. A gap row whose observed column stops reading `allow` has started being caught and should lose its flag. The groups that are still open: path traversal in every spelling (`file_read` has no policy rule at all), terminal escapes on both the argument and the result side, SSRF once the metadata host is obfuscated or reached through a redirect, cross-tool exfiltration, and instructions smuggled as prose or as a fake tool precondition.
+
+Two things the current payload set does measure, and did not before: `src/normalize.py` catches every obfuscated and encoded spelling of the same trigger phrase, and output-side PII redaction stops AWS instance-metadata credentials from reaching the model. It does not stop the GCP equivalent, because `OutputInspector` has no pattern for that token shape, which is why `ss-002` is a gap next to `ss-001` which is not.
+
+The SSRF payloads need a fetch tool, so `src/mock_server.py` exposes `http_fetch`. It is a pure stub and performs no network I/O of any kind: the canonical AWS and GCP metadata hosts return a fake credential document assembled from published documentation examples, and every other URL gets an echo saying nothing was fetched. Obfuscated spellings of those hosts are deliberately not resolved, because handing them the same document would let output-side redaction report detection the input side does not have.
+
 ### Multi-step payloads
 
 A payload with a `steps` list is a sequence: the scanner issues one `tools/call` per step, in order, against the same target. That is what a cross-tool exfiltration actually looks like, and one `tools/call` per payload could not express it.
