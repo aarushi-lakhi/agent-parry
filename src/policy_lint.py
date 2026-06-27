@@ -15,6 +15,10 @@ matched span of every benign block. A corpus-free fallback mutates each pattern
 into plausible-benign strings (an ordinary reference number, a keyword embedded
 in a longer word, a keyword quoted inside prose) so the empirical half still
 says something when a payload file carries no benign entries.
+
+Both halves run under the policy's own ``settings.normalization`` block and its
+per-rule ``normalize:`` overrides, so a rule that only matches in the canonical
+or decoded view is reported with that view rather than read as unmatched.
 """
 
 from __future__ import annotations
@@ -30,8 +34,9 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from src.models import PolicyAction
-from src.policy import PolicyEngine
+from src.models import Finding, PolicyAction
+from src.normalize import VIEW_CANONICAL, VIEW_ORIGINAL
+from src.policy import PolicyEngine, ViewFlags
 
 SEV_HIGH = "high"
 SEV_MEDIUM = "medium"
@@ -39,6 +44,9 @@ SEV_LOW = "low"
 _SEV_ORDER = {SEV_HIGH: 0, SEV_MEDIUM: 1, SEV_LOW: 2}
 
 MAXREPEAT = regex_parser.MAXREPEAT
+
+VIEW_DECODED = "decoded"
+_INHERITED_VIEWS: ViewFlags = (True, False)
 
 _LARGE_CLASS = 36
 _FLOOR_MIN = 8
@@ -149,6 +157,7 @@ class BenignOutcome(BaseModel):
     pattern: str | None = None
     matched_text: str | None = None
     span: tuple[int, int] | None = None
+    view: str = VIEW_ORIGINAL
     reason: str = ""
 
 
@@ -160,6 +169,7 @@ class LintReport(BaseModel):
     rule_count: int = 0
     pattern_count: int = 0
     benign_total: int = 0
+    views: list[str] = Field(default_factory=lambda: [VIEW_ORIGINAL])
     findings: list[LintFinding] = Field(default_factory=list)
     blocks: list[BenignOutcome] = Field(default_factory=list)
     approvals: list[BenignOutcome] = Field(default_factory=list)
@@ -496,23 +506,66 @@ def _is_prose_word(text: str) -> bool:
     return text.isalpha() and len(text) >= _BRIDGE_WORD
 
 
-def _span_text(compiled: re.Pattern[str], value: str) -> tuple[tuple[int, int], str] | None:
-    """Span and matched text of the first match, or None."""
-    match = compiled.search(value)
-    if match is None:
-        return None
-    return (match.start(), match.end()), match.group(0)
-
-
-def _pattern_conditions(rule: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every pattern_match condition of a raw rule."""
+def _pattern_conditions(rule: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
+    """Every pattern_match condition of a raw rule, with its index in the rule."""
     conditions = rule.get("conditions") or []
     if not isinstance(conditions, list):
         return []
     return [
-        c
-        for c in conditions
+        (index, c)
+        for index, c in enumerate(conditions)
         if isinstance(c, dict) and c.get("type") == "pattern_match" and isinstance(c.get("patterns"), list)
+    ]
+
+
+def _resolved_views(policy_path: Path) -> dict[tuple[str, int], ViewFlags]:
+    """Per-condition view flags, resolved by PolicyEngine rather than re-derived.
+
+    Keyed by rule name and condition index, which is the raw index too: a rule
+    whose conditions do not all parse is dropped whole, so surviving conditions
+    keep their positions.
+    """
+    engine = PolicyEngine(policy_path=str(policy_path))
+    return {
+        (rule.name, index): condition.normalize
+        for rule in engine.compiled_rules()
+        for index, condition in enumerate(rule.conditions)
+    }
+
+
+def _view_labels(flags: list[ViewFlags]) -> list[str]:
+    """Which normalized views any condition of the policy is matched against."""
+    labels = [VIEW_ORIGINAL]
+    if any(canonical for canonical, _ in flags):
+        labels.append(VIEW_CANONICAL)
+    if any(decoded for _, decoded in flags):
+        labels.append(VIEW_DECODED)
+    return labels
+
+
+def _decoded_view_findings(
+    rule_name: str,
+    pattern: str,
+    field: str | None,
+    views: ViewFlags,
+) -> list[LintFinding]:
+    """Conditions matched against decoded plaintext, where the raw pattern understates reach."""
+    if not views[1]:
+        return []
+    return [
+        LintFinding(
+            rule=rule_name,
+            check="decoded_view_widens_match",
+            severity=SEV_MEDIUM,
+            pattern=pattern,
+            field=field,
+            message=(
+                f"this condition also runs against base64 and percent-encoded fragments of `{field}` "
+                "decoded to plaintext, so it reaches text a reader of the raw pattern cannot see, and "
+                "every static check below reads the raw pattern only. PolicyEngine keeps decoded views "
+                "off by default for exactly this reason"
+            ),
+        )
     ]
 
 
@@ -781,7 +834,7 @@ def _dead_pattern_findings(
         return []
     arguments = payload.get("arguments") or {}
     findings: list[LintFinding] = []
-    for condition in _pattern_conditions(rule):
+    for _index, condition in _pattern_conditions(rule):
         field = condition.get("field")
         value = arguments.get(field)
         if not isinstance(value, str) or not value.strip():
@@ -823,7 +876,7 @@ def _probe_findings(rule_name: str, rule: dict[str, Any]) -> list[LintFinding]:
     action = str(rule.get("action") or "").strip().upper()
     findings: list[LintFinding] = []
     mentioned = False
-    for condition in _pattern_conditions(rule):
+    for _index, condition in _pattern_conditions(rule):
         field = condition.get("field")
         for pattern in (str(p) for p in condition["patterns"]):
             for probe in _generate_probes(pattern, field if isinstance(field, str) else None):
@@ -871,20 +924,27 @@ def _is_benign(payload: dict[str, Any]) -> bool:
 def _evaluate_benign(
     rules: list[dict[str, Any]],
     benign: list[dict[str, Any]],
+    settings: dict[str, Any],
 ) -> tuple[list[BenignOutcome], list[BenignOutcome]]:
-    """Run every rule alone against every benign payload through a real PolicyEngine."""
+    """Run every rule alone against every benign payload through a real PolicyEngine.
+
+    Each one-rule policy carries the real ``settings`` block, so normalization is
+    resolved exactly as the deployed policy resolves it. With ``settings: {}`` a
+    policy that turned normalization off would still be linted with the canonical
+    view on, and the lint would report blocks enforcement does not make.
+    """
     blocks: list[BenignOutcome] = []
     approvals: list[BenignOutcome] = []
     with tempfile.TemporaryDirectory(prefix="agentparry-lint-") as tmp:
         for index, rule in enumerate(rules):
             path = Path(tmp) / f"rule_{index}.yaml"
-            path.write_text(yaml.safe_dump({"rules": [rule], "settings": {}}), encoding="utf-8")
+            path.write_text(yaml.safe_dump({"rules": [rule], "settings": settings}), encoding="utf-8")
             engine = PolicyEngine(policy_path=str(path))
             for payload in benign:
                 decision = engine.evaluate(str(payload.get("tool") or ""), payload.get("arguments") or {})
                 if decision.action == PolicyAction.ALLOW:
                     continue
-                outcome = _outcome(rule, payload, decision.action.value)
+                outcome = _outcome(rule, payload, decision.action.value, decision.findings)
                 if decision.action == PolicyAction.BLOCK:
                     blocks.append(outcome)
                 else:
@@ -892,40 +952,37 @@ def _evaluate_benign(
     return blocks, approvals
 
 
-def _outcome(rule: dict[str, Any], payload: dict[str, Any], action: str) -> BenignOutcome:
-    """Describe why a rule did not allow a benign payload, with the matched span."""
-    arguments = payload.get("arguments") or {}
-    for condition in _pattern_conditions(rule):
-        field = condition.get("field")
-        value = arguments.get(field)
-        if not isinstance(value, str):
-            continue
-        for pattern in (str(p) for p in condition["patterns"]):
-            try:
-                compiled = re.compile(pattern, flags=re.IGNORECASE)
-            except re.error:
-                continue
-            hit = _span_text(compiled, value)
-            if hit is not None:
-                span, text = hit
-                return BenignOutcome(
-                    payload_id=str(payload.get("id") or ""),
-                    tool=str(payload.get("tool") or ""),
-                    rule=str(rule.get("name") or ""),
-                    action=action,
-                    field=str(field),
-                    pattern=pattern,
-                    matched_text=text,
-                    span=span,
-                    reason=f"pattern matched in `{field}`",
-                )
-    return BenignOutcome(
-        payload_id=str(payload.get("id") or ""),
-        tool=str(payload.get("tool") or ""),
-        rule=str(rule.get("name") or ""),
-        action=action,
-        reason="non-pattern condition matched (see rule conditions)",
-    )
+def _outcome(
+    rule: dict[str, Any],
+    payload: dict[str, Any],
+    action: str,
+    findings: list[Finding],
+) -> BenignOutcome:
+    """Describe why a rule did not allow a benign payload, from the engine's own findings.
+
+    The span and view come from ``PolicyDecision``, so a match found only in a
+    normalized view is reported with that view and a span back in the original
+    argument, instead of being reported as a non-pattern condition.
+    """
+    base = {
+        "payload_id": str(payload.get("id") or ""),
+        "tool": str(payload.get("tool") or ""),
+        "rule": str(rule.get("name") or ""),
+        "action": action,
+    }
+    matched = next((f for f in findings if f.matched_pattern is not None), None)
+    if matched is not None:
+        return BenignOutcome(
+            **base,
+            field=matched.field,
+            pattern=matched.matched_pattern,
+            matched_text=matched.matched_text,
+            span=matched.span,
+            view=matched.view,
+            reason=f"pattern matched in `{matched.field}`",
+        )
+    reason = findings[0].description if findings else "condition matched (see rule conditions)"
+    return BenignOutcome(**base, reason=reason)
 
 
 def lint_policy(
@@ -940,10 +997,12 @@ def lint_policy(
         raise FileNotFoundError(f"policy file not found: {path}")
     loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     rules = [r for r in (loaded.get("rules") or []) if isinstance(r, dict)]
+    settings = loaded.get("settings") if isinstance(loaded.get("settings"), dict) else {}
 
     all_payloads = _load_payloads(payloads_path)
     by_id = {str(p.get("id")): p for p in all_payloads}
     benign = [p for p in all_payloads if _is_benign(p)]
+    resolved_views = _resolved_views(path)
 
     findings: list[LintFinding] = []
     pattern_count = 0
@@ -951,9 +1010,10 @@ def lint_policy(
         name = str(rule.get("name") or "")
         findings.extend(_dead_pattern_findings(name, rule, by_id))
         findings.extend(_allowlist_findings(name, rule))
-        for condition in _pattern_conditions(rule):
+        for index, condition in _pattern_conditions(rule):
             field = condition.get("field")
             field_name = field if isinstance(field, str) else None
+            views = resolved_views.get((name, index), _INHERITED_VIEWS)
             for pattern in (str(p) for p in condition["patterns"]):
                 pattern_count += 1
                 findings.extend(_always_findings(name, pattern, field_name))
@@ -961,10 +1021,11 @@ def lint_policy(
                 findings.extend(_bridge_findings(name, pattern, field_name))
                 findings.extend(_short_literal_findings(name, pattern, field_name))
                 findings.extend(_redos_findings(name, pattern, field_name))
+                findings.extend(_decoded_view_findings(name, pattern, field_name, views))
         if probes:
             findings.extend(_probe_findings(name, rule))
 
-    blocks, approvals = _evaluate_benign(rules, benign)
+    blocks, approvals = _evaluate_benign(rules, benign, settings)
     findings.extend(
         LintFinding(
             rule=block.rule,
@@ -974,8 +1035,8 @@ def lint_policy(
             field=block.field,
             example=block.matched_text,
             message=(
-                f"blocks benign payload {block.payload_id} on `{block.field}` span {block.span}: "
-                f"{block.matched_text!r}"
+                f"blocks benign payload {block.payload_id} on `{block.field}` span {block.span} "
+                f"in the {block.view} view: {block.matched_text!r}"
             ),
         )
         for block in blocks
@@ -989,6 +1050,7 @@ def lint_policy(
             rule_count=len(rules),
             pattern_count=pattern_count,
             benign_total=len(benign),
+            views=_view_labels(list(resolved_views.values())),
             findings=findings,
             blocks=blocks,
             approvals=approvals,
@@ -1042,6 +1104,7 @@ def render_report(report: LintReport) -> str:
     lines: list[str] = [
         f"Policy lint: {report.policy_path}",
         f"{report.rule_count} rules, {report.pattern_count} patterns{corpus_note}",
+        f"matched views: {', '.join(report.views)}",
         "",
         "EMPIRICAL: benign corpus",
     ]
@@ -1051,7 +1114,10 @@ def render_report(report: LintReport) -> str:
         lines.append("  no benign payload is blocked")
     for block in report.blocks:
         lines.append(f"  BLOCK  {block.payload_id}  {block.tool}  {block.rule}")
-        detail = f"pattern `{block.pattern}` on `{block.field}` span {block.span} matched {block.matched_text!r}"
+        detail = (
+            f"pattern `{block.pattern}` on `{block.field}` span {block.span} "
+            f"matched {block.matched_text!r} in the {block.view} view"
+        )
         lines.append(f"         {detail if block.pattern else block.reason}")
     for approval in report.approvals:
         lines.append(f"  {approval.action}  {approval.payload_id}  {approval.tool}  {approval.rule}")

@@ -185,6 +185,15 @@ class PolicyEngine:
         """Return current raw rule definitions."""
         return list(self._raw_rules)
 
+    def compiled_rules(self) -> list[Rule]:
+        """Return the compiled rules, each condition carrying its resolved views.
+
+        Rules that failed to parse are absent, the same as at evaluation time, so
+        a caller reading this sees what enforcement sees rather than what the
+        file claims.
+        """
+        return list(self._rules)
+
     def get_settings(self) -> dict[str, Any]:
         """Return the raw ``settings`` block, for consumers other than the rules.
 
