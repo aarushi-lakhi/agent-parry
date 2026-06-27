@@ -10,6 +10,7 @@ import os
 import shlex
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,20 @@ import httpx
 import json5
 
 from src.models import PROXY_URL, ScanReport
-from src.policy_lint import LintReport, lint_policy, render_report
-from src.rule_generator import RuleGenerator, plan_autogen_merge, write_policy_text
+from src.policy_lint import (
+    LintFinding,
+    LintReport,
+    introduced_findings,
+    lint_policy,
+    render_findings,
+    render_report,
+)
+from src.rule_generator import (
+    AutogenMergePlan,
+    RuleGenerator,
+    plan_autogen_merge,
+    write_policy_text,
+)
 from src.scanner import (
     OUTCOME_FALSE_NEGATIVE,
     OUTCOME_FALSE_POSITIVE,
@@ -351,6 +364,22 @@ def _print_analysis(analysis: RescanAnalysis, *, full: bool, max_vulns: int) -> 
         )
 
 
+def _lint_merge(plan: AutogenMergePlan, policy_path: str, payloads_path: str) -> list[LintFinding]:
+    """High-severity findings the merge would add to the policy.
+
+    The candidate text is linted from a tempfile rather than the policy path,
+    because linting the path would only see the rules that already shipped and
+    the rules being written are the ones worth checking.
+    """
+    payloads = payloads_path if Path(payloads_path).is_file() else None
+    before = lint_policy(policy_path, payloads)
+    with tempfile.TemporaryDirectory(prefix="agentparry-harden-") as tmp:
+        candidate = Path(tmp) / Path(policy_path).name
+        candidate.write_text(plan.after_text, encoding="utf-8")
+        after = lint_policy(candidate, payloads)
+    return introduced_findings(before, after)
+
+
 async def _run_after_scan(
     scanner: Scanner,
     before: ScanReport,
@@ -394,6 +423,14 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
     diff = plan.diff(args.policy)
     print(diff if diff else "(no change to the policy file)")
 
+    introduced: list[LintFinding] = []
+    if plan.changed and not args.no_lint:
+        introduced = _lint_merge(plan, args.policy, args.payloads)
+    if introduced:
+        print()
+        print(f"Policy lint: {len(introduced)} high-severity finding(s) introduced by these rules")
+        print("\n".join(render_findings(introduced)))
+
     if args.dry_run:
         print("Dry run: nothing written.")
         return EXIT_OK
@@ -401,6 +438,15 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
     if not plan.changed:
         print("Policy already contains these rules; nothing written.")
         return vulnerability_exit_code(_count_remaining(before), args.max_vulns)
+
+    if introduced and not args.force:
+        print(
+            "Refusing to write: these rules block legitimate traffic or cannot fire as written. "
+            "Fix them, re-run with --force to write them anyway, or --no-lint to skip the check."
+        )
+        return EXIT_VULNERABLE
+    if introduced:
+        print("Writing anyway: --force.")
 
     if not args.yes and not _confirm(f"Write these {len(rules)} rules to {args.policy}? [y/N] "):
         print("Aborted; policy left unchanged.")
@@ -952,8 +998,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "Additive: existing autogen_ rules are kept, same-named ones replaced, handwritten\n"
             "rules preserved. Backs the policy up to a .bak sibling, prints a unified diff, and\n"
             "asks before writing unless --yes.\n"
-            "Exit codes: 0 clean, 1 error, 2 usage, 3 vulnerabilities remain or a regression was\n"
-            "found, 4 aborted at the prompt, 130 interrupted.\n"
+            "The rules about to be written are linted against the benign payloads in --payloads\n"
+            "first, and a merge that introduces a high-severity over-block is refused unless\n"
+            "--force. A dry run reports the findings without changing its exit code.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 vulnerabilities remain, a regression was\n"
+            "found or the lint refused the write, 4 aborted at the prompt, 130 interrupted.\n"
             "Examples:\n"
             "  agentparry harden --target http://localhost:9090/mcp --dry-run\n"
             "  agentparry harden --target http://localhost:9090/mcp --yes --full\n"
@@ -973,6 +1022,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the diff and exit 0 without writing anything",
     )
     p_harden.add_argument("--yes", action="store_true", help="Write the policy without confirming")
+    p_harden.add_argument(
+        "--force",
+        action="store_true",
+        help="Write even when the new rules introduce a high-severity over-block finding",
+    )
+    p_harden.add_argument(
+        "--no-lint",
+        action="store_true",
+        dest="no_lint",
+        help="Do not lint the rules for over-blocking before writing them",
+    )
     p_harden.add_argument(
         "--no-reload",
         action="store_true",
