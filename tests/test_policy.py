@@ -582,6 +582,27 @@ class TestNormalizedRuleMatching(unittest.TestCase):
                 self._action(engine, f"rm{ZWSP} -rf /")
             self.assertIn("canonical", "".join(captured.output))
 
+    def test_decision_carries_the_findings_that_produced_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            command = f"echo x; rm{ZWSP} -rf /"
+            decision = engine.evaluate("shell_exec", {"command": command})
+            self.assertEqual(PolicyAction.BLOCK, decision.action)
+            self.assertEqual(1, len(decision.findings))
+            finding = decision.findings[0]
+            self.assertEqual("canonical", finding.view)
+            self.assertEqual(r"rm\s+-rf\s+/", finding.matched_pattern)
+            self.assertEqual("command", finding.field)
+            self.assertEqual("rm -rf /", finding.matched_text)
+            self.assertIsNotNone(finding.span)
+            start, end = finding.span or (0, 0)
+            self.assertEqual(f"rm{ZWSP} -rf /", command[start:end])
+
+    def test_allow_carries_no_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            self.assertEqual([], engine.evaluate("shell_exec", {"command": "ls -la"}).findings)
+
     def test_pii_detection_uses_views(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             policy_path = Path(tmpdir) / "policy.yaml"
