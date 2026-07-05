@@ -550,6 +550,13 @@ class TestPinStore(unittest.TestCase):
         leftovers = [p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")]
         self.assertEqual([], leftovers)
 
+    def test_a_short_write_leaves_no_temp_file_and_no_pin(self) -> None:
+        with patch("src.pins.os.write", return_value=1):
+            self.assertFalse(self.store.mutate("cmd:a", lambda _e: ServerPin(key="cmd:a")))
+        leftovers = [p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")]
+        self.assertEqual([], leftovers)
+        self.assertFalse(self.path.exists())
+
     def test_a_failed_replace_leaves_no_temp_file(self) -> None:
         with patch("src.pins.os.replace", side_effect=OSError("nope")):
             self.assertFalse(self.store.mutate("cmd:a", lambda _e: ServerPin(key="cmd:a")))
