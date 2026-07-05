@@ -88,19 +88,12 @@ def committed_report() -> LintReport:
     return lint_policy(COMMITTED_POLICY, COMMITTED_PAYLOADS)
 
 
-def test_committed_policy_reports_its_remaining_over_blocks() -> None:
+def test_committed_policy_blocks_no_benign_payload() -> None:
     report = committed_report()
-
-    blocked = {(b.rule, b.payload_id): b for b in report.blocks}
-    assert set(blocked) == {("block_dangerous_shell", "bn-007")}
-
-    sudo = blocked[("block_dangerous_shell", "bn-007")]
-    assert sudo.pattern == r"sudo\s+"
-    assert sudo.field == "command"
-    assert sudo.matched_text == "sudo "
-
-    assert report.over_block_rate == pytest.approx(11.1)
-    assert report.high_rules == ["block_dangerous_shell"]
+    assert report.blocks == []
+    assert report.over_block_rate == pytest.approx(0.0)
+    assert report.high_rules == []
+    assert report.count("high") == 0
 
 
 def test_require_approval_on_a_benign_payload_is_friction_not_over_block() -> None:
@@ -133,13 +126,14 @@ def test_committed_policy_linter_noise_is_bounded() -> None:
     assert set(report.high_rules) <= confirmed
 
 
-def test_corpus_free_run_still_flags_the_same_rules() -> None:
+def test_corpus_free_run_finds_no_high_severity_rule_either() -> None:
+    """The generated probes are the half that catches sudo, and they now clear it too."""
     report = lint_policy(COMMITTED_POLICY, None)
     assert report.benign_total == 0
     assert report.over_block_rate is None
-    assert report.high_rules == ["block_dangerous_shell"]
+    assert report.high_rules == []
     assert report.corpus_confirmed_rules == []
-    assert report.probe_only_rules == ["block_dangerous_shell"]
+    assert report.probe_only_rules == []
 
 
 def test_committed_policy_matches_the_decoded_view_too() -> None:
@@ -419,21 +413,30 @@ def test_missing_payload_file_raises(tmp_path: Path) -> None:
         lint_policy(policy, tmp_path / "missing.yaml")
 
 
-def test_render_report_includes_spans_and_summary() -> None:
+def test_render_report_includes_the_clean_corpus_and_summary() -> None:
     text = render_report(committed_report())
-    assert "over-block rate: 1/9 = 11.1%" in text
-    assert "BLOCK  bn-007  shell_exec  block_dangerous_shell" in text
-    assert "matched 'sudo ' in the original view" in text
+    assert "over-block rate: 0/9 = 0.0%" in text
+    assert "no benign payload is blocked" in text
+    assert "REQUIRE_APPROVAL  bn-002  email_send  flag_external_email" in text
     assert "matched views: original, canonical, decoded" in text
     assert "linter unconfirmed rate" in text
 
 
-def test_cli_exits_vulnerable_on_the_committed_policy() -> None:
+def test_cli_exits_ok_on_the_committed_policy_at_the_ci_gate() -> None:
+    """The gate .github/workflows/ci.yml runs. It must pass on the file in the repo."""
     parser = cli._build_parser()
     args = parser.parse_args(
-        ["lint-policy", "--policy", str(COMMITTED_POLICY), "--payloads", str(COMMITTED_PAYLOADS)]
+        [
+            "lint-policy",
+            "--policy",
+            str(COMMITTED_POLICY),
+            "--payloads",
+            str(COMMITTED_PAYLOADS),
+            "--fail-on",
+            "high",
+        ]
     )
-    assert cli.cmd_lint_policy(args) == cli.EXIT_VULNERABLE
+    assert cli.cmd_lint_policy(args) == cli.EXIT_OK
 
 
 def test_cli_fail_on_never_exits_ok() -> None:

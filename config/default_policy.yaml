@@ -49,12 +49,11 @@ rules:
   - type: pattern_match
     field: command
     patterns:
-    - rm\s+-rf
-    - curl.*\|.*sh
-    - curl.*\|.*bash
-    - wget.*\|.*sh
+    - (?:^|[\n;&|(`]|\$\()\s*rm\s+-rf
+    - (?:^|[\n;&|(`]|\$\()\s*curl.*\|\s*(?:sudo\s+)?(?:\S*/)?(?:sh|bash|dash|zsh|ksh|csh|fish)\b
+    - (?:^|[\n;&|(`]|\$\()\s*wget.*\|\s*(?:sudo\s+)?(?:\S*/)?(?:sh|bash|dash|zsh|ksh|csh|fish)\b
     - chmod\s+777
-    - sudo\s+
+    - (?:^|[\n;&|(`]|\$\()\s*sudo\s+
   message: 'Blocked: dangerous shell command'
 - name: block_data_exfil
   tool: shell_exec
