@@ -280,7 +280,7 @@ What does act is escalation: the changed tools are re-inspected with every sever
 
 ### The store
 
-`~/.agentparry/pins.json`, overridden by `AGENTPARRY_PINS_PATH`, `0600` inside a `0700` directory, same as the audit key. **A local attacker who can write that file defeats the mechanism outright.** That is hygiene, not a defense.
+`~/.agentparry/pins.json`, overridden by `AGENTPARRY_PINS_PATH`, `0600` inside a `0700` directory, same as the audit key. **A local attacker who can write that file defeats the mechanism outright.** That is hygiene, not a defense. The file records the wrapped command line verbatim as the pin's `target`, so a server launched with a secret in argv has that secret in the pin file, exactly as it already appears in `~/.agentparry/proxy.log`.
 
 Steady state is read-only: `last_seen` is only refreshed once a day, an unchanged catalogue writes nothing at all, and re-reporting an already-pending diff writes nothing either. That is what makes Claude Desktop and Claude Code wrapping the same server a non-event. The writes that do happen take an `flock` on a `pins.json.lock` sidecar, re-read inside the lock, merge one server key and `os.replace`, so a second client cannot lose the first one's entry. A busy lock is **skipped**, not waited on: pins are advisory and must never hold up the MCP stream. A corrupt pin file is quarantined to `pins.json.corrupt-<timestamp>` rather than deleted or raised.
 
