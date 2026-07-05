@@ -2,13 +2,15 @@ rules:
 - name: autogen_pi-003
   tool: email_send
   action: BLOCK
-  message: blocks base64-encoded prompt injection in email body
-  description: blocks base64-encoded prompt injection in email body
+  message: blocks base64-encoded credential file exfiltration in email body
+  description: blocks base64-encoded credential file exfiltration in email body
   conditions:
   - type: pattern_match
     field: body
     patterns:
-    - '[A-Za-z0-9+/=]{40,}'
+    - /etc/(?:passwd|shadow|sudoers)
+    normalize:
+      decoded: true
 - name: autogen_pi-004
   tool: email_send
   action: BLOCK
