@@ -20,10 +20,19 @@ console = Console()
 
 AUTOGEN_PREFIX = "autogen_"
 
+_INSTRUCTION_OBJECT = r"(?:rules|instructions|guidelines|policies|restrictions|directives)"
+
+_SAFETY_OVERRIDE_PATTERN = (
+    r"disregard\s+(?:all|any|every|the\s+(?:previous|prior|earlier|preceding|above|system|safety))"
+    rf"\b.{{0,30}}\b{_INSTRUCTION_OBJECT}\b"
+    r"|override\s+(?:your|all|the)\s+(?:safety|security)\b"
+)
+"""An instruction to drop a scoped set of instructions, not any later word "rules"."""
+
 _PI_PATTERNS: list[tuple[str, str, str]] = [
     ("ignore.*instructions", "ignore.*instructions", "instruction override"),
     ("SYSTEM:", r"^SYSTEM:|\[SYSTEM\]", "fake SYSTEM prompt"),
-    ("disregard", r"disregard.*rules|override.*safety", "safety override"),
+    ("disregard", _SAFETY_OVERRIDE_PATTERN, "safety override"),
     ("/etc/passwd", r"/etc/(?:passwd|shadow|sudoers)", "credential file exfiltration"),
 ]
 
