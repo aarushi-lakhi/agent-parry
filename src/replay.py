@@ -77,6 +77,23 @@ METADATA_ACTIONS = frozenset({AuditAction.BLOCK_METADATA, AuditAction.REDACT_MET
 
 OUTPUT_ACTIONS = frozenset({AuditAction.REDACT_OUTPUT})
 
+PIN_ACTIONS = frozenset(
+    {
+        AuditAction.PIN_CREATED,
+        AuditAction.PIN_DIFF,
+        AuditAction.BLOCK_PIN,
+        AuditAction.PIN_ACCEPTED,
+    }
+)
+"""Tool-list pinning, reported apart from the inspectors and from policy.
+
+Three of these are verdicts on a `tools/list` a server sent back, so they sit
+next to the metadata actions rather than inside them: a pin compares against
+what was recorded earlier instead of inspecting the payload on its own.
+`PIN_ACCEPTED` is not proxy traffic at all, it is an operator transferring
+trust from the CLI, which is why the group spans both directions.
+"""
+
 RESPONSE_SIDE_ACTIONS = RESULT_ACTIONS | METADATA_ACTIONS | OUTPUT_ACTIONS
 
 BLOCKING_ACTIONS = frozenset(
@@ -166,6 +183,21 @@ class ResponseSideCounts(BaseModel):
     methods: dict[str, int] = Field(default_factory=dict)
 
 
+class PinCounts(BaseModel):
+    """Tool-list pinning activity, none of which a policy rule produced.
+
+    `blocked` is the one that matters in CI: a server rewrote its tool metadata
+    and the proxy refused the catalogue. `created` is only a first sighting.
+    """
+
+    total: int = 0
+    created: int = 0
+    changed: int = 0
+    blocked: int = 0
+    accepted: int = 0
+    servers: dict[str, int] = Field(default_factory=dict)
+
+
 class LogSummary(BaseModel):
     """Everything answerable from a log without any policy file."""
 
@@ -187,6 +219,7 @@ class LogSummary(BaseModel):
     stdio_require_approval: int = 0
     stdio_require_approval_tools: dict[str, int] = Field(default_factory=dict)
     response_side: ResponseSideCounts = Field(default_factory=ResponseSideCounts)
+    pins: PinCounts = Field(default_factory=PinCounts)
     buckets: list[TimeBucket] = Field(default_factory=list)
     policy_decisions: int = 0
     with_arguments: int = 0
@@ -389,6 +422,25 @@ def _tally_response_side(
         methods[record.method] += 1
 
 
+_PIN_FIELDS = {
+    AuditAction.PIN_CREATED: "created",
+    AuditAction.PIN_DIFF: "changed",
+    AuditAction.BLOCK_PIN: "blocked",
+    AuditAction.PIN_ACCEPTED: "accepted",
+}
+
+
+def _tally_pin(record: AuditRecord, counts: PinCounts, servers: Counter[str]) -> None:
+    """Add one pinning record to the pin totals."""
+    field = _PIN_FIELDS.get(record.action)
+    if field is None:
+        return
+    counts.total += 1
+    setattr(counts, field, getattr(counts, field) + 1)
+    if record.tool:
+        servers[record.tool] += 1
+
+
 def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT_TOP) -> LogSummary:
     """Aggregate a log into the questions answerable without any policy file."""
     actions: Counter[str] = Counter()
@@ -402,8 +454,10 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
     approval_tools: Counter[str] = Counter()
     response_tools: Counter[str] = Counter()
     response_methods: Counter[str] = Counter()
+    pin_servers: Counter[str] = Counter()
     buckets: dict[str, TimeBucket] = {}
     response = ResponseSideCounts()
+    pins = PinCounts()
     runs: set[str] = set()
     fail_open_samples: list[str] = []
     fail_open = 0
@@ -445,6 +499,8 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
             approval_tools[record.tool or "-"] += 1
         if record.action in RESPONSE_SIDE_ACTIONS:
             _tally_response_side(record, response, response_tools, response_methods)
+        if record.action in PIN_ACTIONS:
+            _tally_pin(record, pins, pin_servers)
 
         slot = buckets.setdefault(bucket_key(record.ts, bucket), TimeBucket(bucket=bucket_key(record.ts, bucket)))
         slot.total += 1
@@ -463,6 +519,7 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
     ]
     response.tools = dict(response_tools.most_common(top))
     response.methods = dict(response_methods.most_common(top))
+    pins.servers = dict(pin_servers.most_common(top))
 
     return LogSummary(
         sources=list(log.sources),
@@ -483,6 +540,7 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
         stdio_require_approval=stdio_approvals,
         stdio_require_approval_tools=dict(approval_tools.most_common()),
         response_side=response,
+        pins=pins,
         buckets=[buckets[key] for key in sorted(buckets)],
         policy_decisions=policy_decisions,
         with_arguments=with_arguments,
@@ -822,6 +880,18 @@ def _render_response_side(counts: ResponseSideCounts) -> list[str]:
     return out
 
 
+def _render_pins(counts: PinCounts) -> list[str]:
+    out = [f"Tool-list pinning: {counts.total}"]
+    out.append(
+        f"  {counts.created} first sighting(s), {counts.changed} change(s) pending review, "
+        f"{counts.blocked} catalogue(s) blocked, {counts.accepted} accepted by an operator"
+    )
+    if counts.servers:
+        out.append(f"  servers: {_counter_line(counts.servers)}")
+    out.append("")
+    return out
+
+
 def render_text(report: ReplayReport) -> str:
     """Render a replay report as the plain-text console output."""
     summary = report.summary
@@ -869,6 +939,8 @@ def render_text(report: ReplayReport) -> str:
     out.append("")
 
     out.extend(_render_response_side(summary.response_side))
+    if summary.pins.total:
+        out.extend(_render_pins(summary.pins))
 
     out.append("Rules that fired:")
     if not summary.rules:

@@ -95,3 +95,8 @@ settings:
     action: redact
     severity_threshold: critical
     exempt_tools: []
+  tool_pinning:
+    enabled: true
+    action: warn
+    lock_timeout: 2.0
+    last_seen_interval: 86400.0
