@@ -84,7 +84,12 @@ class PolicyEngine:
             findings: list[Finding] = []
             if self._rule_matches(rule, arguments, findings, view_cache):
                 self._log_rule_match(rule=rule, tool_name=tool_name, findings=findings)
-                return PolicyDecision(action=rule.action, rule_name=rule.name, message=rule.message)
+                return PolicyDecision(
+                    action=rule.action,
+                    rule_name=rule.name,
+                    message=rule.message,
+                    findings=findings,
+                )
         return PolicyDecision(action=PolicyAction.ALLOW)
 
     def _views(
@@ -197,7 +202,12 @@ class PolicyEngine:
 
     @property
     def compiled_rules(self) -> list[Rule]:
-        """Parsed rules in first-match-wins order, malformed ones already dropped."""
+        """Parsed rules in first-match-wins order, each condition carrying its views.
+
+        Rules that failed to parse are absent, the same as at evaluation time, so
+        a caller reading this sees what enforcement sees rather than what the file
+        claims.
+        """
         return list(self._rules)
 
     def _load_policy(self) -> dict[str, Any]:

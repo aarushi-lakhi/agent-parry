@@ -25,3 +25,6 @@ jobs:
         run: pytest tests/ -q
       - name: Lint
         run: ruff check src tests
+      # Exits 3 on a high-severity finding; medium is review advice, not a gate.
+      - name: Policy lint
+        run: agentparry lint-policy --fail-on high

@@ -2,13 +2,15 @@ rules:
 - name: autogen_pi-003
   tool: email_send
   action: BLOCK
-  message: blocks base64-encoded prompt injection in email body
-  description: blocks base64-encoded prompt injection in email body
+  message: blocks base64-encoded credential file exfiltration in email body
+  description: blocks base64-encoded credential file exfiltration in email body
   conditions:
   - type: pattern_match
     field: body
     patterns:
-    - '[A-Za-z0-9+/=]{40,}'
+    - /etc/(?:passwd|shadow|sudoers)
+    normalize:
+      decoded: true
 - name: autogen_pi-004
   tool: email_send
   action: BLOCK
@@ -18,7 +20,7 @@ rules:
   - type: pattern_match
     field: body
     patterns:
-    - disregard.*rules|override.*safety
+    - disregard\s+(?:all|any|every|the\s+(?:previous|prior|earlier|preceding|above|system|safety))\b.{0,30}\b(?:rules|instructions|guidelines|policies|restrictions|directives)\b|override\s+(?:your|all|the)\s+(?:safety|security)\b
 - name: autogen_pe-004
   tool: shell_exec
   action: BLOCK
@@ -47,12 +49,11 @@ rules:
   - type: pattern_match
     field: command
     patterns:
-    - rm\s+-rf
-    - curl.*\|.*sh
-    - curl.*\|.*bash
-    - wget.*\|.*sh
+    - (?:^|[\n;&|(`]|\$\()\s*rm\s+-rf
+    - (?:^|[\n;&|(`]|\$\()\s*curl.*\|\s*(?:sudo\s+)?(?:\S*/)?(?:sh|bash|dash|zsh|ksh|csh|fish)\b
+    - (?:^|[\n;&|(`]|\$\()\s*wget.*\|\s*(?:sudo\s+)?(?:\S*/)?(?:sh|bash|dash|zsh|ksh|csh|fish)\b
     - chmod\s+777
-    - sudo\s+
+    - (?:^|[\n;&|(`]|\$\()\s*sudo\s+
   message: 'Blocked: dangerous shell command'
 - name: block_data_exfil
   tool: shell_exec
