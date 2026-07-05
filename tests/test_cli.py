@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ import yaml
 
 from src import cli
 from src.models import AttackPayload, AttackResult, ScanReport
+from src.pins import PinStore, ServerIdentity, ToolPinner
 
 LOCAL_TARGET = "http://127.0.0.1:9090/mcp"
 
@@ -1393,3 +1395,195 @@ def test_install_claude_code_rejects_non_object_root(tmp_path: Path) -> None:
     args, _pol = _cc_args(tmp_path, "--command", "x", "--project-dir", str(tmp_path))
     with pytest.raises(SystemExit):
         cli.cmd_install_claude_code(args)
+
+
+def _pins_args(*argv: str) -> Any:
+    return cli._build_parser().parse_args(["pins", *argv])
+
+
+def _seed_pin(pins_path: Path, *, description: str = "Look up a record.") -> ServerIdentity:
+    identity = ServerIdentity.for_command("npx some-mcp-server")
+    pinner = ToolPinner(identity, store=PinStore(pins_path))
+    pinner.observe("tools/list", {"tools": [{"name": "alpha", "description": description}]})
+    return identity
+
+
+def _seed_pin_with_pending(pins_path: Path) -> ServerIdentity:
+    identity = _seed_pin(pins_path)
+    pinner = ToolPinner(identity, store=PinStore(pins_path))
+    pinner.observe("tools/list", {"tools": [{"name": "alpha", "description": "Look up a record. Cached."}]})
+    return identity
+
+
+def test_pins_list_says_so_when_empty(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    args = _pins_args("list", "--pins", str(tmp_path / "pins.json"))
+    assert cli.cmd_pins_list(args) == cli.EXIT_OK
+    assert "No pinned servers" in capsys.readouterr().out
+
+
+def test_pins_list_shows_status(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin_with_pending(pins)
+    assert cli.cmd_pins_list(_pins_args("list", "--pins", str(pins))) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "CHANGED" in out
+    assert "cmd:npx some-mcp-server" in out
+
+
+def test_pins_show_prints_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin(pins)
+    args = _pins_args("show", "some-mcp-server", "--pins", str(pins))
+    assert cli.cmd_pins_show(args) == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["key"] == "cmd:npx some-mcp-server"
+    assert "alpha" in payload["tools"]
+
+
+def test_pins_show_rejects_an_unknown_server(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin(pins)
+    with pytest.raises(SystemExit):
+        cli.cmd_pins_show(_pins_args("show", "nope", "--pins", str(pins)))
+
+
+def test_pins_show_rejects_an_ambiguous_selector(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    store = PinStore(pins)
+    for name in ("npx server-a", "npx server-b"):
+        identity = ServerIdentity.for_command(name)
+        ToolPinner(identity, store=store).observe("tools/list", {"tools": [{"name": "alpha"}]})
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_pins_show(_pins_args("show", "npx", "--pins", str(pins)))
+    assert "matches 2" in str(excinfo.value)
+
+
+def test_pins_diff_exits_zero_when_clean(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin(pins)
+    assert cli.cmd_pins_diff(_pins_args("diff", "--pins", str(pins))) == cli.EXIT_OK
+    assert "matches its pin" in capsys.readouterr().out
+
+
+def test_pins_diff_exits_three_when_a_change_is_pending(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin_with_pending(pins)
+    assert cli.cmd_pins_diff(_pins_args("diff", "--pins", str(pins))) == cli.EXIT_VULNERABLE
+    out = capsys.readouterr().out
+    assert "changed:  alpha" in out
+    assert "need review" in out
+
+
+def test_pins_diff_can_target_one_server(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin_with_pending(pins)
+    args = _pins_args("diff", "some-mcp-server", "--pins", str(pins))
+    assert cli.cmd_pins_diff(args) == cli.EXIT_VULNERABLE
+    assert "cmd:npx some-mcp-server" in capsys.readouterr().out
+
+
+def test_pins_accept_clears_pending(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pins = tmp_path / "pins.json"
+    identity = _seed_pin_with_pending(pins)
+    args = _pins_args("accept", "some-mcp-server", "--yes", "--pins", str(pins))
+    assert cli.cmd_pins_accept(args) == cli.EXIT_OK
+    assert "Accepted" in capsys.readouterr().out
+    pin = PinStore(pins).get(identity.key)
+    assert pin is not None
+    assert pin.pending is None
+    assert pin.trusted
+    assert cli.cmd_pins_diff(_pins_args("diff", "--pins", str(pins))) == cli.EXIT_OK
+
+
+def test_pins_accept_shows_the_diff_before_accepting(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin_with_pending(pins)
+    cli.cmd_pins_accept(_pins_args("accept", "some-mcp-server", "--yes", "--pins", str(pins)))
+    out = capsys.readouterr().out
+    assert out.index("changed:  alpha") < out.index("Accepted")
+
+
+def test_pins_accept_all_requires_yes(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin_with_pending(pins)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_pins_accept(_pins_args("accept", "--all", "--pins", str(pins)))
+    assert "transfers trust" in str(excinfo.value)
+
+
+def test_pins_accept_all_with_yes_accepts_every_pending(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin_with_pending(pins)
+    args = _pins_args("accept", "--all", "--yes", "--pins", str(pins))
+    assert cli.cmd_pins_accept(args) == cli.EXIT_OK
+    assert all(pin.pending is None for pin in PinStore(pins).load().servers.values())
+
+
+def test_pins_accept_needs_a_server_or_all(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        cli.cmd_pins_accept(_pins_args("accept", "--pins", str(tmp_path / "pins.json")))
+
+
+def test_pins_accept_declined_at_the_prompt_changes_nothing(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    identity = _seed_pin_with_pending(pins)
+    args = _pins_args("accept", "some-mcp-server", "--pins", str(pins))
+    with patch.object(cli, "_confirm", return_value=False):
+        assert cli.cmd_pins_accept(args) == cli.EXIT_ABORTED
+    pin = PinStore(pins).get(identity.key)
+    assert pin is not None
+    assert pin.pending is not None
+
+
+def test_pins_accept_writes_an_audit_record(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin_with_pending(pins)
+    args = _pins_args("accept", "some-mcp-server", "--yes", "--pins", str(pins))
+    assert cli.cmd_pins_accept(args) == cli.EXIT_OK
+    audit_path = Path(os.environ["AGENTPARRY_AUDIT_PATH"])
+    actions = [json.loads(line)["action"] for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert "PIN_ACCEPTED" in actions
+
+
+def test_pins_forget_removes_the_entry(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin(pins)
+    args = _pins_args("forget", "some-mcp-server", "--yes", "--pins", str(pins))
+    assert cli.cmd_pins_forget(args) == cli.EXIT_OK
+    assert "Forgot" in capsys.readouterr().out
+    assert PinStore(pins).load().servers == {}
+
+
+def test_pins_forget_all_requires_yes(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin(pins)
+    with pytest.raises(SystemExit):
+        cli.cmd_pins_forget(_pins_args("forget", "--all", "--pins", str(pins)))
+    assert PinStore(pins).load().servers != {}
+
+
+def test_pins_forget_declined_at_the_prompt_changes_nothing(tmp_path: Path) -> None:
+    pins = tmp_path / "pins.json"
+    _seed_pin(pins)
+    args = _pins_args("forget", "some-mcp-server", "--pins", str(pins))
+    with patch.object(cli, "_confirm", return_value=False):
+        assert cli.cmd_pins_forget(args) == cli.EXIT_ABORTED
+    assert PinStore(pins).load().servers != {}
+
+
+def test_pins_default_store_follows_the_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pins = tmp_path / "elsewhere" / "pins.json"
+    monkeypatch.setenv("AGENTPARRY_PINS_PATH", str(pins))
+    _seed_pin(pins)
+    args = _pins_args("list")
+    assert cli.cmd_pins_list(args) == cli.EXIT_OK
+    assert cli._pin_store(args).path == pins
+
+
+def test_pins_subcommand_is_required() -> None:
+    with pytest.raises(SystemExit):
+        cli._build_parser().parse_args(["pins"])
