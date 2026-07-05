@@ -503,6 +503,13 @@ def format_console_line(record: AuditRecord, *, arguments: dict[str, Any] | None
         return f"[RESULT]  {tool:<10} {record.detail}"
     if record.action in (AuditAction.BLOCK_METADATA, AuditAction.REDACT_METADATA):
         return f"[META]    {record.method or '-':<10} {record.detail}"
+    if record.action in (
+        AuditAction.PIN_CREATED,
+        AuditAction.PIN_DIFF,
+        AuditAction.PIN_ACCEPTED,
+        AuditAction.BLOCK_PIN,
+    ):
+        return f"[PIN]     {record.method or '-':<10} {record.detail}"
     args_text = json.dumps(arguments or {}, separators=(", ", ": "), ensure_ascii=True, default=str)
     if record.action is AuditAction.BLOCK_POLICY:
         return f"[BLOCK]   {tool:<10} {args_text}  <- {record.rule or 'policy_block'}"

@@ -579,6 +579,7 @@ class ProxyStats(BaseModel):
     neutralized: int = 0
     metadata_injections: int = 0
     metadata_tools_dropped: int = 0
+    pin_diffs: int = 0
 
     def increment(
         self,
@@ -592,6 +593,7 @@ class ProxyStats(BaseModel):
         neutralized: int = 0,
         metadata_injections: int = 0,
         metadata_tools_dropped: int = 0,
+        pin_diffs: int = 0,
     ) -> None:
         """Increment one or more counters by non-negative deltas."""
 
@@ -605,6 +607,7 @@ class ProxyStats(BaseModel):
             "neutralized": neutralized,
             "metadata_injections": metadata_injections,
             "metadata_tools_dropped": metadata_tools_dropped,
+            "pin_diffs": pin_diffs,
         }
 
         for name, delta in deltas.items():
@@ -620,6 +623,7 @@ class ProxyStats(BaseModel):
         self.neutralized += neutralized
         self.metadata_injections += metadata_injections
         self.metadata_tools_dropped += metadata_tools_dropped
+        self.pin_diffs += pin_diffs
 
     def reset(self) -> None:
         """Reset all counters to zero."""
@@ -633,6 +637,7 @@ class ProxyStats(BaseModel):
         self.neutralized = 0
         self.metadata_injections = 0
         self.metadata_tools_dropped = 0
+        self.pin_diffs = 0
 
 
 __all__ = [
