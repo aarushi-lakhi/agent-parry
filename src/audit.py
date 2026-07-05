@@ -85,7 +85,7 @@ def _join_detail(existing: str, added: str) -> str:
     return f"{existing}; {added}"
 
 
-def _utc_now_iso() -> str:
+def utc_now_iso() -> str:
     """UTC ISO8601 with a literal Z suffix, which datetime.isoformat does not emit."""
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -333,7 +333,7 @@ class AuditWriter:
         """
         summarized, count, highest = _summarize_findings(findings)
         record = AuditRecord(
-            ts=_utc_now_iso(),
+            ts=utc_now_iso(),
             run_id=self.run_id,
             pid=self.pid,
             transport=self.transport,
@@ -581,4 +581,5 @@ __all__ = [
     "reset_writer",
     "resolve_args_mode",
     "set_writer",
+    "utc_now_iso",
 ]
