@@ -56,7 +56,6 @@ from src.models import (
     PinSnapshot,
     ServerPin,
     ToolPin,
-    max_severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,7 +104,7 @@ def escalate_severity(severity: str) -> str:
     that never moved, so a signature that reads as ``high`` on first sight reads
     as ``critical`` on a rug pull.
     """
-    return _ESCALATION.get(severity, severity if severity in AUDIT_SEVERITY_ORDER else "medium")
+    return _ESCALATION.get(severity, "medium")
 
 
 def _digest(domain: str, value: Any) -> str:
@@ -912,13 +911,6 @@ def audit_findings_for(observation: PinObservation) -> list[Finding]:
     return _findings_for_audit(observation.diff.escalated)
 
 
-def highest_escalated(observation: PinObservation) -> str | None:
-    """Return the highest escalated severity in an observation, or None."""
-    if observation.diff is None or not observation.diff.escalated:
-        return None
-    return max_severity(finding.severity for finding in observation.diff.escalated)
-
-
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT",
     "LAST_SEEN_INTERVAL_SECONDS",
@@ -933,7 +925,6 @@ __all__ = [
     "escalate_severity",
     "fingerprint_tools",
     "forget",
-    "highest_escalated",
     "instructions_fingerprint",
     "normalize_argv",
     "redact_tool_prose",
