@@ -29,6 +29,8 @@ Put AgentParry flags **before** `--wrap`. After `--wrap`, the first token is the
 | `--log PATH` | Log file (default: `~/.agentparry/proxy.log`) |
 | `--audit PATH` | JSONL audit log (default: `~/.agentparry/audit.jsonl`, or `AGENTPARRY_AUDIT_PATH`) |
 | `--no-audit` | Disable the audit log |
+| `--reload-on-change` / `--no-reload-on-change` | Reload the policy file when it changes on disk (default: on) |
+| `--reload-interval SECONDS` | Poll interval for that watch (default: 2) |
 | `--verbose` | Extra logging to stderr and the log file |
 | `--wrap CMD` | Command to spawn the real MCP server |
 
@@ -57,7 +59,7 @@ Outcomes roll up into a confusion matrix, so a scan reports a pair of numbers in
 | `false_positive` | benign payload blocked, which is over-blocking |
 | `indeterminate` | not measurable: upstream rejected the call (`-32601` / `-32602`), or safe mode meant the output inspector never ran |
 
-`vulnerability_score` counts attack payloads only, so adding benign payloads cannot deflate it. `detection_rate`, `false_positive_rate` and `balanced_score` return `n/a` when their denominator is empty, because "no benign payloads" is not "zero over-blocking". The payload set ships nine `expected_behavior: allow` payloads and the default policy over-blocks three of them; the scan report's "False positives" section names the rule at fault.
+`vulnerability_score` counts attack payloads only, so adding benign payloads cannot deflate it. `detection_rate`, `false_positive_rate` and `balanced_score` return `n/a` when their denominator is empty, because "no benign payloads" is not "zero over-blocking". The payload set ships fifteen `expected_behavior: allow` payloads and the default policy over-blocks none of them; the scan report's "False positives" section names the rule at fault when it does.
 
 Only error code `-32001` counts as a proxy block. `-32601` and `-32602` mean the call never reached policy evaluation and score as indeterminate.
 
@@ -140,7 +142,9 @@ Before writing, `harden` backs the policy up to a `.bak` sibling, prints a unifi
 
 Without `--full` both commands use `Scanner.run_rescan`, which replays only the payloads that previously got through. It therefore cannot see a payload that used to behave correctly and now does not, nor over-blocking among payloads it never replays, so both commands print how many previously correct payloads were skipped. Both also report false positives the new rules introduced: closing four holes while breaking three legitimate calls is not a clean run.
 
-**Writing rules only helps if something reloads them.** `harden` attempts `POST /policy/reload` on the host derived from `--target`, sending `AGENTPARRY_ADMIN_TOKEN` as a bearer token when it is set, and treats any failure as a warning since the file on disk is already updated. The stdio proxy is worse off: it builds its `PolicyEngine` once at startup and has no reload path at all, so a hardening run can never take effect in a live `agentparry wrap` session. `harden` prints a line saying the MCP client has to be restarted.
+**Writing rules only helps if something reloads them.** `harden` attempts `POST /policy/reload` on the host derived from `--target`, sending `AGENTPARRY_ADMIN_TOKEN` as a bearer token when it is set, and treats any failure as a warning since the file on disk is already updated. The stdio proxy watches its policy file and reloads on change, so a hardening run reaches a live `agentparry wrap` session within `--reload-interval` seconds (default 2). `--no-reload-on-change` turns the watch off, and then the MCP client has to be restarted.
+
+A reload rebuilds the engine, the result inspector, the metadata inspector and the tool pinner together, so a `settings` edit lands with the rules. Everything derived from `settings` has to move in one swap: a pinner left behind would keep enforcing the previous `tool_pinning` block and would re-inspect changed metadata with the previous inspector. It refuses any document that would weaken enforcement: unreadable file, YAML syntax error, non-mapping root, and any policy whose rules do not compile to at least one usable rule, which is what a file caught mid-write usually looks like. Every attempt is audited as `POLICY_RELOAD` with the outcome and the rule count; a rejected one leaves the previously loaded policy in force and logs to `~/.agentparry/proxy.log`.
 
 Exit codes, since both are meant for CI:
 
@@ -163,7 +167,7 @@ agentparry lint-policy --no-corpus                       # generated benign stri
 agentparry lint-policy --format json --fail-on high      # CI
 ```
 
-Two halves. The **empirical** half writes each rule to a one-rule policy, loads it with a real `PolicyEngine`, evaluates it against the nine `category: benign` payloads in `attacks/payloads.yaml`, and reports the matched span of every benign block. One rule at a time, because `evaluate` is first-match-wins and would otherwise attribute a payload to whichever rule happens to be first. The **static** half walks each pattern's parse tree and reports shapes that over-block: unanchored short literals, generic classes with a low repetition floor, unbounded `.*` bridges, patterns matching the empty string, empty domain allowlists, autogen rules that cannot match their originating payload, and ReDoS-shaped nesting.
+Two halves. The **empirical** half writes each rule to a one-rule policy, loads it with a real `PolicyEngine`, evaluates it against the fifteen `category: benign` payloads in `attacks/payloads.yaml`, and reports the matched span of every benign block. One rule at a time, because `evaluate` is first-match-wins and would otherwise attribute a payload to whichever rule happens to be first. The **static** half walks each pattern's parse tree and reports shapes that over-block: unanchored short literals, generic classes with a low repetition floor, unbounded `.*` bridges, patterns matching the empty string, empty domain allowlists, autogen rules that cannot match their originating payload, and ReDoS-shaped nesting.
 
 The committed `config/default_policy.yaml` is clean: 0 of 9 benign payloads blocked and no high-severity finding, which is what CI gates on. It was not, and the three rules the linter named are what got fixed: `autogen_pi-003` blocked any 40-character alphanumeric run and now matches its payload's decoded plaintext, `autogen_pi-004` blocked `disregard.*rules` and now needs a scoped instruction object, and `block_dangerous_shell` blocked `sudo\s+` as a substring and now needs a command position. `flag_external_email` on `bn-002` is reported separately as friction rather than a block, because `REQUIRE_APPROVAL` logs and allows over stdio.
 

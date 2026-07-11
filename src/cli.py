@@ -57,6 +57,7 @@ from src.scanner import (
     result_outcome,
     save_scan_outputs,
 )
+from src.stdio_proxy import DEFAULT_RELOAD_INTERVAL
 from src.stdio_proxy import main_argv as stdio_main_argv
 
 EXIT_OK = 0
@@ -66,10 +67,10 @@ EXIT_VULNERABLE = 3
 EXIT_ABORTED = 4
 EXIT_INTERRUPTED = 130
 
-STDIO_RESTART_NOTE = (
-    "Note: the stdio proxy (agentparry wrap) builds its policy engine once at startup and has no "
-    "reload path, so a running wrap session keeps the old rules. Restart your MCP client to pick "
-    "up this policy."
+STDIO_RELOAD_NOTE = (
+    "Note: a running `agentparry wrap` session picks this policy up on its own within a few "
+    "seconds, and keeps the previous rules if the file does not parse. A session started with "
+    "--no-reload-on-change keeps the old rules until you restart your MCP client."
 )
 
 
@@ -147,6 +148,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         proxy_argv.extend(["--audit", args.audit])
     if args.no_audit:
         proxy_argv.append("--no-audit")
+    if not args.reload_on_change:
+        proxy_argv.append("--no-reload-on-change")
+    if args.reload_interval is not None:
+        proxy_argv.extend(["--reload-interval", str(args.reload_interval)])
     if args.verbose:
         proxy_argv.append("--verbose")
     proxy_argv.append("--wrap")
@@ -483,7 +488,7 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
         print("Skipped policy reload (--no-reload); reload the proxy yourself for this to take effect.")
     else:
         await _reload_policy(args.target)
-    print(STDIO_RESTART_NOTE)
+    print(STDIO_RELOAD_NOTE)
 
     after = await _run_after_scan(
         scanner,
@@ -1191,6 +1196,21 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="no_audit",
         action="store_true",
         help="Disable the JSONL audit log (same as AGENTPARRY_AUDIT=0)",
+    )
+    p_wrap.add_argument(
+        "--reload-on-change",
+        dest="reload_on_change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reload the policy file when it changes on disk (default: enabled)",
+    )
+    p_wrap.add_argument(
+        "--reload-interval",
+        dest="reload_interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=f"Policy file poll interval in seconds (default: {DEFAULT_RELOAD_INTERVAL})",
     )
     p_wrap.add_argument("--verbose", action="store_true", help="Verbose logging to stderr and log file")
     p_wrap.set_defaults(handler=cmd_wrap)
