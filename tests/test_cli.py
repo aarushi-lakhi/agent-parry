@@ -286,6 +286,42 @@ def test_wrap_forwards_no_audit() -> None:
     mock_run.assert_called_once_with(["--policy", "pol.yaml", "--no-audit", "--wrap", "uvx", "pkg"])
 
 
+def test_wrap_forwards_reload_flags() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(
+        [
+            "wrap",
+            "--command",
+            "uvx pkg",
+            "--policy",
+            "pol.yaml",
+            "--no-reload-on-change",
+            "--reload-interval",
+            "0.5",
+        ]
+    )
+    with patch.object(cli, "stdio_main_argv", return_value=0) as mock_run:
+        assert cli.cmd_wrap(args) == 0
+    mock_run.assert_called_once_with(
+        [
+            "--policy",
+            "pol.yaml",
+            "--no-reload-on-change",
+            "--reload-interval",
+            "0.5",
+            "--wrap",
+            "uvx",
+            "pkg",
+        ]
+    )
+
+
+def test_wrap_reload_on_change_is_the_default() -> None:
+    args = cli._build_parser().parse_args(["wrap", "--command", "uvx pkg"])
+    assert args.reload_on_change is True
+    assert args.reload_interval is None
+
+
 def test_install_entries_do_not_bake_an_audit_path() -> None:
     entry = cli._stdio_entry_from_command("/abs/policy.yaml", "npx some-mcp-server")
     assert "--audit" not in entry["args"]
@@ -855,8 +891,8 @@ def test_harden_attempts_reload_and_prints_the_stdio_note(
     assert cli.cmd_harden(_harden_args(policy, "--yes")) == cli.EXIT_OK
     assert calls["reloads"] == [LOCAL_TARGET]
     out = capsys.readouterr().out
-    assert "Restart your MCP client" in out
-    assert "no reload path" in out
+    assert "picks this policy up on its own" in out
+    assert "--no-reload-on-change" in out
 
 
 def test_harden_no_reload_skips_the_reload(
