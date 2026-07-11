@@ -85,7 +85,7 @@ def _join_detail(existing: str, added: str) -> str:
     return f"{existing}; {added}"
 
 
-def _utc_now_iso() -> str:
+def utc_now_iso() -> str:
     """UTC ISO8601 with a literal Z suffix, which datetime.isoformat does not emit."""
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -333,7 +333,7 @@ class AuditWriter:
         """
         summarized, count, highest = _summarize_findings(findings)
         record = AuditRecord(
-            ts=_utc_now_iso(),
+            ts=utc_now_iso(),
             run_id=self.run_id,
             pid=self.pid,
             transport=self.transport,
@@ -503,6 +503,13 @@ def format_console_line(record: AuditRecord, *, arguments: dict[str, Any] | None
         return f"[RESULT]  {tool:<10} {record.detail}"
     if record.action in (AuditAction.BLOCK_METADATA, AuditAction.REDACT_METADATA):
         return f"[META]    {record.method or '-':<10} {record.detail}"
+    if record.action in (
+        AuditAction.PIN_CREATED,
+        AuditAction.PIN_DIFF,
+        AuditAction.PIN_ACCEPTED,
+        AuditAction.BLOCK_PIN,
+    ):
+        return f"[PIN]     {record.method or '-':<10} {record.detail}"
     args_text = json.dumps(arguments or {}, separators=(", ", ": "), ensure_ascii=True, default=str)
     if record.action is AuditAction.BLOCK_POLICY:
         return f"[BLOCK]   {tool:<10} {args_text}  <- {record.rule or 'policy_block'}"
@@ -581,4 +588,5 @@ __all__ = [
     "reset_writer",
     "resolve_args_mode",
     "set_writer",
+    "utc_now_iso",
 ]

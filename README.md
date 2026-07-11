@@ -6,9 +6,11 @@ AgentParry helps you **scan**, **protect**, and **verify** autonomous AI agents 
 
 - **HTTP proxy** (`src/proxy.py`): FastAPI service that inspects JSON-RPC to an upstream MCP-style endpoint, applies policy, redacts sensitive output, fences injected instructions found in tool results, and scans the tool catalogue itself for poisoned metadata.
 - **Stdio MCP proxy** (`src/stdio_proxy.py`): Drop-in wrapper for real MCP servers over stdin/stdout—intended for **Claude Desktop** and **Claude Code**, where the client spawns the MCP process and speaks newline-delimited JSON-RPC (and optionally `Content-Length` framing).
+- **Tool list pinning** (`src/pins.py`): records what a server advertised on first sight and reports every later change to it, so a server that is clean on day one and rewrites a description later does not do it silently.
 - **Audit log** (`src/audit.py`): one JSONL line per policy decision, same schema from both transports.
 - **Replay** (`agentparry replay`): reads the audit log back, reports what actually happened, and gates CI on `FAIL_OPEN`.
 - **Closed loop** (`agentparry harden` / `agentparry verify`): scan, generate policy rules from the findings, re-scan, and report both what got fixed and what the new rules broke.
+- **Policy linter** (`agentparry lint-policy`): predicts which rules over-block, offline, by evaluating each rule against a benign payload corpus and by reading its regexes. `harden` refuses to write rules that fail it.
 
 ## Stdio proxy (Claude / MCP)
 
@@ -27,6 +29,8 @@ Put AgentParry flags **before** `--wrap`. After `--wrap`, the first token is the
 | `--log PATH` | Log file (default: `~/.agentparry/proxy.log`) |
 | `--audit PATH` | JSONL audit log (default: `~/.agentparry/audit.jsonl`, or `AGENTPARRY_AUDIT_PATH`) |
 | `--no-audit` | Disable the audit log |
+| `--reload-on-change` / `--no-reload-on-change` | Reload the policy file when it changes on disk (default: on) |
+| `--reload-interval SECONDS` | Poll interval for that watch (default: 2) |
 | `--verbose` | Extra logging to stderr and the log file |
 | `--wrap CMD` | Command to spawn the real MCP server |
 
@@ -55,7 +59,7 @@ Outcomes roll up into a confusion matrix, so a scan reports a pair of numbers in
 | `false_positive` | benign payload blocked, which is over-blocking |
 | `indeterminate` | not measurable: upstream rejected the call (`-32601` / `-32602`), or safe mode meant the output inspector never ran |
 
-`vulnerability_score` counts attack payloads only, so adding benign payloads cannot deflate it. `detection_rate`, `false_positive_rate` and `balanced_score` return `n/a` when their denominator is empty, because "no benign payloads" is not "zero over-blocking". The payload set ships nine `expected_behavior: allow` payloads and the default policy over-blocks three of them; the scan report's "False positives" section names the rule at fault.
+`vulnerability_score` counts attack payloads only, so adding benign payloads cannot deflate it. `detection_rate`, `false_positive_rate` and `balanced_score` return `n/a` when their denominator is empty, because "no benign payloads" is not "zero over-blocking". The payload set ships fifteen `expected_behavior: allow` payloads and the default policy over-blocks none of them; the scan report's "False positives" section names the rule at fault when it does.
 
 Only error code `-32001` counts as a proxy block. `-32601` and `-32602` mean the call never reached policy evaluation and score as indeterminate.
 
@@ -131,12 +135,16 @@ Before writing, `harden` backs the policy up to a `.bak` sibling, prints a unifi
 | `--full` | Re-run the whole payload set after applying rules instead of replaying only what got through. The CI mode |
 | `--max-vulns N` | Tolerate up to N remaining vulnerabilities before exiting 3 |
 | `--no-reload` | Skip the `POST /policy/reload` attempt |
+| `--force` | Write even when the new rules introduce a high-severity lint finding |
+| `--no-lint` | Skip the over-block lint entirely |
 
 `verify` requires `--before` pointing at a saved scan JSON. A baseline scanned in the same invocation would be taken after the rules landed, so the comparison would always look clean. `--target` defaults to the before report's `target_url`. A `--safe` before report has no passed-through results to replay, so `verify` refuses it without `--full`.
 
 Without `--full` both commands use `Scanner.run_rescan`, which replays only the payloads that previously got through. It therefore cannot see a payload that used to behave correctly and now does not, nor over-blocking among payloads it never replays, so both commands print how many previously correct payloads were skipped. Both also report false positives the new rules introduced: closing four holes while breaking three legitimate calls is not a clean run.
 
-**Writing rules only helps if something reloads them.** `harden` attempts `POST /policy/reload` on the host derived from `--target`, sending `AGENTPARRY_ADMIN_TOKEN` as a bearer token when it is set, and treats any failure as a warning since the file on disk is already updated. The stdio proxy is worse off: it builds its `PolicyEngine` once at startup and has no reload path at all, so a hardening run can never take effect in a live `agentparry wrap` session. `harden` prints a line saying the MCP client has to be restarted.
+**Writing rules only helps if something reloads them.** `harden` attempts `POST /policy/reload` on the host derived from `--target`, sending `AGENTPARRY_ADMIN_TOKEN` as a bearer token when it is set, and treats any failure as a warning since the file on disk is already updated. The stdio proxy watches its policy file and reloads on change, so a hardening run reaches a live `agentparry wrap` session within `--reload-interval` seconds (default 2). `--no-reload-on-change` turns the watch off, and then the MCP client has to be restarted.
+
+A reload rebuilds the engine, the result inspector, the metadata inspector and the tool pinner together, so a `settings` edit lands with the rules. Everything derived from `settings` has to move in one swap: a pinner left behind would keep enforcing the previous `tool_pinning` block and would re-inspect changed metadata with the previous inspector. It refuses any document that would weaken enforcement: unreadable file, YAML syntax error, non-mapping root, and any policy whose rules do not compile to at least one usable rule, which is what a file caught mid-write usually looks like. Every attempt is audited as `POLICY_RELOAD` with the outcome and the rule count; a rejected one leaves the previously loaded policy in force and logs to `~/.agentparry/proxy.log`.
 
 Exit codes, since both are meant for CI:
 
@@ -145,9 +153,40 @@ Exit codes, since both are meant for CI:
 | 0 | Clean |
 | 1 | Error |
 | 2 | Bad command line |
-| 3 | Vulnerabilities remain above `--max-vulns`, or a regression was detected |
-| 4 | `harden` aborted at the confirmation prompt |
+| 3 | Vulnerabilities remain above `--max-vulns`, a regression was detected, `harden` refused the write, or `pins diff` found a pin needing review |
+| 4 | `harden` or `pins accept` aborted at the confirmation prompt |
 | 130 | Interrupted |
+
+## Policy linting
+
+`agentparry lint-policy` predicts which rules over-block **before** the policy ships. Offline: no proxy, no network, no MCP server.
+
+```bash
+agentparry lint-policy                                   # committed policy + benign corpus
+agentparry lint-policy --no-corpus                       # generated benign strings only
+agentparry lint-policy --format json --fail-on high      # CI
+```
+
+Two halves. The **empirical** half writes each rule to a one-rule policy, loads it with a real `PolicyEngine`, evaluates it against the fifteen `category: benign` payloads in `attacks/payloads.yaml`, and reports the matched span of every benign block. One rule at a time, because `evaluate` is first-match-wins and would otherwise attribute a payload to whichever rule happens to be first. The **static** half walks each pattern's parse tree and reports shapes that over-block: unanchored short literals, generic classes with a low repetition floor, unbounded `.*` bridges, patterns matching the empty string, empty domain allowlists, autogen rules that cannot match their originating payload, and ReDoS-shaped nesting.
+
+The committed `config/default_policy.yaml` is clean: 0 of 9 benign payloads blocked and no high-severity finding, which is what CI gates on. It was not, and the three rules the linter named are what got fixed: `autogen_pi-003` blocked any 40-character alphanumeric run and now matches its payload's decoded plaintext, `autogen_pi-004` blocked `disregard.*rules` and now needs a scoped instruction object, and `block_dangerous_shell` blocked `sudo\s+` as a substring and now needs a command position. `flag_external_email` on `bn-002` is reported separately as friction rather than a block, because `REQUIRE_APPROVAL` logs and allows over stdio.
+
+**Gate CI on high severity. Treat medium as review advice.** At `--fail-on high` the committed policy passes; at `--fail-on medium` it names 5 of 7 rules, which is the useless-linter mode. The report measures its own noise for that reason: with the high findings fixed, 100% of the rules still flagged are unconfirmed, all of them at medium or low.
+
+The empirical half is the one that earns its place. `sudo\s+` produced **no static finding at all** (a 4-character literal that no ordinary word contains), so a static-only linter ships that bug. What it does not cover: no cross-rule analysis, so first-match-wins shadowing is invisible; no schema awareness, since that would need `tools/list`; ReDoS is a timed growth estimate, not a proof; no shell parsing, so a dangerous command quoted after a real separator still matches; and generated probe strings are evidence of a shape, not measured traffic. Nine benign payloads across three mock tools is nowhere near a real corpus, and "no benign block" is weak evidence rather than a clean sheet.
+
+Both halves run under the policy's own `settings.normalization` block and per-rule `normalize:` overrides, so a rule that matches only in the canonical view is reported with that view and a span back in the original argument. `result_inspection` and `metadata_inspection` get static checks only, flagging actions that discard a tool call or a tool on a false positive; there is no benign corpus of tool results or tool metadata to measure them against, and the report says so.
+
+`agentparry harden` runs the same lint on the rules it is about to write and refuses the merge when it introduces a high-severity finding. The comparison is against a lint of the current file, so a policy that already over-blocks does not make every later run unwritable.
+
+| Flag | Meaning |
+|---|---|
+| `--policy PATH` | Policy YAML to lint (default: `config/default_policy.yaml`) |
+| `--payloads PATH` | Payload YAML holding the benign corpus |
+| `--no-corpus` | Skip the payload file and rely on generated benign strings |
+| `--no-probes` | Static checks and corpus only |
+| `--fail-on {high,medium,low,never}` | Lowest severity that exits 3 (default: `high`) |
+| `--format {text,json}` | Report format |
 
 ## HTTP proxy
 
@@ -163,10 +202,11 @@ Both proxies append one JSON object per line to `~/.agentparry/audit.jsonl` for 
 | `AGENTPARRY_AUDIT=0` | Disable auditing |
 | `AGENTPARRY_AUDIT_ARGS` | `none` (default), `preview`, or `full` |
 | `AGENTPARRY_AUDIT_KEY_PATH` | Override the HMAC key path (default `~/.agentparry/audit.key`) |
+| `AGENTPARRY_PINS_PATH` | Override the tool-list pin store (default `~/.agentparry/pins.json`) |
 
 Order records by `(run_id, seq)`, not by `ts`: wall-clock time can step backwards under NTP.
 
-The response-side inspectors get their own `action` values rather than reusing `REDACT_OUTPUT`, so filtering the column stays unambiguous when PII redaction and an injection rewrite both fire on one response: `NEUTRALIZE_RESULT` and `BLOCK_RESULT_INJECTION` for tool results, `REDACT_METADATA` and `BLOCK_METADATA` for `tools/list` and `initialize`. All four are stamped `direction: server->client`. Adding enum values is additive, so `AUDIT_SCHEMA_VERSION` is unchanged.
+The response-side inspectors get their own `action` values rather than reusing `REDACT_OUTPUT`, so filtering the column stays unambiguous when PII redaction and an injection rewrite both fire on one response: `NEUTRALIZE_RESULT` and `BLOCK_RESULT_INJECTION` for tool results, `REDACT_METADATA` and `BLOCK_METADATA` for `tools/list` and `initialize`, `PIN_CREATED`, `PIN_DIFF` and `BLOCK_PIN` for tool-list pinning. All of them are stamped `direction: server->client`. `PIN_ACCEPTED` comes from the CLI instead, stamped `transport: cli`. Adding enum values is additive, so `AUDIT_SCHEMA_VERSION` is unchanged.
 
 The file is `0600` inside a `0700` directory, and rotates once at 8 MB to `audit.jsonl.1`. There is no `fsync`, so a hard crash can lose the tail.
 
@@ -304,6 +344,81 @@ The default is **redact at a critical-only threshold**. Prose (description, titl
 Findings are recorded under `_agentparry.metadata_injection` on the result, carrying no matched text so annotating cannot smuggle the payload back into the model's context. Both transports run the same `MetadataInspector.inspect(method, result)`, both fail open on an inspector error, and the stdio side runs the scan on a worker thread so a deep schema cannot stall the handshake. A block returns `-32003`, distinct from `-32001` (input-side) and `-32002` (result-side).
 
 `src/mock_server.py` always advertises a poisoned `customer_lookup` tool, with poison in the top-level description, a nested property description, an enum member and a default, plus one zero-width-obfuscated span, and returns poisoned `initialize` instructions. The scanner's metadata phase runs on every scan, not only under `--discover`, and its verdict comes from re-running the inspector over whatever came back rather than from any marker the proxy self-reports.
+
+## Tool list pinning
+
+Metadata inspection catches a server that is poisoned when you look at it. It cannot catch a server that is clean on day one and rewrites a tool description a month later, because nothing about the new text has to match a signature for it to redirect the agent. `src/pins.py` records what a server advertised the first time it was seen and diffs every later `tools/list` and `initialize` against it.
+
+**Be clear about what this does not do:** the pin does not protect against a server that is malicious on day one. On first sight it records whatever the server says, poison included, and that is `MetadataInspector`'s job to catch, not this one's. The pin closes only the change-over-time hole.
+
+The pin lives on disk because that is where the attack lands. Real clients cache `tools/list` and may never re-call it in a session, so a rug pull shows up across restarts, not inside one.
+
+### What is fingerprinted
+
+| Fingerprint | Over what |
+|---|---|
+| Per tool | SHA-256 of the **raw** canonical JSON of that tool object |
+| Tool set | SHA-256 of the `(name, fingerprint)` pairs sorted by name, plus a count |
+| Server instructions | SHA-256 of `initialize`'s `result.instructions` |
+| Server info | SHA-256 of `initialize`'s `result.serverInfo` |
+
+Raw, not normalized. Hashing a normalized view would let an attacker flip zero-width characters freely, and a change that adds only invisible instructions would hash identically. Whitespace churn producing a diff is the correct trade for a security pin. The set-level hash sorts by name so a server that reorders its catalogue does not read as a change, and carries a count so a duplicated name cannot hide behind another entry.
+
+### Server identity
+
+Keyed on how the server is launched: the wrapped argv for stdio (`cmd:npx some-mcp-server`, whitespace-normalized so `npx  server` and `npx server` are one pin), the upstream URL or `AGENTPARRY_UPSTREAM_CMD` for HTTP. Both are known before any traffic.
+
+**Never `serverInfo.name`.** It is attacker-controlled, so keying on it would let a malicious server rename itself out of its own pin. It is recorded *inside* the pin instead, where a change to it is itself a reported diff.
+
+### First run, and untrusted pins
+
+First sight of a server records the pin and reports `PIN_CREATED` without diffing anything. Flagging everything on first contact trains people to ignore the warning. The same applies per facet: an `initialize` that arrives after a `tools/list`-only pin records identity rather than reporting every field as changed.
+
+If metadata inspection produced a **critical** finding while the pin was being created, the pin is written `trusted: false` and every later discovery re-reports it until someone runs `agentparry pins accept`.
+
+### What happens on a diff
+
+```yaml
+settings:
+  tool_pinning:
+    enabled: true
+    action: warn            # off | warn | redact_changed | block
+    lock_timeout: 2.0
+    last_seen_interval: 86400.0
+```
+
+The default is **warn**, not block. Benign description updates are routine, and a proxy that breaks discovery whenever a maintainer rewords a description gets turned off, which protects nobody.
+
+What does act is escalation: the changed tools are re-inspected with every severity raised one level, so a `high` signature on metadata that just changed reads as `critical`. "Changed **and** now matches a signature" costs that tool its prose, while a routine update costs a log line. Redaction leaves the tool name, `enum` members, `required` and the schema intact, so the tool stays callable and client-side validation still passes. The same escalation applies to changed `initialize` instructions.
+
+`redact_changed` redacts every changed or added tool regardless of signatures. `block` refuses discovery with `-32004`, which is distinct from `-32003` because nothing failed a content scan here: the catalogue may be perfectly clean, it is simply not the one that was pinned.
+
+### The store
+
+`~/.agentparry/pins.json`, overridden by `AGENTPARRY_PINS_PATH`, `0600` inside a `0700` directory, same as the audit key. **A local attacker who can write that file defeats the mechanism outright.** That is hygiene, not a defense. The file records the wrapped command line verbatim as the pin's `target`, so a server launched with a secret in argv has that secret in the pin file, exactly as it already appears in `~/.agentparry/proxy.log`.
+
+Steady state is read-only: `last_seen` is only refreshed once a day, an unchanged catalogue writes nothing at all, and re-reporting an already-pending diff writes nothing either. That is what makes Claude Desktop and Claude Code wrapping the same server a non-event. The writes that do happen take an `flock` on a `pins.json.lock` sidecar, re-read inside the lock, merge one server key and `os.replace`, so a second client cannot lose the first one's entry. A busy lock is **skipped**, not waited on: pins are advisory and must never hold up the MCP stream. A corrupt pin file is quarantined to `pins.json.corrupt-<timestamp>` rather than deleted or raised.
+
+Escalated findings are persisted as `AuditFinding`, which has no `matched_text` field, so a pin file cannot grow a copy of the payload it is warning about.
+
+### Pagination: unverified
+
+**This is the shakiest part of the feature.** A `tools/list` second page fetched via `nextCursor` looks exactly like "N tools removed" to a set-level hash. No server in this repo paginates, so the handling here is untested against a real paginating server.
+
+The mitigation: when `nextCursor` is present, the set-level fingerprint and the tool count are neither recorded nor compared, removals are not reported, and the reason is logged. Tools on that page are still fingerprinted individually, so a **changed** description on a paginated page is still caught. Tools that were never seen before are reported as `added`, because a page 2 and a genuine addition are indistinguishable from here; accepting merges them into the pin rather than replacing it.
+
+### CLI
+
+```bash
+agentparry pins list                          # every pinned server and its status
+agentparry pins show 'npx some-mcp-server'    # one pin as JSON
+agentparry pins diff                          # pending changes; exits 3 when any remain
+agentparry pins accept 'npx some-mcp-server'  # trust what it advertises now
+agentparry pins accept --all --yes            # --all requires --yes
+agentparry pins forget 'npx some-mcp-server'  # next run re-pins whatever it sees
+```
+
+A server argument may be the full pin key or a unique substring of it or of the recorded command; ambiguity is an error rather than a guess. `pins diff` exits 3 when a pin needs review so CI can gate on it. `--all` requires `--yes` because accepting transfers trust, and every accept prints the diff before it writes. `PIN_CREATED`, `PIN_DIFF`, `BLOCK_PIN` and `PIN_ACCEPTED` are audit actions, the last one stamped `transport: cli`.
 
 ## Normalization
 
