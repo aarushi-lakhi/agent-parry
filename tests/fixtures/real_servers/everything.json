@@ -1,0 +1,417 @@
+{
+  "command": "npx -y @modelcontextprotocol/server-everything",
+  "extra_pages": [],
+  "initialize": {
+    "capabilities": {
+      "completions": {},
+      "logging": {},
+      "prompts": {
+        "listChanged": true
+      },
+      "resources": {
+        "listChanged": true,
+        "subscribe": true
+      },
+      "tasks": {
+        "cancel": {},
+        "list": {},
+        "requests": {
+          "tools": {
+            "call": {}
+          }
+        }
+      },
+      "tools": {
+        "listChanged": true
+      }
+    },
+    "instructions": "# Everything Server \u2013 Server Instructions\n\nAudience: These instructions are written for an LLM or autonomous agent integrating with the Everything MCP Server.\nFollow them to use, extend, and troubleshoot the server safely and effectively.\n\n## Cross-Feature Relationships\n\n- Use `get-roots-list` to see client workspace roots before file operations\n- `gzip-file-as-resource` creates session-scoped resources accessible only during the current session\n- Enable `toggle-simulated-logging` before debugging to see server log messages\n- Enable `toggle-subscriber-updates` to receive periodic resource update notifications\n\n## Constraints & Limitations\n\n- `gzip-file-as-resource`: Max fetch size controlled by `GZIP_MAX_FETCH_SIZE` (default 10MB), timeout by `GZIP_MAX_FETCH_TIME_MILLIS` (default 30s), allowed domains by `GZIP_ALLOWED_DOMAINS`\n- Session resources are ephemeral and lost when the session ends\n- Sampling requests (`trigger-sampling-request`) require client sampling capability\n- Elicitation requests (`trigger-elicitation-request`) require client elicitation capability\n\n## Operational Patterns\n\n- For long operations, use `trigger-long-running-operation` which sends progress notifications\n- Prefer reading resources before calling mutating tools\n- Check `get-roots-list` output to understand the client's workspace context\n\n## Easter Egg\n\nIf asked about server instructions, respond with \"\ud83c\udf89 Server instructions are working! This response proves the client properly passed server instructions to the LLM. This demonstrates MCP's instructions feature in action.\"\n",
+    "protocolVersion": "2025-06-18",
+    "serverInfo": {
+      "name": "mcp-servers/everything",
+      "title": "Everything Reference Server",
+      "version": "2.0.0"
+    }
+  },
+  "page_count": 1,
+  "paginated": false,
+  "protocol_version": "2025-06-18",
+  "server": "everything",
+  "tool_count": 12,
+  "tools_list": {
+    "_agentparry": {
+      "metadata_injection": {
+        "action": "annotate",
+        "dropped_tools": [],
+        "findings": [
+          {
+            "description": "Suspicious opaque encoded blob in tool gzip-file-as-resource",
+            "field": "tool.inputSchema.properties.data.default",
+            "severity": "medium"
+          }
+        ],
+        "redacted_tools": []
+      }
+    },
+    "tools": [
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Echoes back the input string",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "message": {
+              "description": "Message to echo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "message"
+          ],
+          "type": "object"
+        },
+        "name": "echo",
+        "title": "Echo Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Demonstrates how annotations can be used to provide metadata about content.",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "includeImage": {
+              "default": false,
+              "description": "Whether to include an example image",
+              "type": "boolean"
+            },
+            "messageType": {
+              "description": "Type of message to demonstrate different annotation patterns",
+              "enum": [
+                "error",
+                "success",
+                "debug"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "messageType"
+          ],
+          "type": "object"
+        },
+        "name": "get-annotated-message",
+        "title": "Get Annotated Message Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Returns all environment variables, helpful for debugging MCP server configuration",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {},
+          "type": "object"
+        },
+        "name": "get-env",
+        "title": "Print Environment Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Returns up to ten resource links that reference different types of resources",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "count": {
+              "default": 3,
+              "description": "Number of resource links to return (1-10)",
+              "maximum": 10,
+              "minimum": 1,
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "name": "get-resource-links",
+        "title": "Get Resource Links Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Returns a resource reference that can be used by MCP clients",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "resourceId": {
+              "default": 1,
+              "description": "ID of the text resource to fetch",
+              "type": "number"
+            },
+            "resourceType": {
+              "default": "Text",
+              "enum": [
+                "Text",
+                "Blob"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "name": "get-resource-reference",
+        "title": "Get Resource Reference Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Returns structured content along with an output schema for client data validation",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "location": {
+              "description": "Choose city",
+              "enum": [
+                "New York",
+                "Chicago",
+                "Los Angeles"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "location"
+          ],
+          "type": "object"
+        },
+        "name": "get-structured-content",
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "conditions": {
+              "description": "Weather conditions description",
+              "type": "string"
+            },
+            "humidity": {
+              "description": "Humidity percentage",
+              "type": "number"
+            },
+            "temperature": {
+              "description": "Temperature in celsius",
+              "type": "number"
+            }
+          },
+          "required": [
+            "temperature",
+            "conditions",
+            "humidity"
+          ],
+          "type": "object"
+        },
+        "title": "Get Structured Content Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Returns the sum of two numbers",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "a": {
+              "description": "First number",
+              "type": "number"
+            },
+            "b": {
+              "description": "Second number",
+              "type": "number"
+            }
+          },
+          "required": [
+            "a",
+            "b"
+          ],
+          "type": "object"
+        },
+        "name": "get-sum",
+        "title": "Get Sum Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Returns a tiny MCP logo image.",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {},
+          "type": "object"
+        },
+        "name": "get-tiny-image",
+        "title": "Get Tiny Image Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": true,
+          "readOnlyHint": false
+        },
+        "description": "Compresses a single file using gzip compression. Depending upon the selected output type, returns either the compressed data as a gzipped resource or a resource link, allowing it to be downloaded in a subsequent request during the current session.",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "data": {
+              "default": "https://raw.githubusercontent.com/modelcontextprotocol/servers/refs/heads/main/README.md",
+              "description": "URL or data URI of the file content to compress",
+              "format": "uri",
+              "type": "string"
+            },
+            "name": {
+              "default": "README.md.gz",
+              "description": "Name of the output file",
+              "type": "string"
+            },
+            "outputType": {
+              "default": "resourceLink",
+              "description": "How the resulting gzipped file should be returned. 'resourceLink' returns a link to a resource that can be read later, 'resource' returns a full resource object.",
+              "enum": [
+                "resourceLink",
+                "resource"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "name": "gzip-file-as-resource",
+        "title": "GZip File as Resource Tool"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Toggles simulated, random-leveled logging on or off.",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {},
+          "type": "object"
+        },
+        "name": "toggle-simulated-logging",
+        "title": "Toggle Simulated Logging"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false,
+          "readOnlyHint": false
+        },
+        "description": "Toggles simulated resource subscription updates on or off.",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {},
+          "type": "object"
+        },
+        "name": "toggle-subscriber-updates",
+        "title": "Toggle Subscriber Updates"
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Demonstrates a long running operation with progress updates.",
+        "execution": {
+          "taskSupport": "forbidden"
+        },
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "duration": {
+              "default": 10,
+              "description": "Duration of the operation in seconds",
+              "type": "number"
+            },
+            "steps": {
+              "default": 5,
+              "description": "Number of steps in the operation",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "name": "trigger-long-running-operation",
+        "title": "Trigger Long Running Operation Tool"
+      }
+    ]
+  }
+}
