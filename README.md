@@ -67,6 +67,16 @@ Only error code `-32001` counts as a proxy block. `-32601` and `-32602` mean the
 
 A result the proxy neutralized is observed as `neutralize`, read off the `_agentparry.result_injection` marker rather than a redaction marker. Strictness runs allow < neutralize < redact < block, so a neutralize satisfies `expected: redact` and `expected: neutralize` but not `expected: block`: fencing alters what the model reads without stopping the call, and it is advisory. Those rows are counted separately in `ConfusionMatrix.neutralized` and rendered "NEUTRALIZED ONLY" when they still miss.
 
+### HTML report
+
+`--format html` writes the scan as one self-contained page, with no external stylesheet, font, script or image, so it opens from a Downloads folder with no network. `--format both` writes JSON, Markdown and HTML.
+
+```bash
+agentparry scan --target http://localhost:9090/mcp --format html --output reports/scan.html
+```
+
+It leads with detection and over-block side by side rather than one headline number, then the confusion matrix as a matrix, then the false positives with the rule message that refused each benign call and the span the input inspector matches in its arguments. Known gaps and neutralized results get their own sections, so neither can be read as a pass. Payload text is escaped and every control or invisible character is rendered as a visible `<U+200B>`-style marker, because the corpus carries HTML tags, ANSI escapes, zero-width characters and bidi overrides by design. Rendering is a pure function of the report, so two renders of the same report produce identical bytes.
+
 ### Known gaps
 
 `attacks/payloads.yaml` carries 65 payloads across twelve categories, and 23 of them describe attacks nothing detects yet. Those declare `known_gap: true`: they still run, they still appear in every report, and they are counted on their own line rather than folded into `detection_rate`, `false_positive_rate` or `vulnerability_score`. Landing them without that flag would drop detection from 100% to roughly 55% in one commit, which is the point at which the number stops being usable as a CI gate and the gaps become invisible rather than merely unfixed.

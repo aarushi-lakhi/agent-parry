@@ -58,7 +58,7 @@ OUTCOME_TRUE_ALLOW = "true_allow"
 OUTCOME_FALSE_POSITIVE = "false_positive"
 OUTCOME_INDETERMINATE = "indeterminate"
 
-_OUTCOME_ORDER: dict[str, int] = {
+OUTCOME_ORDER: dict[str, int] = {
     OUTCOME_FALSE_NEGATIVE: 0,
     OUTCOME_FALSE_POSITIVE: 1,
     OUTCOME_INDETERMINATE: 2,
@@ -437,18 +437,18 @@ class _Tallies:
             self.passed_vuln += 1
 
 
-def _format_rate(value: float | None) -> str:
+def format_rate(value: float | None) -> str:
     """Render a rate, or "n/a" when its denominator was empty."""
     return "n/a" if value is None else f"{value}%"
 
 
 def _matrix_line(matrix: ConfusionMatrix, *, include_known_gaps: bool = False) -> str:
     line = (
-        f"Detection: {_format_rate(matrix.detection_rate)} "
+        f"Detection: {format_rate(matrix.detection_rate)} "
         f"({matrix.true_block}/{matrix.attack_total} attacks stopped) | "
-        f"Over-block: {_format_rate(matrix.false_positive_rate)} "
+        f"Over-block: {format_rate(matrix.false_positive_rate)} "
         f"({matrix.false_positive}/{matrix.benign_total} benign blocked) | "
-        f"Balanced: {_format_rate(matrix.balanced_score)}"
+        f"Balanced: {format_rate(matrix.balanced_score)}"
     )
     if matrix.indeterminate:
         line += f" | {matrix.indeterminate} indeterminate"
@@ -1247,7 +1247,7 @@ class Scanner:
         sorted_results = sorted(
             report.results,
             key=lambda r: (
-                _OUTCOME_ORDER.get(result_outcome(r, safe=report.safe_mode), 9),
+                OUTCOME_ORDER.get(result_outcome(r, safe=report.safe_mode), 9),
                 r.payload.name,
             ),
         )
@@ -1418,9 +1418,9 @@ class Scanner:
                 f"| Passed through (vulnerable) | {report.passed} |",
                 f"| Policy allowed (safe, not executed) | {report.policy_allowed_safe} |",
                 f"| Vulnerability score (attack payloads only) | {report.vulnerability_score}% |",
-                f"| Detection rate | {_format_rate(matrix.detection_rate)} |",
-                f"| Over-block rate | {_format_rate(matrix.false_positive_rate)} |",
-                f"| Balanced score | {_format_rate(matrix.balanced_score)} |",
+                f"| Detection rate | {format_rate(matrix.detection_rate)} |",
+                f"| Over-block rate | {format_rate(matrix.false_positive_rate)} |",
+                f"| Balanced score | {format_rate(matrix.balanced_score)} |",
                 f"| Indeterminate | {matrix.indeterminate} |",
                 f"| Known gaps ({gap_scope}) | {matrix.known_gap} |",
                 "",
@@ -1464,6 +1464,20 @@ class Scanner:
         p.write_text(text, encoding="utf-8")
         return str(p)
 
+    def save_html_report(
+        self,
+        report: ScanReport,
+        path: str | Path,
+        suggested_rules: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Write the report as one self-contained HTML page and return its path."""
+        from src.html_report import render_html_report
+
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(render_html_report(report, suggested_rules), encoding="utf-8")
+        return str(p)
+
     @staticmethod
     def _expected_vs_actual_lines(report: ScanReport) -> list[str]:
         lines = [
@@ -1476,7 +1490,7 @@ class Scanner:
         ordered = sorted(
             report.results,
             key=lambda r: (
-                _OUTCOME_ORDER.get(result_outcome(r, safe=report.safe_mode), 9),
+                OUTCOME_ORDER.get(result_outcome(r, safe=report.safe_mode), 9),
                 r.payload.name,
             ),
         )
@@ -1733,7 +1747,7 @@ def save_scan_outputs(
     output: str,
     fmt: str,
 ) -> list[str]:
-    """Write JSON and/or Markdown under output path rules. Returns paths written."""
+    """Write JSON, Markdown and/or HTML under output path rules. Returns paths written."""
     out = Path(output)
     written: list[str] = []
     ts = report.timestamp.strftime("%Y-%m-%dT%H-%M-%S")
@@ -1756,11 +1770,20 @@ def save_scan_outputs(
             written.append(scanner.save_markdown_report(report, out / f"scan_{ts}.md", rules))
         return written
 
+    if fmt == "html":
+        if output.endswith(".html"):
+            written.append(scanner.save_html_report(report, output, rules))
+        else:
+            out.mkdir(parents=True, exist_ok=True)
+            written.append(scanner.save_html_report(report, out / f"scan_{ts}.html", rules))
+        return written
+
     # both
-    if output.endswith((".json", ".md")):
+    if output.endswith((".json", ".md", ".html")):
         base = out.with_suffix("")
         written.append(scanner.save_report(report, str(base.with_suffix(".json"))))
         written.append(scanner.save_markdown_report(report, base.with_suffix(".md"), rules))
+        written.append(scanner.save_html_report(report, base.with_suffix(".html"), rules))
     else:
         out.mkdir(parents=True, exist_ok=True)
         written.append(
@@ -1768,5 +1791,8 @@ def save_scan_outputs(
         )
         written.append(
             scanner.save_markdown_report(report, out / f"scan_{ts}.md", rules)
+        )
+        written.append(
+            scanner.save_html_report(report, out / f"scan_{ts}.html", rules)
         )
     return written
