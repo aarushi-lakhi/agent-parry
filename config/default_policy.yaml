@@ -68,6 +68,42 @@ rules:
     - \|\s*nc\s
     - \|\s*netcat
   message: 'Blocked: possible data exfiltration'
+- name: block_sensitive_file_paths
+  tool: file_read
+  action: block
+  conditions:
+  - type: path_containment
+    field: path
+    denied_paths:
+    - /etc
+    - /proc
+    - /sys
+    - /root
+    - /var/run/secrets
+    - etc/passwd
+    - etc/shadow
+    - etc/sudoers
+    - .ssh
+    - .aws/credentials
+    - .gnupg
+    normalize:
+      canonical: true
+      decoded: true
+  message: 'Blocked: read of a sensitive system path'
+- name: block_file_read_outside_roots
+  tool: file_read
+  action: block
+  conditions:
+  - type: path_containment
+    field: path
+    allowed_roots:
+    - /home/user
+    - /var/log
+    - /tmp
+    normalize:
+      canonical: true
+      decoded: true
+  message: 'Blocked: file read outside the allowed roots'
 - name: flag_external_email
   tool: email_send
   action: require_approval

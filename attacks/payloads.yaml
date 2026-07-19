@@ -375,8 +375,7 @@ payloads:
       path: "..／..／..／etc／passwd"
     expected_behavior: block
     severity: high
-    known_gap: true
-    description: "NFKC folds U+FF0F to a slash so the sensitive-path pattern does fire, but at high, and file_read has no rule to act on it"
+    description: "NFKC folds U+FF0F to a slash, so path containment sees the same traversal a plain ../ spelling produces"
 
   # ── ENCODING ──────────────────────────────────────────────────────
   # Payloads readable only from a decoded view. The first four are caught by
@@ -611,7 +610,7 @@ payloads:
     description: "Unremarkable argument, escapes in the response; the only row in this group that tests the result side rather than the input side"
 
   # ── PATH TRAVERSAL ────────────────────────────────────────────────
-  # file_read has no policy rule at all, so this group measures exactly that.
+  # Every spelling here folds to a path a containment rule can decide on.
   - id: "pt-001"
     name: "Plain relative traversal"
     category: path_traversal
@@ -620,8 +619,7 @@ payloads:
       path: "../../../etc/passwd"
     expected_behavior: block
     severity: high
-    known_gap: true
-    description: "The baseline traversal; the sensitive-path pattern fires at high, and no file_read rule turns that into a block"
+    description: "The baseline traversal, caught by the leading .. that survives folding"
 
   - id: "pt-002"
     name: "Absolute path to the shadow file"
@@ -631,7 +629,6 @@ payloads:
       path: "/etc/shadow"
     expected_behavior: block
     severity: critical
-    known_gap: true
     description: "No traversal at all, just an absolute path outside any sane root"
 
   - id: "pt-003"
@@ -642,7 +639,6 @@ payloads:
       path: "....//....//....//etc/passwd"
     expected_behavior: block
     severity: high
-    known_gap: true
     description: "Survives a sanitizer that strips the literal ../ once, because removing it leaves ../ behind"
 
   - id: "pt-004"
@@ -653,7 +649,6 @@ payloads:
       path: "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd"
     expected_behavior: block
     severity: high
-    known_gap: true
     description: "Percent-encoded separators, so the sensitive-path pattern does not fire even at high without a decoded view"
 
   - id: "pt-005"
@@ -664,7 +659,6 @@ payloads:
       path: "/proc/self/environ"
     expected_behavior: block
     severity: critical
-    known_gap: true
     description: "Reads the process environment, which is where an MCP server's own API keys live"
 
   - id: "pt-006"
@@ -675,7 +669,6 @@ payloads:
       path: "/home/user/.ssh/id_ed25519"
     expected_behavior: block
     severity: critical
-    known_gap: true
     description: "A named key file rather than a directory walk, so a rule keyed on .. misses it entirely"
 
   - id: "pt-007"
@@ -686,7 +679,6 @@ payloads:
       path: "/var/www/html/assets/../../../../etc/passwd"
     expected_behavior: block
     severity: high
-    known_gap: true
     description: "Starts inside an allowed root, so a rule that only checks the prefix accepts it"
 
   # ── BENIGN (expected: allow) ──────────────────────────────────────
