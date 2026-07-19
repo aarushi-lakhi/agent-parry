@@ -29,6 +29,7 @@ from src.inspector import (
     MetadataInspector,
     OutputInspector,
     ResultInspector,
+    TerminalSanitizer,
 )
 from src.models import (
     INJECTION_BLOCK_ERROR_CODE,
@@ -43,6 +44,7 @@ from src.models import (
     MetadataInspection,
     PinObservation,
     PolicyAction,
+    TerminalSanitization,
     is_known_mcp_method,
     is_tools_call,
 )
@@ -274,6 +276,7 @@ class PolicyBundle:
 
     engine: PolicyEngine
     result_inspector: ResultInspector
+    terminal_sanitizer: TerminalSanitizer
     metadata_inspector: MetadataInspector
     tool_pinner: ToolPinner
 
@@ -311,6 +314,7 @@ def build_policy_bundle(
     return PolicyBundle(
         engine=engine,
         result_inspector=ResultInspector.from_policy_settings(settings),
+        terminal_sanitizer=TerminalSanitizer.from_policy_settings(settings),
         metadata_inspector=metadata_inspector,
         tool_pinner=ToolPinner.from_policy_settings(
             settings, identity=identity, inspector=metadata_inspector
@@ -328,6 +332,7 @@ class StdioMcpProxy:
         stdout_lock: asyncio.Lock,
         audit: AuditWriter,
         result_inspector: ResultInspector | None = None,
+        terminal_sanitizer: TerminalSanitizer | None = None,
         metadata_inspector: MetadataInspector | None = None,
         tool_pinner: ToolPinner | None = None,
     ) -> None:
@@ -335,6 +340,7 @@ class StdioMcpProxy:
         self._input_inspector = input_inspector
         self._output_inspector = output_inspector
         self._result_inspector = result_inspector or ResultInspector()
+        self._terminal_sanitizer = terminal_sanitizer or TerminalSanitizer()
         self._metadata_inspector = metadata_inspector or MetadataInspector()
         self._tool_pinner = tool_pinner or ToolPinner()
         self._stdout_lock = stdout_lock
@@ -362,6 +368,7 @@ class StdioMcpProxy:
         """
         self._policy = bundle.engine
         self._result_inspector = bundle.result_inspector
+        self._terminal_sanitizer = bundle.terminal_sanitizer
         self._metadata_inspector = bundle.metadata_inspector
         self._tool_pinner = bundle.tool_pinner
 
@@ -686,7 +693,33 @@ class StdioMcpProxy:
                         **inbound,
                     )
 
-                # PII first, so the injection scan sees what the model will see.
+                try:
+                    stripped = self._terminal_sanitizer.sanitize(tool_name, sanitized)
+                except Exception as exc:
+                    logger.exception("TerminalSanitizer failed for %s; forwarding raw (fail-open)", tool_name)
+                    self._record(
+                        AuditAction.FAIL_OPEN,
+                        detail=(
+                            f"TerminalSanitizer raised {type(exc).__name__}; "
+                            "result forwarded with any terminal escapes intact (fail-open)"
+                        ),
+                        **inbound,
+                    )
+                    stripped = TerminalSanitization(result=sanitized)
+
+                if stripped.findings:
+                    self._record(
+                        AuditAction.REDACT_OUTPUT,
+                        findings=stripped.findings,
+                        detail=(
+                            f"{stripped.action}: {stripped.escapes_removed} terminal escape "
+                            f"sequence(s) in {len(stripped.fields)} result field(s)"
+                        ),
+                        **inbound,
+                    )
+                sanitized = stripped.result
+
+                # PII first, then escapes, so the injection scan sees what the model will see.
                 try:
                     inspection = self._result_inspector.inspect(tool_name, sanitized)
                 except Exception as exc:
@@ -699,7 +732,7 @@ class StdioMcpProxy:
                         ),
                         **inbound,
                     )
-                    if pii_findings:
+                    if pii_findings or stripped.findings:
                         msg = dict(msg)
                         msg["result"] = sanitized
                     return msg
@@ -725,7 +758,7 @@ class StdioMcpProxy:
                             "message": inspection.block_message,
                         },
                     }
-                if pii_findings or inspection.findings:
+                if pii_findings or stripped.findings or inspection.findings:
                     msg = dict(msg)
                     msg["result"] = inspection.result
                 else:
@@ -1084,6 +1117,7 @@ async def _run_proxy(argv: list[str]) -> int:
         input_inspector = InputInspector()
         output_inspector = OutputInspector()
         result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+        terminal_sanitizer = TerminalSanitizer.from_policy_settings(policy_engine.get_settings())
         metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
         tool_pinner = ToolPinner.from_policy_settings(
             policy_engine.get_settings(),
@@ -1139,6 +1173,7 @@ async def _run_proxy(argv: list[str]) -> int:
         input_inspector=input_inspector,
         output_inspector=output_inspector,
         result_inspector=result_inspector,
+        terminal_sanitizer=terminal_sanitizer,
         metadata_inspector=metadata_inspector,
         tool_pinner=tool_pinner,
         stdout_lock=stdout_lock,
