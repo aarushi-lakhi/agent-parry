@@ -522,6 +522,66 @@ def test_committed_autogen_rules_regenerate_unchanged() -> None:
     assert generated == committed
 
 
+def test_path_traversal_generates_a_containment_rule_not_a_regex(tmp_path: Path) -> None:
+    payload = make_payload("pt-001", "path_traversal", "file_read", {"path": "../../../etc/passwd"})
+    rule = generate_one(payload)
+    condition = only_condition(rule)
+    assert condition["type"] == "path_containment"
+    assert condition["field"] == "path"
+    assert condition["denied_paths"] == ["etc/passwd"]
+    assert condition["normalize"] == {"canonical": True, "decoded": True}
+    assert_rule_blocks_its_own_payload(tmp_path, payload)
+
+
+@pytest.mark.parametrize(
+    ("path", "target"),
+    [
+        ("/etc/shadow", "/etc/shadow"),
+        ("../../../etc/passwd", "etc/passwd"),
+        ("....//....//etc/passwd", "..../..../etc/passwd"),
+        ("%2e%2e%2f%2e%2e%2fetc%2fpasswd", "etc/passwd"),
+        ("/var/www/html/assets/../../../../etc/passwd", "/etc/passwd"),
+    ],
+)
+def test_path_traversal_rule_names_the_target_not_the_spelling(
+    tmp_path: Path, path: str, target: str
+) -> None:
+    payload = make_payload("pt-x", "path_traversal", "file_read", {"path": path})
+    rule = generate_one(payload)
+    assert only_condition(rule)["denied_paths"] == [target]
+    assert_rule_blocks_its_own_payload(tmp_path, payload)
+
+
+def test_path_traversal_rule_leaves_the_benign_file_reads_alone(tmp_path: Path) -> None:
+    payloads_file = yaml.safe_load((REPO_ROOT / "attacks" / "payloads.yaml").read_text())
+    benign = [
+        p
+        for p in payloads_file["payloads"]
+        if p["category"] == "benign" and p["tool"] == "file_read"
+    ]
+    assert benign
+    traversal = [p for p in payloads_file["payloads"] if p["category"] == "path_traversal"]
+    rules = [
+        generate_one(AttackPayload(**raw))
+        for raw in traversal
+    ]
+    engine = PolicyEngine(write_policy(tmp_path, rules))
+    for payload in benign:
+        decision = engine.evaluate(payload["tool"], payload["arguments"])
+        assert decision.action == PolicyAction.ALLOW, (payload["id"], decision)
+
+
+def test_path_traversal_without_a_usable_target_generates_nothing() -> None:
+    payload = make_payload("pt-y", "path_traversal", "file_read", {"path": "../.."})
+    report = ScanReport(
+        total_attacks=1,
+        results=[AttackResult(payload=payload, passed_through=True)],
+        timestamp=datetime.now(UTC),
+        target_url="http://example.invalid/mcp",
+    )
+    assert RuleGenerator().generate_rules(report) == []
+
+
 def test_generated_rule_does_not_fire_on_the_original_tool_name(tmp_path: Path) -> None:
     payload = make_payload(
         "de-003",
