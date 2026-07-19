@@ -126,6 +126,10 @@ settings:
     action: neutralize
     severity_threshold: high
     exempt_tools: []
+  terminal_sanitization:
+    enabled: true
+    action: strip
+    exempt_tools: []
   metadata_inspection:
     enabled: true
     action: redact
