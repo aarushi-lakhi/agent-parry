@@ -16,6 +16,7 @@ from rich.table import Table
 
 from src.models import AttackResult, ScanReport
 from src.normalize import MIN_OPAQUE_BLOB, decode_base64_fragment, iter_base64_runs
+from src.policy import folded_path_candidates, path_segments
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ _PI_PATTERNS: list[tuple[str, str, str]] = [
 ]
 
 _DECODED_NORMALIZE = {"decoded": True}
+
+_PATH_NORMALIZE = {"canonical": True, "decoded": True}
 
 _DE_PATTERNS: list[tuple[str, str, str]] = [
     ("curl", r"curl.*-d", "curl POST exfiltration"),
@@ -119,6 +122,29 @@ def _usable_patterns(patterns: list[str], value: str) -> list[str]:
             pass
         kept.append(pattern)
     return kept
+
+
+def _denied_target(raw_path: str) -> str:
+    """The path a traversal payload was reaching for, or "" when there is none.
+
+    Every folded spelling of the argument is considered, so a percent-encoded or
+    fullwidth payload contributes the path it decodes to rather than the bytes it
+    was written with. An absolute spelling wins because it names the target
+    exactly. Otherwise the most decoded spelling wins, which `folded_path_candidates`
+    returns last, since that is the one that says where the payload was going.
+    """
+    candidates = folded_path_candidates(raw_path)
+    absolute = next((folded for folded in candidates if folded.startswith("/")), None)
+    if absolute is not None:
+        return absolute
+    for folded in reversed(candidates):
+        segments = path_segments(folded)
+        index = 0
+        while index < len(segments) and segments[index] == "..":
+            index += 1
+        if segments[index:]:
+            return "/".join(segments[index:])
+    return ""
 
 
 def _decoded_blob_text(body: str) -> str | None:
@@ -371,6 +397,8 @@ class RuleGenerator:
             return self._rule_privilege_escalation(payload.id, payload.tool, payload.arguments)
         if category == "pii_leak":
             return self._rule_pii_leak(payload.id, payload.tool, payload.arguments)
+        if category == "path_traversal":
+            return self._rule_path_traversal(payload.id, payload.tool, payload.arguments)
         return None
 
     @staticmethod
@@ -508,6 +536,51 @@ class RuleGenerator:
         return RuleGenerator._make_rule(
             attack_id, tool, "BLOCK", field, [pattern], desc, command,
         )
+
+    @staticmethod
+    def _rule_path_traversal(
+        attack_id: str, tool: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Build a BLOCK rule for one traversal payload, as a path_containment denial.
+
+        Not a pattern_match rule, and that is the whole point of the category: a
+        regex over the raw argument reads `....//`, `%2e%2e%2f` and a fullwidth
+        solidus as three unrelated strings, while every one of them folds to the
+        same path. So the emitted rule names the folded target and lets the
+        condition do the folding.
+
+        `denied_paths` carries the target the payload was reaching for rather than
+        the spelling it used, which is what `..` segments are stripped for: a rule
+        derived from `../../../etc/passwd` denies the `etc/passwd` segments and so
+        also covers the absolute spelling and the doubled-dot one. Nothing broader
+        is inferred, matching `_patterns_for_value`: a narrow rule that fires beats
+        a general one that does not.
+        """
+        field, raw_path = RuleGenerator._select_field(arguments, _PATH_FIELDS, "path")
+        target = _denied_target(raw_path)
+        if not target:
+            logger.warning(
+                "Refusing to generate a path rule with no target attack_id=%s tool=%s field=%s",
+                attack_id,
+                tool,
+                field,
+            )
+            return None
+        return {
+            "name": f"autogen_{attack_id}",
+            "tool": tool,
+            "action": "BLOCK",
+            "message": f"blocks reads of {target}",
+            "description": f"blocks reads of {target}",
+            "conditions": [
+                {
+                    "type": "path_containment",
+                    "field": field,
+                    "denied_paths": [target],
+                    "normalize": dict(_PATH_NORMALIZE),
+                }
+            ],
+        }
 
     @staticmethod
     def _rule_pii_leak(

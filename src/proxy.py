@@ -32,6 +32,7 @@ from src.inspector import (
     MetadataInspector,
     OutputInspector,
     ResultInspector,
+    TerminalSanitizer,
 )
 from src.models import (
     INJECTION_BLOCK_ERROR_CODE,
@@ -71,6 +72,7 @@ policy_engine = PolicyEngine(policy_path=_policy_path())
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
 result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+terminal_sanitizer = TerminalSanitizer.from_policy_settings(policy_engine.get_settings())
 metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
 tool_pinner = ToolPinner.from_policy_settings(policy_engine.get_settings(), inspector=metadata_inspector)
 stats = ProxyStats()
@@ -609,8 +611,23 @@ def _handle_mcp_rpc(
             **audit_ctx,
         )
 
-    # PII first, so the injection scan sees the text the model will actually see.
-    inspection = result_inspector.inspect(tool_name, sanitized_result)
+    stripped = terminal_sanitizer.sanitize(tool_name, sanitized_result)
+    if stripped.findings:
+        stats.increment(terminal_escapes_stripped=stripped.escapes_removed)
+        _record(
+            AuditAction.REDACT_OUTPUT,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            tool=tool_name,
+            findings=stripped.findings,
+            detail=(
+                f"{stripped.action}: {stripped.escapes_removed} terminal escape sequence(s) "
+                f"in {len(stripped.fields)} result field(s)"
+            ),
+            **audit_ctx,
+        )
+
+    # PII first, then escapes, so the injection scan sees the text the model will see.
+    inspection = result_inspector.inspect(tool_name, stripped.result)
     if inspection.findings:
         stats.increment(result_injections=1)
         if inspection.action in ("neutralize", "redact"):
@@ -664,8 +681,9 @@ def get_stats() -> dict[str, int]:
 
 def _rebuild_inspectors() -> None:
     """Rebuild the settings-derived inspectors after a policy load."""
-    global result_inspector, metadata_inspector, tool_pinner
+    global result_inspector, terminal_sanitizer, metadata_inspector, tool_pinner
     result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+    terminal_sanitizer = TerminalSanitizer.from_policy_settings(policy_engine.get_settings())
     metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
     tool_pinner = ToolPinner.from_policy_settings(policy_engine.get_settings(), inspector=metadata_inspector)
 
