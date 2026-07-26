@@ -373,7 +373,13 @@ def _observe_pin(
     as if it were clean.
     """
     try:
-        observation = tool_pinner.observe(request.method, raw_result, findings, identity=_server_identity())
+        observation = tool_pinner.observe(
+            request.method,
+            raw_result,
+            findings,
+            identity=_server_identity(),
+            params=request.params,
+        )
     except Exception as exc:
         logger.exception("Tool-list pin check failed for %s; forwarding raw (fail-open)", request.method)
         _record(
