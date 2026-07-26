@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import json
 import os
 import sys
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1078,6 +1081,78 @@ def test_harden_refuses_to_prompt_on_a_non_tty(
         cli.cmd_harden(_harden_args(policy))
     assert "--yes" in str(exc.value)
     assert "scans" not in calls  # refused before firing any payload
+
+
+def _quickstart_args(*extra: str) -> Any:
+    return cli._build_parser().parse_args(["quickstart", *extra])
+
+
+def test_quickstart_requires_exactly_one_source() -> None:
+    for argv in ([], ["--command", "npx srv", "--target", LOCAL_TARGET]):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_quickstart(_quickstart_args(*argv))
+        assert "exactly one of --command or --target" in str(exc.value)
+
+
+def test_quickstart_scans_a_target_safely_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[_report([_vulnerable("pe-004"), _blocked("pe-001")])])
+
+    assert cli.cmd_quickstart(_quickstart_args("--target", LOCAL_TARGET)) == cli.EXIT_OK
+    assert calls["scans"] == [{"target": LOCAL_TARGET, "discover": True, "safe": True, "include_known_gaps": False}]
+    out = capsys.readouterr().out
+    assert "Still getting through: 1 payload(s): pe-004" in out
+    assert f"agentparry harden --target {LOCAL_TARGET} --safe --yes" in out
+
+
+def test_quickstart_command_run_does_not_hand_back_a_dead_port(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[_report([_blocked("pe-001")])])
+    booted: list[tuple[str, str]] = []
+
+    @contextlib.asynccontextmanager
+    async def _fake_proxy(command: str, policy: str) -> AsyncIterator[str]:
+        booted.append((command, policy))
+        yield "http://127.0.0.1:65000/mcp"
+
+    monkeypatch.setattr(cli, "_local_proxy", _fake_proxy)
+
+    assert cli.cmd_quickstart(_quickstart_args("--command", "npx srv")) == cli.EXIT_OK
+    assert booted == [("npx srv", str(packaged_policy_path()))]
+    out = capsys.readouterr().out
+    assert 'agentparry wrap --command "npx srv"' in out
+    assert "--target http://127.0.0.1:65000/mcp" not in out
+
+
+def test_quickstart_verdict_truncates_a_long_gap_list() -> None:
+    results = [_vulnerable(f"pe-{i:03d}") for i in range(cli.QUICKSTART_MAX_GAPS + 3)]
+    lines = cli.quickstart_verdict(_report(results))
+    assert lines[-1].endswith("and 3 more")
+    assert lines[-1].count(",") == cli.QUICKSTART_MAX_GAPS - 1
+
+
+def test_quickstart_verdict_says_so_when_nothing_got_through() -> None:
+    assert cli.quickstart_verdict(_report([_blocked("pe-001")]))[-1] == "Nothing got through."
+
+
+def _subcommand_names(parser: argparse.ArgumentParser) -> list[str]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return list(action.choices)
+    raise AssertionError("no subparsers on the parser")
+
+
+def test_help_groups_every_subcommand_by_verb() -> None:
+    parser = cli._build_parser()
+    text = parser.format_help()
+    for name in _subcommand_names(parser):
+        assert f"    {name} " in text, name
+    for heading in ("START HERE", "SCAN,", "PROTECT,", "VERIFY,"):
+        assert heading in text
 
 
 def test_harden_copies_a_packaged_policy_out_instead_of_writing_package_data(
