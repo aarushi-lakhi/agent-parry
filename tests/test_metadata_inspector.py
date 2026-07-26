@@ -166,12 +166,26 @@ class TestMetadataDetection(unittest.TestCase):
         findings = [f for f in self.inspector.scan_tool(tool) if f.severity == "medium"]
         self.assertTrue(findings)
 
-    def test_oversized_description_is_medium(self) -> None:
+    def test_oversized_description_is_low_and_never_actionable(self) -> None:
+        """Length says the author is verbose, not that anything is hidden."""
         tool = _clean_tool()
-        tool["description"] = "weather. " * 400
+        tool["description"] = "weather. " * 1200
         findings = [f for f in self.inspector.scan_tool(tool) if "Oversized" in f.description]
         self.assertEqual(1, len(findings))
-        self.assertEqual("medium", findings[0].severity)
+        self.assertEqual("low", findings[0].severity)
+        for threshold in ("medium", "high", "critical"):
+            inspector = MetadataInspector(
+                MetadataInspectorSettings(action="redact", severity_threshold=threshold)  # type: ignore[arg-type]
+            )
+            result = inspector.inspect_tools_list({"tools": [copy.deepcopy(tool)]})
+            self.assertEqual([], result.redacted_tools, msg=f"redacted at {threshold}")
+            self.assertEqual([], result.dropped_tools, msg=f"dropped at {threshold}")
+
+    def test_a_description_at_the_real_server_maximum_is_not_oversized(self) -> None:
+        """sequential-thinking's real description is 2781 characters and legitimate."""
+        tool = _clean_tool()
+        tool["description"] = "x" * 2_781
+        self.assertEqual([], [f for f in self.inspector.scan_tool(tool) if "Oversized" in f.description])
 
     def test_json_schema_pattern_key_does_not_trip_the_blob_rule(self) -> None:
         tool = _clean_tool()
@@ -186,6 +200,32 @@ class TestMetadataDetection(unittest.TestCase):
     def test_opaque_blob_still_flagged_in_a_description(self) -> None:
         tool = _clean_tool()
         tool["description"] = f"Weather. Reference: {BLOB}"
+        blobs = [f for f in self.inspector.scan_tool(tool) if f.matched_pattern == "opaque encoded blob"]
+        self.assertEqual(1, len(blobs))
+
+    def test_a_url_does_not_trip_the_blob_rule(self) -> None:
+        """A URL path is mixed-case and undecodable, which is the blob shape exactly."""
+        tool = _clean_tool()
+        schema = tool["inputSchema"]
+        assert isinstance(schema, dict)
+        url = "https://raw.githubusercontent.com/modelcontextprotocol/servers/refs/heads/main/README.md"
+        schema["properties"]["city"]["default"] = url
+        tool["description"] = f"Weather. See {url} for details."
+        blobs = [f for f in self.inspector.scan_tool(tool) if f.matched_pattern == "opaque encoded blob"]
+        self.assertEqual([], blobs)
+
+    def test_a_blob_in_a_schema_default_is_still_flagged(self) -> None:
+        """`default` is not exempt: it is model-facing text an attacker controls."""
+        tool = _clean_tool()
+        schema = tool["inputSchema"]
+        assert isinstance(schema, dict)
+        schema["properties"]["city"]["default"] = BLOB
+        blobs = [f for f in self.inspector.scan_tool(tool) if f.matched_pattern == "opaque encoded blob"]
+        self.assertEqual(1, len(blobs))
+
+    def test_a_blob_appended_to_a_url_is_still_flagged(self) -> None:
+        tool = _clean_tool()
+        tool["description"] = f"Weather. See https://example.com/docs and {BLOB} besides."
         blobs = [f for f in self.inspector.scan_tool(tool) if f.matched_pattern == "opaque encoded blob"]
         self.assertEqual(1, len(blobs))
 

@@ -41,6 +41,7 @@ may be perfectly clean; it is simply not the catalogue that was pinned.
 """
 
 TOOLS_CALL_METHOD = "tools/call"
+TOOLS_LIST_METHOD = "tools/list"
 
 MCP_EXACT_METHODS = frozenset(
     {
@@ -423,9 +424,9 @@ class PinSnapshot(BaseModel):
 
     Every fingerprint field is nullable because one observation only ever sees
     part of the picture: ``initialize`` carries identity and no tools, and a
-    paginated ``tools/list`` carries one page of tools and no trustworthy
-    set-level hash. ``None`` means "this observation says nothing about that
-    field", so accepting it leaves the pinned value alone.
+    ``tools/list`` carries tools and nothing about identity. ``None`` means "this
+    observation says nothing about that field", so accepting it leaves the pinned
+    value alone.
     """
 
     observed_at: str = ""
@@ -433,7 +434,6 @@ class PinSnapshot(BaseModel):
     set_fingerprint: str | None = None
     tool_count: int | None = None
     tools: dict[str, ToolPin] | None = None
-    merge_tools: bool = False
     server_info: dict[str, Any] | None = None
     server_info_fingerprint: str | None = None
     instructions_fingerprint: str | None = None
@@ -480,10 +480,15 @@ class PinObservation(BaseModel):
 
     ``status`` is what happened to the pin, ``action`` what was done to the
     response. ``skipped`` means the store was unreadable or the lock was busy:
-    pins are advisory and must never hold up the MCP stream.
+    pins are advisory and must never hold up the MCP stream. ``partial`` means
+    the response was one page of a ``tools/list`` cursor walk that has not
+    finished, so there is no catalogue to diff yet and nothing was written.
+
+    ``paginated`` says the catalogue arrived over more than one page, on the
+    buffered pages and on the completed observation alike.
     """
 
-    status: Literal["off", "created", "unchanged", "changed", "skipped"] = "off"
+    status: Literal["off", "created", "unchanged", "changed", "skipped", "partial"] = "off"
     key: str = ""
     trusted: bool = True
     diff: PinDiff | None = None
@@ -752,6 +757,7 @@ __all__ = [
     "PROXY_URL",
     "RESULT_INJECTION_ERROR_CODE",
     "TOOLS_CALL_METHOD",
+    "TOOLS_LIST_METHOD",
     "AttackPayload",
     "AttackResult",
     "AttackStep",

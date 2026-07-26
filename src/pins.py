@@ -7,7 +7,7 @@ match a pattern for it to redirect the agent. This module closes that hole and
 only that hole: it records what a server advertised the first time it was seen
 and reports every later change against it.
 
-Three deliberate choices:
+Four deliberate choices:
 
 * Fingerprints are taken over the **raw** canonical JSON of each tool, never a
   normalized view. Normalizing first would let an attacker flip zero-width
@@ -18,6 +18,10 @@ Three deliberate choices:
 * Server identity comes from how the server is launched, never from
   ``serverInfo.name``, which is attacker-controlled: a malicious server would
   simply rename itself out of its own pin.
+* A ``tools/list`` cursor walk is diffed as one sequence, never page by page.
+  Pages are buffered in memory and the pin is not touched until the page
+  without a ``nextCursor`` arrives, because half a catalogue recorded as the
+  whole one would report every later full listing as a pile of additions.
 
 The store is advisory. It is read-only in steady state, every write goes through
 an ``flock`` plus ``os.replace`` and is merged per server key, and a busy lock or
@@ -37,7 +41,7 @@ import shlex
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -81,6 +85,19 @@ contend on every handshake for a field nobody reads in anger.
 """
 
 MAX_KEY_CHARS = 400
+
+MAX_WALK_PAGES = 100
+"""Pages one ``tools/list`` cursor walk may buffer before it is given up on."""
+
+MAX_WALK_TOOLS = 10_000
+"""Tools one ``tools/list`` cursor walk may buffer before it is given up on."""
+
+WALK_TTL_SECONDS = 300.0
+"""How long a half-fetched cursor walk stays open before a later page starts over.
+
+A client is free to abandon pagination, and nothing tells the proxy that it did.
+The walk is dropped instead of being mistaken for the prefix of the next one.
+"""
 
 PIN_REDACTION = (
     "[AgentParry removed this text: it changed since this server was pinned, and the changed metadata "
@@ -373,6 +390,38 @@ class PinStore:
         _chmod(path, 0o600)
 
 
+@dataclass(slots=True)
+class _ToolsListWalk:
+    """The buffered pages of one in-progress ``tools/list`` cursor walk.
+
+    Held in memory on the pinner and never persisted. ``whole`` is False once the
+    walk is known not to start at page one or to have skipped a hop, which is the
+    flag that keeps an incomplete catalogue out of the store entirely.
+    """
+
+    pages: list[list[Any]] = field(default_factory=list)
+    next_cursor: str = ""
+    whole: bool = True
+    started: float = field(default_factory=time.monotonic)
+
+    @property
+    def tool_count(self) -> int:
+        """Tools buffered so far, across every page of this walk."""
+        return sum(len(page) for page in self.pages)
+
+    def catalogue(self) -> list[Any]:
+        """Flatten the buffered pages into one catalogue, in page order."""
+        return [tool for page in self.pages for tool in page]
+
+
+def _request_cursor(params: Any) -> str:
+    """Return the ``cursor`` a ``tools/list`` request carried, or an empty string."""
+    if not isinstance(params, dict):
+        return ""
+    cursor = params.get("cursor")
+    return cursor if isinstance(cursor, str) and cursor else ""
+
+
 class ToolPinSettings(BaseModel):
     """What to do when a server's advertised metadata no longer matches its pin."""
 
@@ -430,6 +479,15 @@ class ToolPinner:
     :class:`~src.inspector.MetadataInspector`'s job, not this one's. The only
     hedge is that a critical metadata finding at creation time writes the pin
     ``trusted: false``, which re-reports on every discovery until accepted.
+
+    A paginated ``tools/list`` is diffed once, as a sequence. The proxy sees each
+    page as an unrelated JSON-RPC response, so pages are correlated on the
+    request ``cursor``: no cursor starts a walk, a cursor continues the walk that
+    handed it out. Pages accumulate in memory and only the page without a
+    ``nextCursor`` reaches the store. Assumptions, in order of how much they
+    cost if wrong: one walk is in flight per server key at a time, a walk whose
+    first page this pinner never saw is never recorded, and a caller that passes
+    no params gets the weaker rule of appending to whatever walk is still open.
     """
 
     def __init__(
@@ -444,6 +502,7 @@ class ToolPinner:
         self._settings = settings or ToolPinSettings()
         self._store = store or PinStore(lock_timeout=self._settings.lock_timeout)
         self._inspector = inspector or MetadataInspector()
+        self._walks: dict[str, _ToolsListWalk] = {}
 
     @classmethod
     def from_policy_settings(cls, settings: Any, **kwargs: Any) -> ToolPinner:
@@ -483,18 +542,24 @@ class ToolPinner:
         findings: Sequence[Finding] = (),
         *,
         identity: ServerIdentity | None = None,
+        params: dict[str, Any] | None = None,
     ) -> PinObservation:
         """Dispatch on the JSON-RPC method that produced this discovery result.
 
         Pass the **raw** upstream result, before metadata redaction rewrote it:
         pinning the redacted form would diff on every run and would pin poison
         that inspection had already removed as if it were clean.
+
+        ``params`` is the params object of the request this result answers. It is
+        what correlates the pages of a ``tools/list`` cursor walk, so a caller
+        that has it should pass it; ``None`` means "not known" and falls back to
+        appending to any walk still open.
         """
         target = identity or self._identity
         if not self._active() or target is None:
             return PinObservation()
         if method == "tools/list":
-            return self._observe_tools_list(target, result, findings)
+            return self._observe_tools_list(target, result, findings, params)
         if method == "initialize":
             return self._observe_initialize(target, result, findings)
         return PinObservation()
@@ -522,27 +587,51 @@ class ToolPinner:
         return self._settings.enabled and self._settings.action != "off"
 
     def _observe_tools_list(
-        self, identity: ServerIdentity, result: dict[str, Any], findings: Sequence[Finding]
+        self,
+        identity: ServerIdentity,
+        result: dict[str, Any],
+        findings: Sequence[Finding],
+        params: dict[str, Any] | None = None,
     ) -> PinObservation:
-        tools = result.get("tools")
-        if not isinstance(tools, list):
+        page = result.get("tools")
+        if not isinstance(page, list):
             return PinObservation()
 
-        paginated = bool(result.get("nextCursor"))
-        observed = fingerprint_tools(tools)
-        if paginated:
-            logger.info(
-                "tools/list carries nextCursor; skipping set-level pin diffing for this page key=%s tools=%d",
-                identity.key,
-                len(tools),
+        raw_cursor = result.get("nextCursor")
+        next_cursor = raw_cursor if isinstance(raw_cursor, str) and raw_cursor else ""
+        walk = self._advance_walk(identity.key, page, params, next_cursor)
+        paginated = len(walk.pages) > 1 or bool(next_cursor) or not walk.whole
+        if next_cursor:
+            return PinObservation(
+                status="partial",
+                key=identity.key,
+                paginated=True,
+                detail=(
+                    f"buffered page {len(walk.pages)} of a paginated tools/list, "
+                    f"{walk.tool_count} tool(s) so far; the pin is diffed once the walk ends"
+                ),
             )
 
+        self._walks.pop(identity.key, None)
+        if not walk.whole:
+            logger.warning(
+                "Discarding an incomplete tools/list cursor walk; the pin was not diffed key=%s",
+                identity.key,
+            )
+            return PinObservation(
+                status="partial",
+                key=identity.key,
+                paginated=True,
+                detail="incomplete paginated tools/list; nothing pinned and nothing diffed",
+            )
+
+        tools = walk.catalogue()
+        observed = fingerprint_tools(tools)
         snapshot = PinSnapshot(
             observed_at=utc_now_iso(),
             tools=observed,
-            merge_tools=paginated,
-            set_fingerprint=None if paginated else tools_set_fingerprint(tools),
-            tool_count=None if paginated else len(tools),
+            set_fingerprint=tools_set_fingerprint(tools),
+            tool_count=len(tools),
         )
         pin = self._store.get(identity.key)
         if pin is None or not pin.tools_seen:
@@ -551,17 +640,53 @@ class ToolPinner:
                 pin,
                 findings,
                 snapshot=snapshot,
-                detail=f"{len(observed)} tool(s) pinned" + (" (first page only)" if paginated else ""),
+                detail=f"{len(observed)} tool(s) pinned",
                 paginated=paginated,
             )
 
-        diff = self._diff_tools(pin, observed, tools, paginated=paginated)
+        diff = self._diff_tools(pin, observed, tools)
         escalated = {
             name: self._escalated_tool_findings(tool)
             for tool in tools
             if (name := tool_name_of(tool)) in (*diff.changed, *diff.added)
         }
         return self._settle(identity, pin, diff, snapshot, escalated=escalated, paginated=paginated)
+
+    def _advance_walk(
+        self, key: str, page: list[Any], params: dict[str, Any] | None, next_cursor: str
+    ) -> _ToolsListWalk:
+        """Fold one ``tools/list`` page into a walk, starting a new one when it is page one.
+
+        A request cursor that does not match the one the previous page handed out
+        means these pages belong to different walks, so the buffer is dropped and
+        the new walk is marked incomplete rather than silently stitched together.
+        """
+        walk = self._walks.get(key)
+        if walk is not None and time.monotonic() - walk.started > WALK_TTL_SECONDS:
+            logger.info("Abandoning a stale tools/list cursor walk key=%s pages=%d", key, len(walk.pages))
+            walk = None
+
+        cursor = _request_cursor(params)
+        if not cursor and (isinstance(params, dict) or walk is None):
+            walk = _ToolsListWalk()
+        elif walk is None or (cursor and cursor != walk.next_cursor):
+            logger.warning("A tools/list page continues a cursor walk this proxy never saw start key=%s", key)
+            walk = _ToolsListWalk(whole=False)
+
+        if len(walk.pages) >= MAX_WALK_PAGES or walk.tool_count + len(page) > MAX_WALK_TOOLS:
+            logger.warning(
+                "tools/list cursor walk exceeded its buffer budget; giving up on it key=%s pages=%d tools=%d",
+                key,
+                len(walk.pages),
+                walk.tool_count,
+            )
+            walk.whole = False
+            walk.pages = []
+        else:
+            walk.pages.append(list(page))
+        walk.next_cursor = next_cursor
+        self._walks[key] = walk
+        return walk
 
     def _observe_initialize(
         self, identity: ServerIdentity, result: dict[str, Any], findings: Sequence[Finding]
@@ -699,17 +824,13 @@ class ToolPinner:
             detail=f"{action}: {diff.summary()}",
         )
 
-    def _diff_tools(
-        self, pin: ServerPin, observed: dict[str, ToolPin], tools: Sequence[Any], *, paginated: bool
-    ) -> PinDiff:
+    def _diff_tools(self, pin: ServerPin, observed: dict[str, ToolPin], tools: Sequence[Any]) -> PinDiff:
         changed = sorted(
             name
             for name, entry in observed.items()
             if name in pin.tools and pin.tools[name].fingerprint != entry.fingerprint
         )
         added = sorted(name for name in observed if name not in pin.tools)
-        if paginated:
-            return PinDiff(changed=changed, added=added)
         removed = sorted(name for name in pin.tools if name not in observed)
         set_fingerprint = tools_set_fingerprint(tools)
         return PinDiff(
@@ -826,11 +947,7 @@ def _merge_snapshots(existing: PinSnapshot | None, incoming: PinSnapshot) -> Pin
         merged.server_info_fingerprint = incoming.server_info_fingerprint
         merged.instructions_fingerprint = incoming.instructions_fingerprint
     if incoming.tools is not None:
-        if incoming.merge_tools and merged.tools is not None:
-            merged.tools = {**merged.tools, **incoming.tools}
-        else:
-            merged.tools = dict(incoming.tools)
-        merged.merge_tools = incoming.merge_tools
+        merged.tools = dict(incoming.tools)
         if incoming.set_fingerprint is not None:
             merged.set_fingerprint = incoming.set_fingerprint
         if incoming.tool_count is not None:
@@ -853,10 +970,10 @@ def _escalate(findings: Sequence[Finding]) -> list[AuditFinding]:
 def _apply_snapshot(pin: ServerPin, snapshot: PinSnapshot) -> None:
     """Copy one observed facet onto a pin, leaving the other facet alone.
 
-    An ``initialize`` observation must not wipe the tool set, one page of a
-    paginated ``tools/list`` must not wipe the pages after it, and an identity
+    An ``initialize`` observation must not wipe the tool set, and an identity
     observation applies its fingerprints verbatim including ``None``, which is how
-    instructions being withdrawn is recorded rather than ignored.
+    instructions being withdrawn is recorded rather than ignored. A tools
+    observation is always a whole catalogue, so it replaces rather than merges.
     """
     if snapshot.identity:
         pin.server_info = snapshot.server_info
@@ -864,10 +981,7 @@ def _apply_snapshot(pin: ServerPin, snapshot: PinSnapshot) -> None:
         pin.instructions_fingerprint = snapshot.instructions_fingerprint
         pin.identity_seen = True
     if snapshot.tools is not None:
-        if snapshot.merge_tools:
-            pin.tools.update(snapshot.tools)
-        else:
-            pin.tools = dict(snapshot.tools)
+        pin.tools = dict(snapshot.tools)
         pin.tools_seen = True
         if snapshot.set_fingerprint is not None:
             pin.set_fingerprint = snapshot.set_fingerprint
@@ -889,7 +1003,6 @@ def _pending_shape(snapshot: PinSnapshot) -> dict[str, Any]:
     fingerprints = None if snapshot.tools is None else {name: pin.fingerprint for name, pin in snapshot.tools.items()}
     return {
         "tools": fingerprints,
-        "merge_tools": snapshot.merge_tools,
         "set_fingerprint": snapshot.set_fingerprint,
         "tool_count": snapshot.tool_count,
         "identity": snapshot.identity,
@@ -918,7 +1031,10 @@ def audit_findings_for(observation: PinObservation) -> list[Finding]:
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT",
     "LAST_SEEN_INTERVAL_SECONDS",
+    "MAX_WALK_PAGES",
+    "MAX_WALK_TOOLS",
     "PIN_REDACTION",
+    "WALK_TTL_SECONDS",
     "PinStore",
     "ServerIdentity",
     "ToolPinSettings",
