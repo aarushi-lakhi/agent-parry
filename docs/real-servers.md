@@ -163,7 +163,7 @@ Fixes, in value order: descend into `array`/`object` schemas to find string leav
 pick a valid `enum` member and append the injection payload rather than replacing
 the value; fill required non-strings with a schema-shaped default (`0`, `[]`, `{}`).
 
-## Pinning survives a real `tools/list`. Pagination does not
+## Pinning survives a real `tools/list`, and now survives pagination too
 
 Per server, three consecutive observations of the same real `tools/list`:
 `created`, `unchanged`, `unchanged`. Same for `initialize`. Set fingerprints are
@@ -172,18 +172,40 @@ order-independent on all eight real catalogues. Nothing spurious, no drift.
 **No real server in the corpus paginates `tools/list`.** All eight return a single
 page with no `nextCursor`, including playwright at 24 tools.
 
-Which is why this is broken. `_observe_tools_list` decides `paginated` from
-`nextCursor` on the page in hand. The *last* page of a paginated response has no
-`nextCursor`, so it is diffed as if it were the complete catalogue. Splitting
-playwright's real 24-tool catalogue into two pages produces, on page two, a
+Which is why this was broken. `_observe_tools_list` used to decide `paginated`
+from `nextCursor` on the page in hand. The *last* page of a paginated response has
+none, so it was diffed as if it were the complete catalogue. Splitting
+playwright's real 24-tool catalogue into two pages produced, on page two, a
 `changed` observation with **12 tools removed and 12 added** — a full rug-pull
-warning on a server that did nothing. It recurs on every discovery and the pin
-never converges. The MCP spec allows cursor pagination on `tools/list`, so this is
-a live bug that no reference server happens to trigger.
+warning on a server that did nothing. It recurred on every discovery and the pin
+never converged. The MCP spec allows cursor pagination on `tools/list`, so this
+was a live bug that no reference server happens to trigger.
 
-`test_paginated_tools_list_produces_a_spurious_diff` pins the broken behavior so a
-fix is visible when it lands. The fix is to carry the paginated flag across a
-cursor walk rather than deriving it per page.
+A `tools/list` cursor walk is now correlated and diffed as one sequence. Pages are
+buffered in memory on the pinner and keyed on the **request** `cursor`: a request
+with no cursor starts a walk, a request carrying a cursor continues the walk that
+handed that cursor out. Nothing reaches the pin store until the page without a
+`nextCursor` arrives, so the same split playwright catalogue now reads `partial`,
+`created`, then `partial`, `unchanged` on every later discovery. Splitting it 2,
+3, 8 or 24 ways pins the identical set fingerprint.
+
+What that costs, stated as assumptions:
+
+- **One walk is in flight per server key at a time.** A second walk starting
+  (a request with no cursor) discards whatever the first had buffered.
+- **A walk whose first page this proxy never saw is never recorded.** An orphan
+  continuation, a cursor that does not match the open walk, and a walk past the
+  page or tool budget all end in `partial` with the pin untouched. A half-fetched
+  catalogue recorded as the whole one would pin a subset and then report every
+  later full listing as a pile of additions, which is worse than recording
+  nothing.
+- **A client that abandons pagination costs nothing.** The buffer is dropped by
+  the next page-one request, or by a 300-second TTL, whichever comes first.
+- **Interleaved traffic is fine.** Only `tools/list` touches the walk, so a
+  `tools/call` or an `initialize` between pages passes through it.
+- **A caller that passes no request params** (the CLI, a direct `observe` call)
+  falls back to appending to whatever walk is still open. Weaker, but still
+  convergent for a plain sequential fetch.
 
 ## The benign corpus does not resemble real traffic
 
@@ -219,7 +241,7 @@ Start:
   default. 2 total findings, both `medium`, both below threshold.
 - 71% of schema-driven probes are schema-valid; 29% of real tools get no injection
   probe at all.
-- Pins settle on all 8 real catalogues; the paginated path is broken.
+- Pins settle on all 8 real catalogues, and on a synthetic paginated one.
 
 ## Reproducing
 
