@@ -31,6 +31,9 @@ dev = [
 where = ["."]
 include = ["src*"]
 
+[tool.setuptools.package-data]
+"src.data" = ["*.yaml"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120

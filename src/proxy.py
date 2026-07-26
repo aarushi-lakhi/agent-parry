@@ -55,15 +55,13 @@ from src.models import (
 )
 from src.pins import ServerIdentity, ToolPinner, audit_findings_for
 from src.policy import PolicyEngine
+from src.resources import POLICY_DEFAULT_HELP, resolve_policy
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_POLICY_PATH = "config/default_policy.yaml"
-
-
 def _policy_path() -> str:
     """Resolve the policy file, matching the stdio proxy's precedence."""
-    return os.environ.get("AGENTPARRY_POLICY", "").strip() or DEFAULT_POLICY_PATH
+    return str(resolve_policy().path)
 
 
 app = FastAPI(title="AgentParry Proxy", version="1.0")
@@ -781,7 +779,7 @@ def main() -> None:
         "--policy",
         default=None,
         metavar="PATH",
-        help=f"Policy YAML (default: {DEFAULT_POLICY_PATH}, or AGENTPARRY_POLICY)",
+        help=f"Policy YAML (default: {POLICY_DEFAULT_HELP})",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--port", type=int, default=9090, help="Bind port")

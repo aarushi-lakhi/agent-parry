@@ -1,8 +1,8 @@
 """Shared pytest fixtures.
 
-The isolation fixtures are autouse so a test that never mentions auditing or
-pinning still cannot write to the real ~/.agentparry. Autouse fixtures do apply
-to unittest.TestCase methods, which most of this suite uses.
+The isolation fixtures are autouse so a test that never mentions auditing,
+pinning or a user policy copy still cannot write to the real ~/.agentparry. Autouse
+fixtures do apply to unittest.TestCase methods, which most of this suite uses.
 """
 
 from __future__ import annotations
@@ -34,3 +34,15 @@ def isolate_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def isolate_pins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Point the tool-list pin store at tmp_path, subprocesses included."""
     monkeypatch.setenv("AGENTPARRY_PINS_PATH", str(tmp_path / "pins" / "pins.json"))
+
+
+@pytest.fixture(autouse=True)
+def isolate_agentparry_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point the user config dir at tmp_path so no test reads or writes a real user policy.
+
+    The directory stays absent unless a test creates it, so default resolution
+    falls through to the packaged files exactly as it does on a fresh install.
+    """
+    monkeypatch.setenv("AGENTPARRY_HOME", str(tmp_path / "home" / ".agentparry"))
+    monkeypatch.delenv("AGENTPARRY_POLICY", raising=False)
+    monkeypatch.delenv("AGENTPARRY_PAYLOADS", raising=False)

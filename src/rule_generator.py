@@ -17,6 +17,8 @@ from rich.table import Table
 from src.models import AttackResult, ScanReport
 from src.normalize import MIN_OPAQUE_BLOB, decode_base64_fragment, iter_base64_runs
 from src.policy import folded_path_candidates, path_segments
+from src.resources import UNSET, Unset
+from src.resources import policy_path as resolve_policy_path
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +339,7 @@ class RuleGenerator:
     def apply_rules(
         self,
         rules: list[dict[str, Any]],
-        policy_path: str = "config/default_policy.yaml",
+        policy_path: str | Path | Unset = UNSET,
     ) -> None:
         """Replace every autogen rule in the policy with `rules`, in place.
 
@@ -348,8 +350,13 @@ class RuleGenerator:
         `plan_autogen_merge` plus `write_policy_text`, which is what
         `agentparry harden` uses. See `merge_autogen_rules` for why replacing
         silently reintroduces vulnerabilities.
+
+        The default target is the resolved default policy, which in an installed
+        tree is package data. Callers that write must resolve a writable path
+        first; `agentparry harden` does that with `resources.copy_out_policy`.
         """
-        with open(policy_path) as f:
+        target = resolve_policy_path(policy_path)
+        with open(target) as f:
             policy = yaml.safe_load(f) or {}
 
         existing: list[dict[str, Any]] = policy.get("rules", [])
@@ -357,7 +364,7 @@ class RuleGenerator:
 
         policy["rules"] = rules + existing
 
-        with open(policy_path, "w") as f:
+        with open(target, "w") as f:
             yaml.dump(policy, f, default_flow_style=False, sort_keys=False)
 
         for r in rules:
