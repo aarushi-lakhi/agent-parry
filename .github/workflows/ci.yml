@@ -19,8 +19,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      # Tests resolve config/default_policy.yaml and attacks/payloads.yaml
-      # relative to cwd, so they must run from the repo root.
+      # Several tests still read config/default_policy.yaml and
+      # attacks/payloads.yaml by relative path, so pytest wants the repo root.
+      # The agentparry commands below do not.
       - name: Tests
         run: pytest tests/ -q
       - name: Lint
