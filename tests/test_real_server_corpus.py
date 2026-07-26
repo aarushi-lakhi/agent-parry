@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,8 @@ import pytest
 
 from src.inspector import (
     INJECTION_PATTERNS,
+    MAX_DESCRIPTION_CHARS,
+    MAX_METADATA_LEAF_CHARS,
     METADATA_PATTERNS,
     MetadataInspector,
     MetadataInspectorSettings,
@@ -114,9 +118,9 @@ class TestCorpusShape:
 class TestMetadataInspectorOnRealServers:
     """The headline question: does poison detection fire on clean servers?
 
-    Answer, over 75 real tools: not once from the pattern table. The two findings
-    in the corpus are structural heuristics at ``medium``, below the shipped
-    ``critical`` threshold, so nothing is rewritten by default.
+    Answer, over 75 real tools: not once, from the pattern table or from the
+    structural heuristics. Zero findings at any severity, so every threshold
+    including ``medium`` leaves all eight catalogues untouched.
     """
 
     def test_no_injection_pattern_matches_real_prose(self) -> None:
@@ -139,12 +143,7 @@ class TestMetadataInspectorOnRealServers:
             instructions = entry["initialize"].get("instructions")
             if isinstance(instructions, str) and instructions:
                 findings.extend(inspector.scan_instructions(instructions))
-        assert len(findings) == 2
-        assert {f.severity for f in findings} == {"medium"}
-        assert sorted(f.matched_pattern for f in findings) == [
-            "opaque encoded blob",
-            "oversized metadata",
-        ]
+        assert findings == []
 
     @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
     def test_default_settings_never_damage_a_real_tool(self, entry: dict[str, Any]) -> None:
@@ -163,8 +162,9 @@ class TestMetadataInspectorOnRealServers:
         after = inspector.inspect_initialize(entry["initialize"]).result.get("instructions")
         assert after == before
 
-    @pytest.mark.parametrize("threshold", ["critical", "high"])
-    def test_thresholds_above_medium_are_inert(self, threshold: str) -> None:
+    @pytest.mark.parametrize("threshold", ["critical", "high", "medium"])
+    def test_every_threshold_is_inert_on_real_servers(self, threshold: str) -> None:
+        """Medium used to drop one working tool and redact one the model needs."""
         inspector = MetadataInspector(
             MetadataInspectorSettings(action="redact", severity_threshold=threshold)
         )
@@ -173,19 +173,68 @@ class TestMetadataInspectorOnRealServers:
             assert result.dropped_tools == []
             assert result.redacted_tools == []
 
-    def test_medium_threshold_damages_two_real_tools(self) -> None:
-        """Lowering the threshold to medium is not free, and this says how much."""
-        inspector = MetadataInspector(
-            MetadataInspectorSettings(action="redact", severity_threshold="medium")
+    def test_the_gzip_default_url_is_not_an_opaque_blob(self) -> None:
+        """A real raw.githubusercontent.com default used to read as encoded bytes."""
+        tool = next(t for t in tools_of(_entry("everything")) if t["name"] == "gzip-file-as-resource")
+        assert tool["inputSchema"]["properties"]["data"]["default"].startswith("https://")
+        findings = MetadataInspector().scan_tool(tool)
+        assert [f.matched_pattern for f in findings] == []
+
+
+class TestRealDescriptionLengths:
+    """What real tool descriptions actually measure, and what the cap must clear.
+
+    ``MAX_DESCRIPTION_CHARS`` is the only inspector setting a real server has ever
+    tripped. These numbers are why it is 8000 and not 2000, and they fail loudly
+    if someone changes the cap without meaning to.
+    """
+
+    @staticmethod
+    def _lengths() -> list[int]:
+        return sorted(
+            len(tool["description"])
+            for entry in CORPUS
+            for tool in tools_of(entry)
+            if isinstance(tool.get("description"), str)
         )
-        dropped: list[str] = []
-        redacted: list[str] = []
-        for entry in CORPUS:
-            result = inspector.inspect_tools_list(entry["tools_list"])
-            dropped.extend(result.dropped_tools)
-            redacted.extend(result.redacted_tools)
-        assert dropped == ["gzip-file-as-resource"]
-        assert redacted == ["sequentialthinking"]
+
+    def test_every_real_tool_has_a_description(self) -> None:
+        assert len(self._lengths()) == EXPECTED_TOOL_TOTAL
+
+    def test_the_distribution_is_pinned(self) -> None:
+        lengths = self._lengths()
+        assert (lengths[0], lengths[-1]) == (14, 2781)
+        assert statistics.median(lengths) == 57
+        assert lengths[math.ceil(0.90 * len(lengths)) - 1] == 323
+        assert lengths[math.ceil(0.95 * len(lengths)) - 1] == 360
+        assert sum(lengths) == 10_732
+
+    def test_the_outlier_is_alone_and_far_out(self) -> None:
+        """Nothing sits between 460 and 2781, so no cap in that range is defensible."""
+        lengths = self._lengths()
+        assert lengths[-2] == 457
+        assert lengths[-1] == 2781
+
+    def test_the_cap_clears_every_real_description_with_headroom(self) -> None:
+        lengths = self._lengths()
+        assert lengths[-1] < MAX_DESCRIPTION_CHARS < MAX_METADATA_LEAF_CHARS
+        assert 2 * lengths[-1] <= MAX_DESCRIPTION_CHARS
+
+    def test_no_real_description_is_oversized(self) -> None:
+        inspector = MetadataInspector()
+        oversized = [
+            tool["name"]
+            for entry in CORPUS
+            for tool in tools_of(entry)
+            for finding in inspector.scan_tool(tool)
+            if finding.matched_pattern == "oversized metadata"
+        ]
+        assert oversized == []
+
+    def test_the_only_real_instructions_string_is_under_the_cap(self) -> None:
+        instructions = _entry("everything")["initialize"]["instructions"]
+        assert len(instructions) == 1_574
+        assert MetadataInspector().scan_instructions(instructions) == []
 
 
 class TestRemappingAgainstRealToolNames:
