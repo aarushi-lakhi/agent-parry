@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from src.models import AttackResult, ConfusionMatrix, ScanReport
+from src.resources import resolve_policy
 from src.rule_generator import RuleGenerator
 from src.scanner import (
     OUTCOME_FALSE_POSITIVE,
@@ -165,7 +166,7 @@ async def phase2_scan(fast: bool) -> tuple[Scanner, ScanReport]:
     )
 
     gen = RuleGenerator()
-    gen.apply_rules([], policy_path="config/default_policy.yaml")
+    gen.apply_rules([], policy_path=resolve_policy().path)
 
     async with httpx.AsyncClient() as client:
         await client.post(f"{PROXY_BASE}/policy/reload", headers=_admin_headers())
@@ -208,7 +209,7 @@ async def phase3_fix(report: ScanReport, fast: bool) -> None:
 
     if rules:
         console.print(f"\n  Generating {len(rules)} new security rules:\n")
-        gen.apply_rules(rules)
+        gen.apply_rules(rules, policy_path=resolve_policy().path)
         console.print()
 
         async with httpx.AsyncClient() as client:
