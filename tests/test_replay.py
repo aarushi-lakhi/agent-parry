@@ -239,6 +239,7 @@ def test_every_audit_action_falls_in_exactly_one_reported_group() -> None:
         replay.METADATA_ACTIONS,
         replay.OUTPUT_ACTIONS,
         replay.PIN_ACTIONS,
+        replay.TAINT_ACTIONS,
         replay.LIFECYCLE_ACTIONS,
     )
     union: set[AuditAction] = set()

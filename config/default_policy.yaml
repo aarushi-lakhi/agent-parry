@@ -135,6 +135,10 @@ settings:
     action: redact
     severity_threshold: critical
     exempt_tools: []
+  taint_tracking:
+    enabled: false
+    action: flag
+    exempt_tools: []
   tool_pinning:
     enabled: true
     action: warn

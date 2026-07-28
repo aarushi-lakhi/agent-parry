@@ -40,6 +40,7 @@ from src.models import (
     MOCK_SERVER_URL,
     PIN_BLOCK_ERROR_CODE,
     RESULT_INJECTION_ERROR_CODE,
+    TAINT_BLOCK_ERROR_CODE,
     AuditAction,
     AuditDirection,
     AuditRecord,
@@ -56,6 +57,8 @@ from src.models import (
 from src.pins import ServerIdentity, ToolPinner, audit_findings_for
 from src.policy import PolicyEngine
 from src.resources import POLICY_DEFAULT_HELP, resolve_policy
+from src.taint import TaintCheck, TaintTracker, annotate_result
+from src.taint import parse_settings as parse_taint_settings
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,7 @@ result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settin
 terminal_sanitizer = TerminalSanitizer.from_policy_settings(policy_engine.get_settings())
 metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
 tool_pinner = ToolPinner.from_policy_settings(policy_engine.get_settings(), inspector=metadata_inspector)
+taint_tracker = TaintTracker.from_policy_settings(policy_engine.get_settings())
 stats = ProxyStats()
 
 _stdio_server: subprocess.Popen[bytes] | None = None
@@ -305,6 +309,44 @@ def _forward_to_upstream(payload: dict[str, Any]) -> dict[str, Any]:
         response = client.post(url, json=payload)
         response.raise_for_status()
         return response.json()
+
+
+_TAINT_AUDIT_ACTIONS = {
+    "flag": AuditAction.TAINT_FLAG,
+    "redact": AuditAction.REDACT_TAINT,
+    "block": AuditAction.BLOCK_TAINT,
+}
+
+
+def _screen_taint(
+    tool_name: str,
+    arguments: dict[str, Any],
+    session_id: str | None,
+    audit_ctx: dict[str, Any],
+) -> TaintCheck:
+    """Screen one call's arguments against the taint set and audit any hit.
+
+    No fail-open wrapper, matching the policy engine and input inspector on this
+    transport: an exception here surfaces as a 500 and the call does not reach
+    upstream.
+    """
+    check = taint_tracker.check_arguments(tool_name, arguments, session_id=session_id)
+    if not check.hit:
+        return check
+    stats.increment(taint_hits=1)
+    if check.blocked:
+        stats.increment(blocked=1)
+    if check.redacted:
+        stats.increment(redacted=1)
+    _record(
+        _TAINT_AUDIT_ACTIONS[check.action],
+        tool=tool_name,
+        findings=check.findings,
+        rule="taint_tracking",
+        detail=check.detail,
+        **audit_ctx,
+    )
+    return check
 
 
 def _resolve_session_id(*, rpc_method: str, incoming_session: str | None) -> str | None:
@@ -568,6 +610,15 @@ def _handle_mcp_rpc(
             message=decision.message or "Blocked by policy",
         )
 
+    taint = _screen_taint(tool_name, arguments, session_id, audit_ctx)
+    if taint.blocked:
+        return _jsonrpc_error(
+            request_id=request.id,
+            code=TAINT_BLOCK_ERROR_CODE,
+            message=taint.block_message,
+        )
+    outbound_arguments = taint.arguments if taint.redacted else arguments
+
     forwarding = "policy evaluated only (safe scan)" if safe_scan else "forwarded upstream"
     if decision.action == PolicyAction.REQUIRE_APPROVAL:
         stats.increment(flagged_for_approval=1, approved=1)
@@ -597,10 +648,22 @@ def _handle_mcp_rpc(
             result={"_agentparry": {"safe_scan": True, "would_forward": True}},
         )
 
-    upstream_payload = _forward_to_upstream(request.model_dump())
+    outbound = request.model_dump()
+    if taint.redacted:
+        params = dict(outbound.get("params") or {})
+        params["arguments"] = outbound_arguments
+        outbound["params"] = params
+    upstream_payload = _forward_to_upstream(outbound)
     result_payload = upstream_payload.get("result")
     if not isinstance(result_payload, dict):
         return _validated_response(request.id, upstream_payload)
+
+    # Seeded pre-redaction: a value the client never saw is the one worth remembering.
+    taint_tracker.observe_result(
+        tool_name, result_payload, session_id=session_id, request_arguments=outbound_arguments
+    )
+    result_payload = annotate_result(result_payload, taint)
+    upstream_payload["result"] = result_payload
 
     sanitized_result, pii_findings = output_inspector.inspect(tool_name, result_payload)
     if pii_findings:
@@ -684,12 +747,18 @@ def get_stats() -> dict[str, int]:
 
 
 def _rebuild_inspectors() -> None:
-    """Rebuild the settings-derived inspectors after a policy load."""
+    """Rebuild the settings-derived inspectors after a policy load.
+
+    The taint tracker is reconfigured rather than rebuilt: it is the only
+    stateful one, and dropping its set on a reload would leave it silently
+    blind for the rest of the session.
+    """
     global result_inspector, terminal_sanitizer, metadata_inspector, tool_pinner
     result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
     terminal_sanitizer = TerminalSanitizer.from_policy_settings(policy_engine.get_settings())
     metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
     tool_pinner = ToolPinner.from_policy_settings(policy_engine.get_settings(), inspector=metadata_inspector)
+    taint_tracker.reconfigure(parse_taint_settings(policy_engine.get_settings()))
 
 
 def set_policy_path(path: str) -> None:
