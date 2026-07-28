@@ -76,6 +76,12 @@ Only error code `-32001` counts as a proxy block. `-32601` and `-32602` mean the
 
 A result the proxy neutralized is observed as `neutralize`, read off the `_agentparry.result_injection` marker rather than a redaction marker. Strictness runs allow < neutralize < redact < block, so a neutralize satisfies `expected: redact` and `expected: neutralize` but not `expected: block`: fencing alters what the model reads without stopping the call, and it is advisory. Those rows are counted separately in `ConfusionMatrix.neutralized` and rendered "NEUTRALIZED ONLY" when they still miss.
 
+### Discovery remapping
+
+`--discover` calls `tools/list` first and maps each payload's tool onto a real one. A mapping needs evidence that the target does the same kind of thing, not a name that looks similar: the candidate's `inputSchema` has to declare every argument the payload carries with a compatible type and no violated `enum`, every property it marks `required` has to be one the payload supplies, and its name has to carry a verb for that capability as a whole token without carrying a mutating verb the capability does not claim. `difflib` only breaks ties between candidates that already passed both gates; as a matcher it mapped `file_read` onto `browser_file_upload`. Everything else is reported unmapped and never sent, because an untested payload is a gap and a read payload delivered to a write tool is damage.
+
+The report carries mapped and unmapped counts, each accepted mapping with its confidence (`exact`, `schema`, `weak`) and the evidence it rested on, and how many mappings were refused for low confidence. None of those is coverage. Description-only evidence is accepted **only under `--safe`**, where nothing is forwarded upstream, so a wrong guess costs a policy evaluation rather than a real call.
+
 ### HTML report
 
 `--format html` writes the scan as one self-contained page, with no external stylesheet, font, script or image, so it opens from a Downloads folder with no network. `--format both` writes JSON, Markdown and HTML.
