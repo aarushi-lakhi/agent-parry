@@ -447,6 +447,42 @@ agentparry pins forget 'npx some-mcp-server'  # next run re-pins whatever it see
 
 A server argument may be the full pin key or a unique substring of it or of the recorded command; ambiguity is an error rather than a guess. `pins diff` exits 3 when a pin needs review so CI can gate on it. `--all` requires `--yes` because accepting transfers trust, and every accept prints the diff before it writes. `PIN_CREATED`, `PIN_DIFF`, `BLOCK_PIN` and `PIN_ACCEPTED` are audit actions, the last one stamped `transport: cli`.
 
+## Cross-call taint tracking
+
+Every other detector here judges one message, so none can see the attack that needs two calls: `file_read` a secret, then `email_send` it. Neither call is suspicious alone. `src/taint.py` keeps the cross-call state that makes the flow visible: it stores keyed blake2b digests of sensitive-looking values found in tool results and screens later tool arguments against them.
+
+**Off by default.** Turn it on in the policy, or with `AGENTPARRY_TAINT=off|flag|redact|block`, which overrides the policy.
+
+```yaml
+settings:
+  taint_tracking:
+    enabled: false
+    action: flag        # flag | redact | block
+    exempt_tools: []
+```
+
+- `flag` records the hit and forwards the call unchanged. Measured to change no verdict on any payload in the corpus.
+- `redact` rewrites the tainted span out of the outgoing argument and forwards the rest, so the workflow completes and the secret does not leave. It degrades to `flag` on a reformatted match, because shingle evidence has no offsets in the original string.
+- `block` returns `-32005`. Policy `BLOCK` still wins over it.
+
+Storage never holds plaintext. Values are folded by NFKC, homoglyph folding, casefold and alphanumerics-only, then hashed under a per-process random key that is never written to disk, so space insertion, line wrapping, quoting, case flips and confusable substitution all collapse to the same string. Up to 32 hashed 12-char shingles per candidate catch reformatted and partial exfiltration. That protects a crash dump or a leaked stats endpoint, not an attacker who can read the process memory and therefore the key.
+
+Bounds are per session: 256 candidates, 256 client-origin digests, 32 shingles per candidate, 16 sessions, a 3600s TTL, and 64 KiB scanned per string. A secret read at hour 0 and exfiltrated at hour 7 is gone from the set.
+
+### False positives
+
+One mechanism handles both echo and pre-possession: a value seen in an *argument* before it was ever seen in a result is marked client-origin and can never seed. So a tool echoing back what it was handed does not seed, and an agent passing around a secret it already had is exempt for the session.
+
+What it cannot resolve, at all, at this layer: **"read my API key and put it in the config" is the same two calls as exfiltration.** The proxy sees JSON-RPC, never a user turn, so there is no signal in the traffic that recovers intent. That is why the default action is `flag` and why `block` should not be one.
+
+Measured on the shipped corpus and a nine-flow benign sequence probe in `tests/test_taint_measurement.py`: one hit across 65 payloads, and it is the real two-call exfiltration; one hit across nine benign two-call flows, and it is the irreducible case above. The corpus itself contains no benign two-call sequence, so the zero over there is not evidence about the ambiguous shape, which is what the probe exists to say.
+
+Screening roughly doubles per-call proxy latency: 1.5 ms to 2.1 ms on a 500-byte argument, 14 ms to 28 ms on a 16 KB one. Hashing every 12-char window of the argument for the fuzzy matcher is most of it. That cost, and an unmeasured false-positive rate against real servers, are why this is off by default rather than on.
+
+### Not on stdio
+
+`src/taint.py` imports nothing transport-specific, but only `src/proxy.py` wires it. The stdio proxy fails open by contract, and while a fail-open is machine-visible there (it records `FAIL_OPEN`, and `agentparry replay --fail-on-fail-open` gates on it), an exception inside a stateful detector leaves the candidate set incomplete and every later call in that session is then screened against it silently. Wiring stdio needs a rule for that first, and the doubled per-call cost lands worst on the transport that runs inside an interactive session. The stdio proxy logs a warning when taint tracking is configured, rather than leaving an operator to read silence as "nothing happened".
+
 ## Normalization
 
 Detection regexes used to run on raw input, so `ignore all previous instructions` was bypassed by a zero-width space, a fullwidth spelling, a Cyrillic homoglyph, or base64. `src/normalize.py` builds normalized **views** of every string before matching. Each view keeps an offset map back to the original, so a finding still quotes real input and a redaction still splices into the real value.

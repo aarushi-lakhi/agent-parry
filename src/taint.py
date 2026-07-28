@@ -237,6 +237,30 @@ def extract_candidates(text: str) -> list[tuple[str, str, int, int]]:
     return found
 
 
+def seedable_candidates(text: str) -> list[tuple[str, str, int, int]]:
+    """Return the seedable candidates in ``text``, dropping enclosing spans.
+
+    ``high_entropy_token`` matches ``API_KEY=sk-...`` as one run, which is the
+    same secret plus its label. Keeping both would store two digests for one
+    value, and the wider one defeats client-origin suppression: the narrow
+    digest is exempt while the wide one still shingle-matches it.
+    """
+    found = [
+        (kind, value, start, end)
+        for kind, value, start, end in extract_candidates(text)
+        if _seedable(kind, value, normalize(value))
+    ]
+    spans = [(start, end) for _kind, _value, start, end in found]
+    return [
+        candidate
+        for candidate, (start, end) in zip(found, spans, strict=True)
+        if not any(
+            inner_start >= start and inner_end <= end and (inner_end - inner_start) < (end - start)
+            for inner_start, inner_end in spans
+        )
+    ]
+
+
 def iter_strings(value: Any, path: str = "arguments") -> Iterator[tuple[str, str]]:
     """Yield ``(field_path, string)`` for every nested string in a JSON-like value."""
     if isinstance(value, dict):
@@ -444,10 +468,8 @@ class TaintTracker:
 
         stored = 0
         for _field, text in iter_strings(result, path="result"):
-            for kind, value, _start, _end in extract_candidates(text[:MAX_SCAN_CHARS]):
+            for kind, value, _start, _end in seedable_candidates(text[:MAX_SCAN_CHARS]):
                 normalized = normalize(value)
-                if not _seedable(kind, value, normalized):
-                    continue
                 digest = self.digest(normalized)
                 if digest in session.client_origin:
                     continue
@@ -478,11 +500,8 @@ class TaintTracker:
 
     def _mark_client_origin(self, session: _Session, arguments: Any, now: float) -> None:
         for _field, text in iter_strings(arguments):
-            for kind, value, _start, _end in extract_candidates(text[:MAX_SCAN_CHARS]):
-                normalized = normalize(value)
-                if not _seedable(kind, value, normalized):
-                    continue
-                digest = self.digest(normalized)
+            for _kind, value, _start, _end in seedable_candidates(text[:MAX_SCAN_CHARS]):
+                digest = self.digest(normalize(value))
                 if digest in session.candidates:
                     continue
                 self._remember_client_origin(session, digest, now)
@@ -513,11 +532,8 @@ class TaintTracker:
         spans: dict[str, list[tuple[int, int]]] = {}
         for field, text in iter_strings(arguments):
             clipped = text[:MAX_SCAN_CHARS]
-            for kind, value, start, end in extract_candidates(clipped):
-                normalized = normalize(value)
-                if not _seedable(kind, value, normalized):
-                    continue
-                digest = self.digest(normalized)
+            for _kind, value, start, end in seedable_candidates(clipped):
+                digest = self.digest(normalize(value))
                 candidate = session.candidates.get(digest)
                 if candidate is None:
                     self._remember_client_origin(session, digest, now)
@@ -614,6 +630,19 @@ class TaintTracker:
         )
 
 
+def taint_requested(settings: Any) -> bool:
+    """True when policy or environment asks for taint tracking to be on.
+
+    The stdio proxy uses this to say plainly that it does not implement the
+    feature, rather than leaving an operator who enabled it to conclude from
+    silence that nothing suspicious happened.
+    """
+    override = env_mode_override()
+    if override is not None:
+        return override is not TaintMode.OFF
+    return parse_settings(settings).mode is not TaintMode.OFF
+
+
 def parse_settings(settings: Any) -> TaintSettings:
     """Read the ``settings.taint_tracking`` block, falling back to defaults."""
     raw = settings.get("taint_tracking") if isinstance(settings, dict) else None
@@ -652,4 +681,6 @@ __all__ = [
     "iter_strings",
     "normalize",
     "parse_settings",
+    "seedable_candidates",
+    "taint_requested",
 ]

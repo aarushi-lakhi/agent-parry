@@ -52,6 +52,7 @@ from src.models import (
 from src.pins import ServerIdentity, ToolPinner, audit_findings_for
 from src.policy import PolicyEngine
 from src.resources import POLICY_DEFAULT_HELP, resolve_policy
+from src.taint import taint_requested
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
@@ -1144,6 +1145,11 @@ async def _run_proxy(argv: list[str]) -> int:
         tool_pinner.identity_key,
         tool_pinner.store.path,
     )
+    if taint_requested(policy_engine.get_settings()):
+        logger.warning(
+            "Cross-call taint tracking is configured but is not wired into the stdio proxy; "
+            "no taint screening will happen on this transport"
+        )
 
     proc = await asyncio.create_subprocess_exec(
         cmd,
