@@ -336,8 +336,6 @@ def _screen_taint(
     stats.increment(taint_hits=1)
     if check.blocked:
         stats.increment(blocked=1)
-    if check.redacted:
-        stats.increment(redacted=1)
     _record(
         _TAINT_AUDIT_ACTIONS[check.action],
         tool=tool_name,

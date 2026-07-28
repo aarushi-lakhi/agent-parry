@@ -730,6 +730,7 @@ class ProxyStats(BaseModel):
     pin_diffs: int = 0
     terminal_escapes_stripped: int = 0
     taint_hits: int = 0
+    """Cross-call taint hits. Its own counter: `redacted` means output-side PII."""
 
     def increment(
         self,
