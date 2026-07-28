@@ -306,21 +306,22 @@ def test_sequence_notes_name_every_step_observation() -> None:
 
 
 def test_remap_rewrites_every_step_tool() -> None:
-    remapped = remap_payload(_sequence_payload(), ["fileRead", "emailSend"])
+    remapped, mappings = remap_payload(_sequence_payload(), ["fileRead", "emailSend"])
     assert remapped is not None
     assert [s.tool for s in remapped.steps] == ["fileRead", "emailSend"]
     assert remapped.tool == "emailSend"
+    assert {m.confidence for m in mappings} == {"exact"}
 
 
 def test_remap_drops_a_sequence_missing_one_step_tool() -> None:
-    assert remap_payload(_sequence_payload(), ["emailSend"]) is None
+    assert remap_payload(_sequence_payload(), ["emailSend"])[0] is None
 
 
 def test_remap_leaves_a_single_step_payload_alone() -> None:
     payload = AttackPayload(
         id="single-002", name="n", category="pii_leak", tool="file_read", arguments={"path": "/x"}
     )
-    remapped = remap_payload(payload, ["file_read"])
+    remapped, _ = remap_payload(payload, ["file_read"])
     assert remapped is payload
 
 
