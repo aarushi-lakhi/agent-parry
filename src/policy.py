@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
 from src.models import Finding, PolicyAction, PolicyDecision
 
 logger = logging.getLogger(__name__)
+
+_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -201,11 +205,18 @@ class PolicyEngine:
             raw_domains = raw_condition.get("allowed_domains")
             if not isinstance(field_name, str) or not isinstance(raw_domains, list):
                 return None
-            normalized_domains = {
-                str(domain).strip().lower()
-                for domain in raw_domains
-                if str(domain).strip()
-            }
+            normalized_domains: set[str] = set()
+            for domain in raw_domains:
+                normalized = self._normalize_host(str(domain))
+                if normalized is None:
+                    logger.warning(
+                        "Dropping unusable allowlist domain rule=%s condition=%s domain=%s",
+                        rule_name,
+                        cond_index,
+                        domain,
+                    )
+                    continue
+                normalized_domains.add(normalized)
             return Condition(type=cond_type, field=field_name, allowed_domains=normalized_domains)
 
         if cond_type == "pii_detection":
@@ -293,7 +304,6 @@ class PolicyEngine:
 
         if condition.type == "domain_allowlist":
             value = arguments.get(condition.field or "")
-            domain = self._extract_domain(value)
             # Empty allowlist intentionally flags everything.
             if not condition.allowed_domains:
                 findings.append(
@@ -304,11 +314,12 @@ class PolicyEngine:
                     )
                 )
                 return True
-            if domain is None or domain not in condition.allowed_domains:
+            host = None if value is None else self._host_from_token(str(value))
+            if host is None or host not in condition.allowed_domains:
                 findings.append(
                     Finding(
                         severity="medium",
-                        description=f"Domain not allowlisted: {domain or 'unknown'}",
+                        description=f"Domain not allowlisted: {host or 'unknown'}",
                         field=condition.field,
                     )
                 )
@@ -334,15 +345,69 @@ class PolicyEngine:
         return False
 
     @staticmethod
-    def _extract_domain(value: Any) -> str | None:
-        if value is None:
+    def _normalize_host(host: str) -> str | None:
+        """Return a comparable host string, or None when nothing usable is left.
+
+        IP literals collapse to their canonical form so ``[0:0:0:0:0:0:0:1]`` and
+        ``::1`` compare equal. Names are IDNA-encoded so a Unicode spelling and its
+        punycode spelling compare equal.
+
+        Deliberately no Unicode normalization or homoglyph folding: folding is
+        fail-open for an allowlist, since folding a Cyrillic-o spelling of
+        ``company.com`` onto the ASCII one would let a confusable domain through.
+        Flagging mixed-script hosts is the inverse job and belongs in its own check.
+
+        Never raises. ``src.stdio_proxy`` fails open on policy exceptions, so a raise
+        out of here would silently disable enforcement for that call.
+        """
+        candidate = host.strip().casefold()
+        if candidate.endswith("."):
+            candidate = candidate[:-1]
+        if candidate.startswith("[") and candidate.endswith("]"):
+            candidate = candidate[1:-1]
+        if not candidate:
             return None
-        address = str(value).strip()
-        if "@" not in address:
+        try:
+            return ipaddress.ip_address(candidate).compressed
+        except ValueError:
+            pass
+        try:
+            # The idna codec rejects empty labels and labels over 63 chars.
+            return candidate.encode("idna").decode("ascii")
+        except (UnicodeError, UnicodeDecodeError):
+            return candidate
+
+    @classmethod
+    def _host_from_token(cls, token: str) -> str | None:
+        """Extract the host from one URL, email address, or bare hostname token."""
+        candidate = token.strip()
+        if not candidate:
             return None
-        _, domain = address.rsplit("@", 1)
-        normalized = domain.strip().lower()
-        return normalized or None
+
+        if _SCHEME_RE.match(candidate) or candidate.startswith("//"):
+            return cls._host_from_url(candidate)
+
+        at_index = candidate.find("@")
+        if at_index != -1 and "/" not in candidate[:at_index]:
+            remainder = candidate.rsplit("@", 1)[1]
+            if any(char in remainder for char in "/:?@"):
+                return None
+            return cls._normalize_host(remainder)
+
+        if "/" in candidate or ":" in candidate:
+            return cls._host_from_url(f"//{candidate}")
+
+        return cls._normalize_host(candidate)
+
+    @classmethod
+    def _host_from_url(cls, url: str) -> str | None:
+        try:
+            hostname = urlsplit(url).hostname
+        except ValueError:
+            return None
+        if not hostname:
+            return None
+        return cls._normalize_host(hostname)
 
     @classmethod
     def _flatten_values(cls, value: Any) -> list[str]:
