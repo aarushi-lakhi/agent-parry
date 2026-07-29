@@ -165,6 +165,18 @@ def _stdio_entry_from_command(policy_abs: str, command: str) -> dict[str, Any]:
     }
 
 
+_REGENERATED_ENTRY_KEYS = frozenset(
+    {
+        # Rebuilt to point at the proxy.
+        "command",
+        "args",
+        "env",
+        "type",
+        "url",
+    }
+)
+
+
 def _stdio_entry_from_existing(policy_abs: str, entry: dict[str, Any]) -> dict[str, Any]:
     if entry.get("url") is not None and not entry.get("command"):
         raise SystemExit(
@@ -192,11 +204,15 @@ def _stdio_entry_from_existing(policy_abs: str, entry: dict[str, Any]) -> dict[s
     else:
         args = _wrap_stdio_args(policy_abs, orig_cmd, orig_args)
 
-    return {
+    new_entry: dict[str, Any] = {
         "command": sys.executable,
         "args": args,
         "env": env,
     }
+    for key, value in entry.items():
+        if key not in _REGENERATED_ENTRY_KEYS:
+            new_entry[key] = value
+    return new_entry
 
 
 def cmd_install_claude(args: argparse.Namespace) -> int:
