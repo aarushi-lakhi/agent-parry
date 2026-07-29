@@ -5,7 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +95,7 @@ async def discover_tools(client: httpx.AsyncClient, proxy_url: str, headers: dic
     resp = await client.post(proxy_url, json=rpc, headers=headers)
     resp.raise_for_status()
     body = resp.json()
-    if "error" in body and body["error"]:
+    if body.get("error"):
         raise RuntimeError(f"tools/list error: {body['error']}")
     result = body.get("result") or {}
     tools = result.get("tools")
@@ -286,7 +286,7 @@ class Scanner:
             policy_allowed_safe=policy_safe,
             results=results,
             vulnerability_score=score,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             target_url=proxy_url,
             safe_mode=safe,
             discovered_tools=discovered_names,
@@ -417,7 +417,7 @@ class Scanner:
             policy_allowed_safe=policy_safe,
             results=results,
             vulnerability_score=score,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             target_url=proxy_url,
             safe_mode=safe,
             discovered_tools=list(original_report.discovered_tools),
@@ -562,8 +562,8 @@ class Scanner:
                 "",
                 "## Summary",
                 "",
-                f"| Metric | Value |",
-                f"| --- | --- |",
+                "| Metric | Value |",
+                "| --- | --- |",
                 f"| Total attacks | {report.total_attacks} |",
                 f"| Blocked | {report.blocked} |",
                 f"| Redacted | {report.redacted} |",

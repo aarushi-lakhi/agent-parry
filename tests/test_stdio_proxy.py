@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from src.inspector import InputInspector, OutputInspector
 from src.models import PolicyAction, PolicyDecision
 from src.policy import PolicyEngine
 from src.stdio_proxy import (
@@ -28,7 +29,6 @@ from src.stdio_proxy import (
     _resolve_policy_path,
     _run_proxy,
 )
-from src.inspector import InputInspector, OutputInspector
 
 
 class TestArgvParsing(unittest.TestCase):

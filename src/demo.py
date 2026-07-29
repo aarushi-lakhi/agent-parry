@@ -7,9 +7,8 @@ import asyncio
 import signal
 import subprocess
 import sys
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 import httpx
 from rich.console import Console

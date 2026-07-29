@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
-from src.models import PolicyAction, PolicyDecision
 from src import proxy as proxy_module
+from src.models import PolicyAction, PolicyDecision
 from src.proxy import app, main, mcp_get, policy_engine, stats
 
 
@@ -302,10 +302,9 @@ class TestProxy(unittest.TestCase):
             "AGENTPARRY_UPSTREAM_CMD": "x",
             "AGENTPARRY_UPSTREAM_URL": "http://y/mcp",
         }
-        with patch.dict(os.environ, env, clear=False):
-            with patch.object(sys, "argv", ["agentparry-proxy"]):
-                with self.assertRaises(SystemExit) as raised:
-                    main()
+        with patch.dict(os.environ, env, clear=False), patch.object(sys, "argv", ["agentparry-proxy"]):
+            with self.assertRaises(SystemExit) as raised:
+                main()
         self.assertEqual(raised.exception.code, 1)
 
     @patch("src.proxy._forward_to_upstream")

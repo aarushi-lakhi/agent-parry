@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-
 
 PROXY_PORT = 9090
 MOCK_SERVER_PORT = 8080
@@ -102,7 +101,7 @@ class ScanReport(BaseModel):
     policy_allowed_safe: int = 0
     results: list[AttackResult] = Field(default_factory=list)
     vulnerability_score: float = 0.0
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     target_url: str = ""
     safe_mode: bool = False
     discovered_tools: list[str] = Field(default_factory=list)
@@ -160,18 +159,18 @@ class ProxyStats(BaseModel):
 
 
 __all__ = [
-    "PROXY_PORT",
     "MOCK_SERVER_PORT",
-    "PROXY_URL",
     "MOCK_SERVER_URL",
-    "JsonRpcRequest",
-    "JsonRpcResponse",
-    "JsonRpcError",
-    "PolicyAction",
-    "PolicyDecision",
-    "Finding",
+    "PROXY_PORT",
+    "PROXY_URL",
     "AttackPayload",
     "AttackResult",
-    "ScanReport",
+    "Finding",
+    "JsonRpcError",
+    "JsonRpcRequest",
+    "JsonRpcResponse",
+    "PolicyAction",
+    "PolicyDecision",
     "ProxyStats",
+    "ScanReport",
 ]
