@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from src.inspector import InputInspector, OutputInspector
-from src.models import PolicyAction
+from src.models import PolicyAction, is_known_mcp_method, is_tools_call
 from src.policy import PolicyEngine
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -238,11 +238,15 @@ class StdioMcpProxy:
         method = msg.get("method")
         req_id = msg.get("id")
 
-        if method != "tools/call":
+        if not (isinstance(method, str) and is_tools_call(method)):
             if req_id is not None:
                 m = method if isinstance(method, str) else "unknown"
                 self._pending_forwarded[req_id] = m
-            self._log_line("client→server", method if isinstance(method, str) else None, "allow", "passthrough")
+            if isinstance(method, str) and not is_known_mcp_method(method):
+                logger.warning("Forwarding unknown MCP method without inspection method=%s", method)
+                self._log_line("client→server", method, "passthrough", "unknown_method")
+            else:
+                self._log_line("client→server", method if isinstance(method, str) else None, "allow", "passthrough")
             return msg
 
         params = msg.get("params")
