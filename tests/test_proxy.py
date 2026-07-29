@@ -302,9 +302,12 @@ class TestProxy(unittest.TestCase):
             "AGENTPARRY_UPSTREAM_CMD": "x",
             "AGENTPARRY_UPSTREAM_URL": "http://y/mcp",
         }
-        with patch.dict(os.environ, env, clear=False), patch.object(sys, "argv", ["agentparry-proxy"]):
-            with self.assertRaises(SystemExit) as raised:
-                main()
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(sys, "argv", ["agentparry-proxy"]),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            main()
         self.assertEqual(raised.exception.code, 1)
 
     @patch("src.proxy._forward_to_upstream")
