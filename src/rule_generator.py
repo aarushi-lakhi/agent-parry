@@ -97,11 +97,11 @@ class RuleGenerator:
         category = payload.category
 
         if category == "prompt_injection":
-            return self._rule_prompt_injection(payload.id, payload.arguments)
+            return self._rule_prompt_injection(payload.id, payload.tool, payload.arguments)
         if category == "data_exfiltration":
-            return self._rule_data_exfiltration(payload.id, payload.arguments)
+            return self._rule_data_exfiltration(payload.id, payload.tool, payload.arguments)
         if category == "privilege_escalation":
-            return self._rule_privilege_escalation(payload.id, payload.arguments)
+            return self._rule_privilege_escalation(payload.id, payload.tool, payload.arguments)
         if category == "pii_leak":
             return self._rule_pii_leak(payload.id, payload.tool, payload.arguments)
         return None
@@ -132,7 +132,7 @@ class RuleGenerator:
 
     @staticmethod
     def _rule_prompt_injection(
-        attack_id: str, arguments: dict[str, Any]
+        attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         body: str = arguments.get("body", "")
 
@@ -152,12 +152,12 @@ class RuleGenerator:
                 pattern = re.escape(first_words)
 
         return RuleGenerator._make_rule(
-            attack_id, "email_send", "BLOCK", "body", [pattern], desc,
+            attack_id, tool, "BLOCK", "body", [pattern], desc,
         )
 
     @staticmethod
     def _rule_data_exfiltration(
-        attack_id: str, arguments: dict[str, Any]
+        attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         command: str = arguments.get("command", "")
 
@@ -170,12 +170,12 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, "shell_exec", "BLOCK", "command", [pattern], desc,
+            attack_id, tool, "BLOCK", "command", [pattern], desc,
         )
 
     @staticmethod
     def _rule_privilege_escalation(
-        attack_id: str, arguments: dict[str, Any]
+        attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         command: str = arguments.get("command", "")
 
@@ -188,24 +188,24 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, "shell_exec", "BLOCK", "command", [pattern], desc,
+            attack_id, tool, "BLOCK", "command", [pattern], desc,
         )
 
     @staticmethod
     def _rule_pii_leak(
         attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        if tool == "file_read":
+        if "path" in arguments:
             file_path: str = arguments.get("path", "")
             filename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
             pattern = re.escape(filename)
             return RuleGenerator._make_rule(
-                attack_id, "file_read", "BLOCK", "path", [pattern],
+                attack_id, tool, "BLOCK", "path", [pattern],
                 f"blocks reads of {filename}",
             )
 
         return RuleGenerator._make_rule(
-            attack_id, "email_send", "BLOCK", "body",
+            attack_id, tool, "BLOCK", "body",
             [r"\d{3}-\d{2}-\d{4}", r"4\d{3}[-\s]?\d{4}"],
             "blocks emails containing SSN or credit card numbers",
         )
