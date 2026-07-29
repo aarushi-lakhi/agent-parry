@@ -37,6 +37,35 @@ class TestProxy(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"]["serverInfo"]["name"], "mock")
 
+    def test_log_line_survives_markup_in_arguments(self) -> None:
+        for hostile in ("hi [/] there", "[/nope] x", "[bold]secret", "[red]a[/red]"):
+            with self.subTest(body=hostile):
+                proxy_module._log_allow("email_send", {"body": hostile})
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_hostile_markup_in_tool_call_does_not_500(self, mock_forward) -> None:
+        mock_forward.return_value = {"jsonrpc": "2.0", "id": 9, "result": {"status": "sent"}}
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "email_send",
+                    "arguments": {"to": "dev@company.com", "subject": "x", "body": "hi [/] there"},
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"]["status"], "sent")
+
+    def test_log_line_emits_arguments_verbatim(self) -> None:
+        buffer = io.StringIO()
+        with patch.object(proxy_module, "console", proxy_module.Console(file=buffer, width=200)):
+            proxy_module._log_allow("email_send", {"body": "[bold]keep me"})
+        self.assertIn("[bold]keep me", buffer.getvalue())
+
     @patch("src.proxy._forward_to_upstream")
     def test_blocks_critical_prompt_injection(self, mock_forward) -> None:
         response = self.client.post(
