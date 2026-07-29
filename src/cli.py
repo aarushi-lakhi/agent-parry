@@ -26,17 +26,58 @@ def _split_command(command: str) -> tuple[str, list[str]]:
     return parts[0], parts[1:]
 
 
+_STDIO_PROXY_ARGS_PREFIX = ["-m", "src.stdio_proxy"]
+
+
 def _wrap_stdio_args(policy_abs: str, cmd: str, child_args: list[str]) -> list[str]:
     wrap_tail = ["--wrap", cmd]
     if child_args:
         wrap_tail.extend(["--", *child_args])
     return [
-        "-m",
-        "src.stdio_proxy",
+        *_STDIO_PROXY_ARGS_PREFIX,
         "--policy",
         policy_abs,
         *wrap_tail,
     ]
+
+
+def _is_wrapped_stdio_args(args: Any) -> bool:
+    """Report whether an arg list already launches the AgentParry stdio proxy.
+
+    Matches on the arg shape rather than on the entry's ``command``, because the
+    interpreter path recorded at install time varies by machine and virtualenv.
+
+    Args:
+        args: Candidate ``args`` value from an MCP server entry, any type.
+
+    Returns:
+        True when the args invoke ``-m src.stdio_proxy``.
+    """
+    return isinstance(args, list) and args[:2] == _STDIO_PROXY_ARGS_PREFIX
+
+
+def _repolicy_stdio_args(policy_abs: str, args: list[str]) -> list[str]:
+    """Point an already-wrapped arg list at a different policy file.
+
+    Only the proxy's own options are scanned; the search stops at ``--wrap`` or
+    ``--`` so a ``--policy`` flag belonging to the wrapped child is left alone.
+
+    Args:
+        policy_abs: Absolute path to the policy file to install.
+        args: Args of an entry for which `_is_wrapped_stdio_args` is True.
+
+    Returns:
+        A new arg list wrapping the same child command with the new policy.
+    """
+    out = list(args)
+    i = len(_STDIO_PROXY_ARGS_PREFIX)
+    while i < len(out) and out[i] not in ("--wrap", "--"):
+        if out[i] == "--policy" and i + 1 < len(out):
+            out[i + 1] = policy_abs
+            return out
+        i += 1
+    out[len(_STDIO_PROXY_ARGS_PREFIX) : len(_STDIO_PROXY_ARGS_PREFIX)] = ["--policy", policy_abs]
+    return out
 
 
 def cmd_wrap(args: argparse.Namespace) -> int:
@@ -145,9 +186,15 @@ def _stdio_entry_from_existing(policy_abs: str, entry: dict[str, Any]) -> dict[s
     else:
         raise SystemExit("error: existing server env must be an object of string keys and string values")
     env["AGENTPARRY_POLICY"] = policy_abs
+
+    if _is_wrapped_stdio_args(orig_args):
+        args = _repolicy_stdio_args(policy_abs, orig_args)
+    else:
+        args = _wrap_stdio_args(policy_abs, orig_cmd, orig_args)
+
     return {
         "command": sys.executable,
-        "args": _wrap_stdio_args(policy_abs, orig_cmd, orig_args),
+        "args": args,
         "env": env,
     }
 
@@ -160,10 +207,12 @@ def cmd_install_claude(args: argparse.Namespace) -> int:
     servers: dict[str, Any] = data["mcpServers"]
     name = args.server_name
 
+    already_wrapped = False
     if name in servers:
         entry = servers[name]
         if not isinstance(entry, dict):
             raise SystemExit(f"error: mcpServers[{name!r}] must be an object")
+        already_wrapped = _is_wrapped_stdio_args(entry.get("args"))
         new_entry = _stdio_entry_from_existing(policy_abs, entry)
     else:
         if not args.command:
@@ -180,6 +229,8 @@ def cmd_install_claude(args: argparse.Namespace) -> int:
         json.dump(data, f, indent=2)
         f.write("\n")
 
+    if already_wrapped:
+        print(f"{name!r} was already wrapped by AgentParry; kept the same child command and set policy to {policy_abs}")
     print("Restart Claude Desktop to activate AgentParry protection")
     return 0
 
