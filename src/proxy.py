@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -27,9 +28,17 @@ from src.inspector import InputInspector, OutputInspector
 from src.models import MOCK_SERVER_URL, JsonRpcRequest, JsonRpcResponse, PolicyAction, ProxyStats
 from src.policy import PolicyEngine
 
+DEFAULT_POLICY_PATH = "config/default_policy.yaml"
+
+
+def _policy_path() -> str:
+    """Resolve the policy file, matching the stdio proxy's precedence."""
+    return os.environ.get("AGENTPARRY_POLICY", "").strip() or DEFAULT_POLICY_PATH
+
+
 app = FastAPI(title="AgentParry Proxy", version="1.0")
 console = Console()
-policy_engine = PolicyEngine()
+policy_engine = PolicyEngine(policy_path=_policy_path())
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
 stats = ProxyStats()
@@ -363,6 +372,17 @@ def get_stats() -> dict[str, int]:
     return stats.model_dump()
 
 
+def set_policy_path(path: str) -> None:
+    """Repoint the live policy engine and reload it.
+
+    The engine is built at import time, so main() has to call this after
+    parsing --policy; setting the env var alone would come too late.
+    """
+    os.environ["AGENTPARRY_POLICY"] = path
+    policy_engine.policy_path = Path(path)
+    policy_engine.reload()
+
+
 @app.post("/policy/reload", dependencies=[Depends(require_admin)])
 def reload_policy() -> dict[str, Any]:
     policy_engine.reload()
@@ -438,6 +458,12 @@ def main() -> None:
         metavar="CMD",
         help="Run this command as stdio MCP server (or set AGENTPARRY_UPSTREAM_CMD)",
     )
+    parser.add_argument(
+        "--policy",
+        default=None,
+        metavar="PATH",
+        help=f"Policy YAML (default: {DEFAULT_POLICY_PATH}, or AGENTPARRY_POLICY)",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--port", type=int, default=9090, help="Bind port")
     parser.add_argument("--log-level", default="info", help="Uvicorn log level")
@@ -449,6 +475,12 @@ def main() -> None:
     if _upstream_config_conflict_message():
         print(_upstream_config_conflict_message(), file=sys.stderr)
         sys.exit(1)
+    if args.policy is not None:
+        policy_file = Path(args.policy).expanduser()
+        if not policy_file.exists():
+            print(f"error: policy file not found: {policy_file}", file=sys.stderr)
+            sys.exit(1)
+        set_policy_path(str(policy_file))
     import uvicorn
 
     uvicorn.run("src.proxy:app", host=args.host, port=args.port, log_level=args.log_level)

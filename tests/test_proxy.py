@@ -8,7 +8,9 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -283,6 +285,49 @@ class TestProxy(unittest.TestCase):
         )
         self.assertEqual(response.json()["error"]["code"], -32001)
         mock_forward.assert_not_called()
+
+    def test_policy_path_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENTPARRY_POLICY", None)
+            self.assertEqual(proxy_module._policy_path(), proxy_module.DEFAULT_POLICY_PATH)
+
+    def test_policy_path_from_env(self) -> None:
+        with patch.dict(os.environ, {"AGENTPARRY_POLICY": "/tmp/other.yaml"}, clear=False):
+            self.assertEqual(proxy_module._policy_path(), "/tmp/other.yaml")
+
+    def test_set_policy_path_repoints_and_reloads_engine(self) -> None:
+        original = proxy_module.policy_engine.policy_path
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = Path(tmp) / "custom.yaml"
+            custom.write_text(
+                "rules:\n"
+                "- name: only_rule\n"
+                "  tool: shell_exec\n"
+                "  action: block\n"
+                "  message: nope\n"
+                "  conditions:\n"
+                "  - type: pattern_match\n"
+                "    field: command\n"
+                "    patterns: ['^ls$']\n",
+                encoding="utf-8",
+            )
+            try:
+                with patch.dict(os.environ, {}, clear=False):
+                    proxy_module.set_policy_path(str(custom))
+                    names = [r["name"] for r in proxy_module.policy_engine.get_rules()]
+                    self.assertEqual(names, ["only_rule"])
+            finally:
+                proxy_module.policy_engine.policy_path = original
+                proxy_module.policy_engine.reload()
+
+    def test_main_exits_when_policy_file_missing(self) -> None:
+        argv = ["agentparry-proxy", "--policy", "/nonexistent/nope.yaml"]
+        with (
+            patch.object(sys, "argv", argv),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            main()
+        self.assertEqual(raised.exception.code, 1)
 
     def test_delete_mcp(self) -> None:
         response = self.client.delete("/mcp")
