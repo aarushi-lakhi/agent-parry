@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from rich.console import Console
@@ -32,7 +33,6 @@ policy_engine = PolicyEngine()
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
 stats = ProxyStats()
-_bypass_all: bool = False
 
 _stdio_server: subprocess.Popen[bytes] | None = None
 _stdio_lock = threading.Lock()
@@ -124,12 +124,45 @@ def _forward_via_stdio(payload: dict[str, Any]) -> dict[str, Any]:
                 return msg
 
 
+def _cors_origins(raw: str | None = None) -> list[str]:
+    """Parse AGENTPARRY_CORS_ORIGINS into an explicit origin allowlist."""
+    source = os.environ.get("AGENTPARRY_CORS_ORIGINS", "") if raw is None else raw
+    return [origin.strip() for origin in source.split(",") if origin.strip()]
+
+
+def _admin_token() -> str:
+    return os.environ.get("AGENTPARRY_ADMIN_TOKEN", "").strip()
+
+
+def _bearer_token(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    return auth.removeprefix("Bearer ").strip()
+
+
+def require_admin(request: Request) -> None:
+    """Gate the /policy control plane. Fails closed when no admin token is set."""
+    expected = _admin_token()
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail="AGENTPARRY_ADMIN_TOKEN is not set; the /policy control plane is disabled",
+        )
+    origin = request.headers.get("origin")
+    if origin and origin not in _cors_origins():
+        raise HTTPException(status_code=403, detail="Cross-origin policy request refused")
+    presented = _bearer_token(request)
+    if presented is None or not secrets.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
         expected = os.environ.get("AGENTPARRY_AUTH_TOKEN", "").strip()
         if expected and request.method != "OPTIONS":
-            auth = request.headers.get("authorization", "")
-            if not auth.startswith("Bearer ") or auth.removeprefix("Bearer ").strip() != expected:
+            presented = _bearer_token(request)
+            if presented is None or not secrets.compare_digest(presented, expected):
                 return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
@@ -137,7 +170,7 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(_BearerAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=[
         "Content-Type",
@@ -242,10 +275,6 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
             message=f"Method not found: {request.method}",
         )
 
-    if _bypass_all and not safe_scan:
-        upstream_payload = _forward_to_upstream(request.model_dump())
-        return JsonRpcResponse.model_validate(upstream_payload)
-
     stats.increment(total_requests=1)
     tool_name, arguments = _get_tool_payload(request)
     if tool_name is None:
@@ -334,27 +363,13 @@ def get_stats() -> dict[str, int]:
     return stats.model_dump()
 
 
-@app.post("/policy/disable")
-def disable_policy() -> dict[str, str]:
-    global _bypass_all
-    _bypass_all = True
-    return {"status": "ok", "policy": "disabled"}
-
-
-@app.post("/policy/enable")
-def enable_policy() -> dict[str, str]:
-    global _bypass_all
-    _bypass_all = False
-    return {"status": "ok", "policy": "enabled"}
-
-
-@app.post("/policy/reload")
+@app.post("/policy/reload", dependencies=[Depends(require_admin)])
 def reload_policy() -> dict[str, Any]:
     policy_engine.reload()
     return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
 
 
-@app.get("/policy/rules")
+@app.get("/policy/rules", dependencies=[Depends(require_admin)])
 def list_rules() -> dict[str, Any]:
     return {"rules": policy_engine.get_rules()}
 
