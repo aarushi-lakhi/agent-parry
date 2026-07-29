@@ -230,9 +230,6 @@ class Scanner:
                 AttackPayload(**entry) for entry in data.get("payloads", [])
             ]
 
-    # ------------------------------------------------------------------
-    # Scan execution
-    # ------------------------------------------------------------------
 
     async def run_scan(
         self,
@@ -429,9 +426,6 @@ class Scanner:
             payload_stats=dict(original_report.payload_stats),
         )
 
-    # ------------------------------------------------------------------
-    # Reporting
-    # ------------------------------------------------------------------
 
     def print_report(self, report: ScanReport) -> None:
         summary = (
@@ -604,9 +598,6 @@ class Scanner:
         p.write_text(text, encoding="utf-8")
         return str(p)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _classify_response(
