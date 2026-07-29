@@ -13,6 +13,48 @@ MOCK_SERVER_PORT = 8080
 PROXY_URL = "http://127.0.0.1:9090/mcp"
 MOCK_SERVER_URL = "http://127.0.0.1:8080/mcp"
 
+TOOLS_CALL_METHOD = "tools/call"
+
+MCP_EXACT_METHODS = frozenset(
+    {
+        "initialize",
+        "initialized",
+        "ping",
+        "tools/list",
+        TOOLS_CALL_METHOD,
+    }
+)
+
+MCP_PASSTHROUGH_PREFIXES = (
+    "notifications/",
+    "resources/",
+    "prompts/",
+    "logging/",
+    "completion/",
+    "roots/",
+    "sampling/",
+)
+
+
+def is_tools_call(method: str) -> bool:
+    """True for tools/call, including case variants.
+
+    JSON-RPC methods are case-sensitive, so this over-approximates on purpose:
+    anything that could plausibly reach a lenient upstream as a tool call gets
+    inspected rather than forwarded blind.
+    """
+    return method.casefold() == TOOLS_CALL_METHOD
+
+
+# tools/ is never prefix-matched: a near-miss must not reach upstream uninspected.
+def is_known_mcp_method(method: str) -> bool:
+    """True for MCP methods safe to forward upstream without tool inspection."""
+    if method in MCP_EXACT_METHODS:
+        return True
+    if method.casefold().startswith("tools/"):
+        return False
+    return method.startswith(MCP_PASSTHROUGH_PREFIXES)
+
 
 class JsonRpcRequest(BaseModel):
     """Represents an incoming JSON-RPC 2.0 request."""
@@ -159,10 +201,13 @@ class ProxyStats(BaseModel):
 
 
 __all__ = [
+    "MCP_EXACT_METHODS",
+    "MCP_PASSTHROUGH_PREFIXES",
     "MOCK_SERVER_PORT",
     "MOCK_SERVER_URL",
     "PROXY_PORT",
     "PROXY_URL",
+    "TOOLS_CALL_METHOD",
     "AttackPayload",
     "AttackResult",
     "Finding",
@@ -173,4 +218,6 @@ __all__ = [
     "PolicyDecision",
     "ProxyStats",
     "ScanReport",
+    "is_known_mcp_method",
+    "is_tools_call",
 ]
