@@ -135,6 +135,41 @@ class TestStdioMcpProxyAsync(unittest.IsolatedAsyncioTestCase):
         self.assertIs(out, msg)
         self.assertEqual(proxy._pending_forwarded.get(1), "initialize")
 
+    async def test_resources_read_passthrough_registers_pending(self) -> None:
+        proxy, _captured = await self._make_proxy()
+        msg = {"jsonrpc": "2.0", "id": 21, "method": "resources/read", "params": {"uri": "file:///x"}}
+        out = await proxy.handle_client_message(msg)
+        self.assertIs(out, msg)
+        self.assertEqual(proxy._pending_forwarded.get(21), "resources/read")
+
+    async def test_unknown_method_forwarded_with_warning(self) -> None:
+        proxy, _captured = await self._make_proxy()
+        msg = {"jsonrpc": "2.0", "id": 22, "method": "evil/exec", "params": {}}
+        with self.assertLogs("src.stdio_proxy", level="WARNING") as logs:
+            out = await proxy.handle_client_message(msg)
+        self.assertIs(out, msg)
+        self.assertTrue(any("unknown MCP method" in line for line in logs.output))
+
+    async def test_known_method_forwarded_without_unknown_warning(self) -> None:
+        proxy, _captured = await self._make_proxy()
+        msg = {"jsonrpc": "2.0", "id": 23, "method": "prompts/get", "params": {}}
+        with self.assertLogs("src.stdio_proxy", level="INFO") as logs:
+            out = await proxy.handle_client_message(msg)
+        self.assertIs(out, msg)
+        self.assertFalse(any("unknown MCP method" in line for line in logs.output))
+
+    async def test_tools_call_case_variant_is_inspected(self) -> None:
+        proxy, captured = await self._make_proxy()
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/Call",
+            "params": {"name": "shell_exec", "arguments": {"command": "rm -rf /"}},
+        }
+        out = await proxy.handle_client_message(msg)
+        self.assertIsNone(out)
+        self.assertEqual(captured[0].get("error", {}).get("code"), -32001)
+
     async def test_tools_call_critical_blocks_without_forward(self) -> None:
         proxy, captured = await self._make_proxy()
         msg = {

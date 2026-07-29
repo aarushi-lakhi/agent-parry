@@ -329,6 +329,69 @@ class TestProxy(unittest.TestCase):
             main()
         self.assertEqual(raised.exception.code, 1)
 
+    @patch("src.proxy._forward_to_upstream")
+    def test_known_methods_forward_upstream(self, mock_forward) -> None:
+        for method in ("resources/read", "resources/list", "prompts/get", "ping"):
+            with self.subTest(method=method):
+                mock_forward.reset_mock()
+                mock_forward.return_value = {"jsonrpc": "2.0", "id": 5, "result": {"ok": method}}
+                response = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 5, "method": method})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["result"]["ok"], method)
+                self.assertEqual(mock_forward.call_args[0][0]["method"], method)
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_unknown_method_returns_method_not_found(self, mock_forward) -> None:
+        response = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 6, "method": "evil/exec"})
+        self.assertEqual(response.json()["error"]["code"], -32601)
+        mock_forward.assert_not_called()
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_tools_namespace_typo_is_rejected_not_forwarded(self, mock_forward) -> None:
+        response = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 7, "method": "tools/call2"})
+        self.assertEqual(response.json()["error"]["code"], -32601)
+        mock_forward.assert_not_called()
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_tools_call_case_variant_is_inspected_not_forwarded(self, mock_forward) -> None:
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/Call",
+                "params": {"name": "shell_exec", "arguments": {"command": "rm -rf /"}},
+            },
+        )
+        self.assertEqual(response.json()["error"]["code"], -32001)
+        mock_forward.assert_not_called()
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_forwarded_method_skips_policy_and_stats(self, mock_forward) -> None:
+        # Anchor for a future PR that adds inspection to these surfaces.
+        mock_forward.return_value = {"jsonrpc": "2.0", "id": 5, "result": {"contents": []}}
+        with patch.object(policy_engine, "evaluate") as mock_eval:
+            self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 5, "method": "resources/read"})
+        mock_eval.assert_not_called()
+        self.assertEqual(stats.total_requests, 0)
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_session_header_echoed_for_resources_read(self, mock_forward) -> None:
+        mock_forward.return_value = {"jsonrpc": "2.0", "id": 5, "result": {"contents": []}}
+        response = self.client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 5, "method": "resources/read"},
+            headers={"Mcp-Session-Id": "sess-1"},
+        )
+        self.assertEqual(response.headers.get("mcp-session-id"), "sess-1")
+
+    @patch("src.proxy._forward_to_upstream")
+    def test_malformed_upstream_response_becomes_jsonrpc_error(self, mock_forward) -> None:
+        mock_forward.return_value = {"jsonrpc": "2.0", "result": {"contents": []}}
+        response = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 12, "method": "resources/read"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["error"]["code"], -32603)
+
     def test_delete_mcp(self) -> None:
         response = self.client.delete("/mcp")
         self.assertEqual(response.status_code, 200)
