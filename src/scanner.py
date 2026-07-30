@@ -27,6 +27,15 @@ console = Console()
 
 SAFE_SCAN_HEADER = "AgentParry-Safe-Scan"
 
+PROXY_BLOCK_CODE = -32001
+UPSTREAM_REJECTED_CODES = frozenset({-32601, -32602})
+
+OBSERVED_BLOCK = "block"
+OBSERVED_REDACT = "redact"
+OBSERVED_ALLOW = "allow"
+OBSERVED_EVALUATED = "evaluated"
+OBSERVED_UNAVAILABLE = "unavailable"
+
 _TOOL_KEYWORD_HINTS: dict[str, tuple[str, ...]] = {
     "shell_exec": ("shell", "bash", "cmd", "exec", "terminal", "sh"),
     "email_send": ("email", "mail", "send", "smtp", "message"),
@@ -327,6 +336,7 @@ class Scanner:
                     AttackResult(
                         payload=payload,
                         passed_through=True,
+                        observed_behavior=OBSERVED_UNAVAILABLE,
                         notes=f"Connection error: {exc}",
                     )
                 )
@@ -571,11 +581,26 @@ class Scanner:
     def _classify_response(
         payload: AttackPayload, body: dict[str, Any]
     ) -> AttackResult:
-        if "error" in body and body["error"] is not None:
+        error = body.get("error")
+        if error is not None:
+            code = error.get("code") if isinstance(error, dict) else None
+            if not isinstance(code, int):
+                code = None
+            if code in UPSTREAM_REJECTED_CODES:
+                return AttackResult(
+                    payload=payload,
+                    was_blocked=True,
+                    error_code=code,
+                    proxy_response=body,
+                    observed_behavior=OBSERVED_UNAVAILABLE,
+                    notes=f"Upstream rejected the call ({code}); policy never evaluated it",
+                )
             return AttackResult(
                 payload=payload,
                 was_blocked=True,
+                error_code=code,
                 proxy_response=body,
+                observed_behavior=OBSERVED_BLOCK,
                 notes="Blocked by proxy",
             )
 
@@ -588,6 +613,7 @@ class Scanner:
                     evaluated_only=True,
                     passed_through=False,
                     proxy_response=body,
+                    observed_behavior=OBSERVED_EVALUATED,
                     notes="Safe scan: policy allowed; upstream not executed",
                 )
 
@@ -596,6 +622,7 @@ class Scanner:
                 payload=payload,
                 was_redacted=True,
                 proxy_response=body,
+                observed_behavior=OBSERVED_REDACT,
                 notes="Output redacted by proxy",
             )
         if isinstance(result_value, dict):
@@ -605,6 +632,7 @@ class Scanner:
                         payload=payload,
                         was_redacted=True,
                         proxy_response=body,
+                        observed_behavior=OBSERVED_REDACT,
                         notes="Output redacted by proxy",
                     )
 
@@ -612,6 +640,7 @@ class Scanner:
             payload=payload,
             passed_through=True,
             proxy_response=body,
+            observed_behavior=OBSERVED_ALLOW,
             notes="Passed through unblocked",
         )
 
