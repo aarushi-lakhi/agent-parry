@@ -84,3 +84,8 @@ settings:
     enabled: true
     canonical: true
     decoded: false
+  result_inspection:
+    enabled: true
+    action: neutralize
+    severity_threshold: high
+    exempt_tools: []

@@ -15,6 +15,16 @@ MOCK_SERVER_URL = "http://127.0.0.1:8080/mcp"
 
 MATCHED_TEXT_LIMIT = 120
 
+INJECTION_BLOCK_ERROR_CODE = -32001
+"""Input-side block: the proxy refused to forward a tool call."""
+
+RESULT_INJECTION_ERROR_CODE = -32002
+"""Output-side block: the tool ran, and its result was refused.
+
+Deliberately distinct from -32001 so an operator reading a log, and the scanner
+reading a response, can tell which direction the block came from.
+"""
+
 
 class JsonRpcRequest(BaseModel):
     """Represents an incoming JSON-RPC 2.0 request."""
@@ -84,6 +94,21 @@ class Finding(BaseModel):
         return value[:MATCHED_TEXT_LIMIT]
 
 
+class ResultInspection(BaseModel):
+    """Outcome of scanning one tool result for indirect prompt injection.
+
+    ``action`` is what was actually done, not what was configured: block mode
+    degrades to ``neutralize`` below critical severity, and any leaf whose
+    severity is only medium is recorded and annotated without being rewritten.
+    """
+
+    result: dict[str, Any] = Field(default_factory=dict)
+    findings: list[Finding] = Field(default_factory=list)
+    action: Literal["none", "annotate", "neutralize", "redact", "block"] = "none"
+    blocked: bool = False
+    block_message: str = ""
+
+
 class AttackPayload(BaseModel):
     """Defines one scanner attack payload and expected behavior."""
 
@@ -136,6 +161,8 @@ class ProxyStats(BaseModel):
     approved: int = 0
     redacted: int = 0
     flagged_for_approval: int = 0
+    result_injections: int = 0
+    neutralized: int = 0
 
     def increment(
         self,
@@ -145,6 +172,8 @@ class ProxyStats(BaseModel):
         approved: int = 0,
         redacted: int = 0,
         flagged_for_approval: int = 0,
+        result_injections: int = 0,
+        neutralized: int = 0,
     ) -> None:
         """Increment one or more counters by non-negative deltas."""
 
@@ -154,6 +183,8 @@ class ProxyStats(BaseModel):
             "approved": approved,
             "redacted": redacted,
             "flagged_for_approval": flagged_for_approval,
+            "result_injections": result_injections,
+            "neutralized": neutralized,
         }
 
         for name, delta in deltas.items():
@@ -165,6 +196,8 @@ class ProxyStats(BaseModel):
         self.approved += approved
         self.redacted += redacted
         self.flagged_for_approval += flagged_for_approval
+        self.result_injections += result_injections
+        self.neutralized += neutralized
 
     def reset(self) -> None:
         """Reset all counters to zero."""
@@ -174,14 +207,18 @@ class ProxyStats(BaseModel):
         self.approved = 0
         self.redacted = 0
         self.flagged_for_approval = 0
+        self.result_injections = 0
+        self.neutralized = 0
 
 
 __all__ = [
+    "INJECTION_BLOCK_ERROR_CODE",
     "MATCHED_TEXT_LIMIT",
     "MOCK_SERVER_PORT",
     "MOCK_SERVER_URL",
     "PROXY_PORT",
     "PROXY_URL",
+    "RESULT_INJECTION_ERROR_CODE",
     "AttackPayload",
     "AttackResult",
     "Finding",
@@ -191,5 +228,6 @@ __all__ = [
     "PolicyAction",
     "PolicyDecision",
     "ProxyStats",
+    "ResultInspection",
     "ScanReport",
 ]
