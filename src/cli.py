@@ -1,4 +1,4 @@
-"""AgentParry CLI: wrap, scan, harden, verify, and install helpers."""
+"""AgentParry CLI: wrap, scan, harden, verify, replay, and install helpers."""
 
 from __future__ import annotations
 
@@ -18,7 +18,16 @@ from urllib.parse import urlparse
 import httpx
 import json5
 
+from src.audit import default_audit_path
 from src.models import PROXY_URL, ScanReport
+from src.replay import (
+    BUCKET_WIDTHS,
+    DEFAULT_BUCKET,
+    DEFAULT_TOP,
+    build_report,
+    read_log,
+    render_text,
+)
 from src.rule_generator import RuleGenerator, plan_autogen_merge, write_policy_text
 from src.scanner import (
     OUTCOME_FALSE_NEGATIVE,
@@ -509,6 +518,42 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return EXIT_INTERRUPTED
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Read a recorded audit log back and report on it, optionally against a new policy.
+
+    Exits 3 on a finding the caller asked to gate on: any FAIL_OPEN with
+    `--fail-on-fail-open`, or more than `--max-new-blocks` recorded allows that
+    the candidate policy would stop.
+    """
+    log_path = Path(args.log).expanduser() if args.log else default_audit_path()
+    if not log_path.is_file():
+        raise SystemExit(f"error: audit log not found: {log_path}")
+    for label, value in (("--policy", args.policy), ("--against", args.against)):
+        if value is not None and not Path(value).expanduser().is_file():
+            raise SystemExit(f"error: {label} policy file not found: {value}")
+
+    log = read_log(log_path, include_rotated=args.rotated)
+    report = build_report(
+        log,
+        bucket=args.bucket,
+        top=args.top,
+        baseline_policy=args.policy,
+        candidate_policy=args.against,
+    )
+
+    if args.format == "json":
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_text(report))
+
+    if args.fail_on_fail_open and report.summary.fail_open > 0:
+        return EXIT_VULNERABLE
+    gate = args.max_new_blocks
+    if gate is not None and report.diff is not None and report.diff.newly_blocked > gate:
+        return EXIT_VULNERABLE
+    return EXIT_OK
+
+
 def _claude_config_path() -> Path:
     home = Path.home()
     if sys.platform == "darwin":
@@ -994,6 +1039,84 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_verify_scope_args(p_verify)
     p_verify.set_defaults(handler=cmd_verify)
+
+    p_replay = sub.add_parser(
+        "replay",
+        help="Re-read a recorded audit log and replay its decisions against a policy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Reads the JSONL audit log written by both proxies. Always reports dead rules,\n"
+            "which rules fired on which tools, FAIL_OPEN decisions (a rule crashed and traffic\n"
+            "was allowed unchecked), REQUIRE_APPROVAL over stdio (allowed, never prompted), and\n"
+            "a decision histogram.\n"
+            "A default log stores a keyed HMAC of the arguments, not the arguments, so a\n"
+            "pattern_match rule cannot be re-run. Those decisions are reported as\n"
+            "indeterminate, never as allowed.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 a gated finding was exceeded.\n"
+            "Examples:\n"
+            "  agentparry replay\n"
+            "  agentparry replay --log /tmp/audit.jsonl --policy config/default_policy.yaml\n"
+            "  agentparry replay --policy config/default_policy.yaml --against /tmp/candidate.yaml\n"
+            "  agentparry replay --format json --fail-on-fail-open\n"
+        ),
+    )
+    p_replay.add_argument(
+        "--log",
+        default=None,
+        metavar="PATH",
+        help="Audit JSONL to read (default: ~/.agentparry/audit.jsonl or AGENTPARRY_AUDIT_PATH)",
+    )
+    p_replay.add_argument(
+        "--rotated",
+        action="store_true",
+        help="Also read the rotated .1 sibling, oldest first",
+    )
+    p_replay.add_argument(
+        "--policy",
+        default=None,
+        metavar="PATH",
+        help="Policy in force when the log was recorded; enables dead-rule detection",
+    )
+    p_replay.add_argument(
+        "--against",
+        default=None,
+        metavar="PATH",
+        help="Candidate policy to replay the recorded decisions against",
+    )
+    p_replay.add_argument(
+        "--bucket",
+        choices=tuple(BUCKET_WIDTHS),
+        default=DEFAULT_BUCKET,
+        help=f"Histogram bucket width (default: {DEFAULT_BUCKET})",
+    )
+    p_replay.add_argument(
+        "--top",
+        type=int,
+        default=DEFAULT_TOP,
+        metavar="N",
+        help=f"How many rules and tools to list (default: {DEFAULT_TOP})",
+    )
+    p_replay.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: text)",
+    )
+    p_replay.add_argument(
+        "--fail-on-fail-open",
+        action="store_true",
+        dest="fail_on_fail_open",
+        help="Exit 3 if any decision was FAIL_OPEN",
+    )
+    p_replay.add_argument(
+        "--max-new-blocks",
+        type=int,
+        default=None,
+        dest="max_new_blocks",
+        metavar="N",
+        help="With --against, exit 3 when more than N recorded allows would now be stopped",
+    )
+    p_replay.set_defaults(handler=cmd_replay)
 
     p_claude = sub.add_parser(
         "install-claude",
