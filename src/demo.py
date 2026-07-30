@@ -348,7 +348,7 @@ async def main(fast: bool = False) -> None:
     console.print()
     console.print(
         Panel(
-            "[bold green]\U0001f6e1\ufe0f  AgentShield[/bold green]\n\n"
+            "[bold green]\U0001f6e1\ufe0f  AgentParry[/bold green]\n\n"
             "AI agent security toolkit \u2014 scan, protect, verify\n"
             "Framework-agnostic MCP proxy with closed-loop testing",
             border_style="green",
@@ -398,11 +398,11 @@ async def main(fast: bool = False) -> None:
         proxy_ok = await _poll_health(f"{PROXY_BASE}/health")
         if proxy_ok:
             console.print(
-                f"[green]\u2705 AgentShield proxy running on :{PROXY_PORT}[/green]"
+                f"[green]\u2705 AgentParry proxy running on :{PROXY_PORT}[/green]"
             )
         else:
             console.print(
-                f"[red]\u274c AgentShield proxy failed to start on :{PROXY_PORT}[/red]"
+                f"[red]\u274c AgentParry proxy failed to start on :{PROXY_PORT}[/red]"
             )
             return
 
@@ -460,7 +460,7 @@ async def main(fast: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AgentShield demo")
+    parser = argparse.ArgumentParser(description="AgentParry demo")
     parser.add_argument("--fast", action="store_true", help="Skip pauses for testing")
     args = parser.parse_args()
 
