@@ -280,6 +280,18 @@ def strip_invisible(text: str) -> tuple[str, Offsets]:
     return "".join(parts), offsets
 
 
+def find_invisible(text: str) -> list[re.Match[str]]:
+    """Return every invisible-format-character occurrence in text.
+
+    Exposed for callers that treat the mere presence of an invisible character as
+    a signal, rather than as something to strip before matching, so there is one
+    definition of "invisible" in the codebase instead of two.
+    """
+    if text.isascii():
+        return []
+    return list(_INVISIBLE_RE.finditer(text))
+
+
 def nfkc_fold(text: str) -> tuple[str, Offsets]:
     """Apply NFKC compatibility folding, mapping fullwidth and ligature forms.
 
@@ -636,6 +648,7 @@ __all__ = [
     "collapse_whitespace",
     "decode_base64_fragment",
     "detection_normalizer",
+    "find_invisible",
     "fold_homoglyphs",
     "is_opaque_blob",
     "iter_base64_runs",
