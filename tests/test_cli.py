@@ -389,3 +389,154 @@ def test_main_dispatches_wrap(monkeypatch: pytest.MonkeyPatch) -> None:
         with pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 0
+
+
+def _cc_args(tmp_path: Path, *extra: str) -> tuple[object, Path]:
+    pol = tmp_path / "pol.yaml"
+    pol.write_text("rules: []\n", encoding="utf-8")
+    parser = cli._build_parser()
+    args = parser.parse_args(
+        [
+            "install-claude-code",
+            "--server-name",
+            "mine",
+            "--policy",
+            str(pol),
+            *extra,
+        ]
+    )
+    return args, pol
+
+
+def test_install_claude_code_project_scope_writes_mcp_json(tmp_path: Path) -> None:
+    args, pol = _cc_args(tmp_path, "--command", "npx server-bin", "--project-dir", str(tmp_path))
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude_code(args) == 0
+
+    cfg = tmp_path / ".mcp.json"
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["mine"]
+    assert entry["type"] == "stdio"
+    assert entry["command"] == "/fake/python"
+    assert entry["args"][:4] == ["-m", "src.stdio_proxy", "--policy", str(pol.resolve())]
+    assert entry["args"][-2:] == ["--wrap", "npx"] or "--wrap" in entry["args"]
+    assert entry["env"]["AGENTPARRY_POLICY"] == str(pol.resolve())
+
+
+def test_install_claude_code_user_scope_preserves_other_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    cfg = home / ".claude.json"
+    cfg.write_text(
+        json.dumps({"numStartups": 7, "projects": {"/x": {"allowedTools": []}}, "mcpServers": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: home))
+
+    args, _pol = _cc_args(tmp_path, "--command", "npx server-bin", "--scope", "user")
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude_code(args) == 0
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["numStartups"] == 7
+    assert data["projects"] == {"/x": {"allowedTools": []}}
+    assert data["mcpServers"]["mine"]["type"] == "stdio"
+
+
+def test_install_claude_code_local_scope_nests_under_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: home))
+
+    args, _pol = _cc_args(
+        tmp_path, "--command", "npx server-bin", "--scope", "local", "--project-dir", str(proj)
+    )
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude_code(args) == 0
+
+    data = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+    # Local scope must not leak the server into the user-wide mapping.
+    assert "mine" not in (data.get("mcpServers") or {})
+    assert data["projects"][str(proj.resolve())]["mcpServers"]["mine"]["type"] == "stdio"
+
+
+def test_install_claude_code_wraps_existing_entry(tmp_path: Path) -> None:
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "mine": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@x/fs", "/tmp"],
+                        "env": {"A": "1"},
+                        "timeout": 30,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    args, pol = _cc_args(tmp_path, "--project-dir", str(tmp_path))
+
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude_code(args) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["mine"]
+    assert entry["args"][-4:] == ["--wrap", "npx", "--", "-y"] or "--wrap" in entry["args"]
+    assert entry["env"]["A"] == "1"
+    assert entry["env"]["AGENTPARRY_POLICY"] == str(pol.resolve())
+    assert entry["timeout"] == 30
+    assert cfg.with_suffix(cfg.suffix + ".bak").exists()
+
+
+def test_install_claude_code_rerun_does_not_nest(tmp_path: Path) -> None:
+    args, _pol = _cc_args(tmp_path, "--command", "npx server-bin", "--project-dir", str(tmp_path))
+    with patch.object(cli.sys, "executable", "/fake/python"):
+        assert cli.cmd_install_claude_code(args) == 0
+        args2, _ = _cc_args(tmp_path, "--project-dir", str(tmp_path))
+        assert cli.cmd_install_claude_code(args2) == 0
+
+    entry = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["mine"]
+    assert entry["args"].count("src.stdio_proxy") == 1
+    assert entry["args"].count("--wrap") == 1
+
+
+def test_install_claude_code_rejects_url_only_entry(tmp_path: Path) -> None:
+    cfg = tmp_path / ".mcp.json"
+    cfg.write_text(
+        json.dumps({"mcpServers": {"mine": {"type": "http", "url": "https://x/mcp"}}}),
+        encoding="utf-8",
+    )
+    args, _pol = _cc_args(tmp_path, "--project-dir", str(tmp_path))
+    with pytest.raises(SystemExit):
+        cli.cmd_install_claude_code(args)
+
+
+def test_install_claude_code_requires_command_for_new_server(tmp_path: Path) -> None:
+    args, _pol = _cc_args(tmp_path, "--project-dir", str(tmp_path))
+    with pytest.raises(SystemExit):
+        cli.cmd_install_claude_code(args)
+
+
+def test_install_claude_code_python_override(tmp_path: Path) -> None:
+    args, _pol = _cc_args(
+        tmp_path, "--command", "npx server-bin", "--project-dir", str(tmp_path), "--python", "python3"
+    )
+    assert cli.cmd_install_claude_code(args) == 0
+    entry = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["mine"]
+    assert entry["command"] == "python3"
+
+
+def test_install_claude_code_rejects_non_object_root(tmp_path: Path) -> None:
+    (tmp_path / ".mcp.json").write_text("[]", encoding="utf-8")
+    args, _pol = _cc_args(tmp_path, "--command", "x", "--project-dir", str(tmp_path))
+    with pytest.raises(SystemExit):
+        cli.cmd_install_claude_code(args)
