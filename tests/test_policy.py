@@ -246,6 +246,23 @@ class TestPolicyEngine(unittest.TestCase):
             reloaded = PolicyEngine(policy_path=str(path))
             self.assertEqual([rule["name"] for rule in reloaded.get_rules()], ["manual_keep"])
 
+    def test_get_settings_returns_a_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            settings = {"result_inspection": {"action": "block", "exempt_tools": ["docs"]}}
+            path = self._write_policy(root, {"rules": [], "settings": settings})
+            engine = PolicyEngine(policy_path=str(path))
+
+            loaded = engine.get_settings()
+            self.assertEqual(settings, loaded)
+            loaded["result_inspection"]["action"] = "annotate"
+            self.assertEqual("block", engine.get_settings()["result_inspection"]["action"])
+
+    def test_get_settings_on_a_missing_file_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = PolicyEngine(policy_path=str(Path(tmpdir) / "absent.yaml"))
+            self.assertEqual({}, engine.get_settings())
+
 
 class TestHostHelpers(unittest.TestCase):
     def test_normalize_host_casefolds_and_strips_trailing_dot(self) -> None:
