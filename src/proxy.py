@@ -37,18 +37,22 @@ from src.models import (
     INJECTION_BLOCK_ERROR_CODE,
     METADATA_BLOCK_ERROR_CODE,
     MOCK_SERVER_URL,
+    PIN_BLOCK_ERROR_CODE,
     RESULT_INJECTION_ERROR_CODE,
     AuditAction,
     AuditDirection,
     AuditRecord,
+    AuditTransport,
     Finding,
     JsonRpcRequest,
     JsonRpcResponse,
+    PinObservation,
     PolicyAction,
     ProxyStats,
     is_known_mcp_method,
     is_tools_call,
 )
+from src.pins import ServerIdentity, ToolPinner, audit_findings_for
 from src.policy import PolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -68,6 +72,7 @@ input_inspector = InputInspector()
 output_inspector = OutputInspector()
 result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
 metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
+tool_pinner = ToolPinner.from_policy_settings(policy_engine.get_settings(), inspector=metadata_inspector)
 stats = ProxyStats()
 
 _stdio_server: subprocess.Popen[bytes] | None = None
@@ -343,12 +348,65 @@ def _validated_response(request_id: int | str, upstream_payload: dict[str, Any])
         )
 
 
+def _server_identity() -> ServerIdentity:
+    """Key this upstream for pinning, from the same env the forwarder reads.
+
+    Resolved per request rather than at import, so a test or an operator changing
+    the upstream does not keep writing to the previous server's pin.
+    """
+    command = _upstream_cmd()
+    if command:
+        return ServerIdentity.for_command(command, transport=AuditTransport.HTTP)
+    return ServerIdentity.for_url(_effective_http_mcp_url(), transport=AuditTransport.HTTP)
+
+
+def _observe_pin(
+    request: JsonRpcRequest,
+    raw_result: dict[str, Any],
+    findings: list[Finding],
+    audit_ctx: dict[str, Any],
+) -> PinObservation:
+    """Diff the raw discovery result against the pin on disk, failing open.
+
+    The raw result, not the redacted one: pinning what metadata inspection
+    rewrote would diff on every run, and would pin poison it had already removed
+    as if it were clean.
+    """
+    try:
+        observation = tool_pinner.observe(request.method, raw_result, findings, identity=_server_identity())
+    except Exception as exc:
+        logger.exception("Tool-list pin check failed for %s; forwarding raw (fail-open)", request.method)
+        _record(
+            AuditAction.FAIL_OPEN,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            detail=f"ToolPinner raised {type(exc).__name__}; pin not checked (fail-open)",
+            **audit_ctx,
+        )
+        return PinObservation()
+
+    if not observation.reportable:
+        return observation
+    action = AuditAction.PIN_CREATED if observation.status == "created" else AuditAction.PIN_DIFF
+    if observation.blocked:
+        action = AuditAction.BLOCK_PIN
+    if observation.status == "changed":
+        stats.increment(pin_diffs=1)
+    _record(
+        action,
+        direction=AuditDirection.SERVER_TO_CLIENT,
+        findings=audit_findings_for(observation),
+        detail=observation.detail,
+        **audit_ctx,
+    )
+    return observation
+
+
 def _inspect_metadata(
     request: JsonRpcRequest,
     upstream_payload: dict[str, Any],
     audit_ctx: dict[str, Any],
 ) -> JsonRpcResponse:
-    """Scan a discovery result for poisoned metadata, failing open on error.
+    """Scan a discovery result for poisoned metadata, then diff it against its pin.
 
     Fail-open matches the rest of the proxy: an inspector bug must not make a
     client unable to list tools.
@@ -357,6 +415,7 @@ def _inspect_metadata(
     if not isinstance(result_payload, dict):
         return _validated_response(request.id, upstream_payload)
 
+    inspection = None
     try:
         inspection = metadata_inspector.inspect(request.method, result_payload)
     except Exception as exc:
@@ -370,41 +429,52 @@ def _inspect_metadata(
             ),
             **audit_ctx,
         )
-        return _validated_response(request.id, upstream_payload)
 
-    if not inspection.findings:
+    findings: list[Finding] = []
+    if inspection is not None and inspection.findings:
+        findings = inspection.findings
+        affected = inspection.dropped_tools + inspection.redacted_tools
+        stats.increment(
+            metadata_injections=1,
+            metadata_tools_dropped=len(inspection.dropped_tools),
+        )
+        detail = f"{inspection.action}: {len(inspection.findings)} poisoned metadata finding(s)"
+        if affected:
+            detail += f" tools={','.join(affected)}"
+        _record(
+            AuditAction.BLOCK_METADATA if inspection.blocked else AuditAction.REDACT_METADATA,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            findings=inspection.findings,
+            detail=detail,
+            **audit_ctx,
+        )
+    elif inspection is not None:
         _record(
             AuditAction.ALLOW,
             direction=AuditDirection.SERVER_TO_CLIENT,
             detail="discovery metadata inspected, no findings",
             **audit_ctx,
         )
-        return _validated_response(request.id, upstream_payload)
 
-    affected = inspection.dropped_tools + inspection.redacted_tools
-    stats.increment(
-        metadata_injections=1,
-        metadata_tools_dropped=len(inspection.dropped_tools),
-    )
-    detail = f"{inspection.action}: {len(inspection.findings)} poisoned metadata finding(s)"
-    if affected:
-        detail += f" tools={','.join(affected)}"
-    _record(
-        AuditAction.BLOCK_METADATA if inspection.blocked else AuditAction.REDACT_METADATA,
-        direction=AuditDirection.SERVER_TO_CLIENT,
-        findings=inspection.findings,
-        detail=detail,
-        **audit_ctx,
-    )
-    if inspection.blocked:
+    observation = _observe_pin(request, result_payload, findings, audit_ctx)
+
+    if inspection is not None and inspection.blocked:
         stats.increment(blocked=1)
         return _jsonrpc_error(
             request_id=request.id,
             code=METADATA_BLOCK_ERROR_CODE,
             message=inspection.block_message,
         )
+    if observation.blocked:
+        stats.increment(blocked=1)
+        return _jsonrpc_error(
+            request_id=request.id,
+            code=PIN_BLOCK_ERROR_CODE,
+            message=observation.block_message,
+        )
 
-    upstream_payload["result"] = inspection.result
+    payload = result_payload if inspection is None else inspection.result
+    upstream_payload["result"] = tool_pinner.apply(payload, observation)
     return _validated_response(request.id, upstream_payload)
 
 
@@ -594,9 +664,10 @@ def get_stats() -> dict[str, int]:
 
 def _rebuild_inspectors() -> None:
     """Rebuild the settings-derived inspectors after a policy load."""
-    global result_inspector, metadata_inspector
+    global result_inspector, metadata_inspector, tool_pinner
     result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
     metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
+    tool_pinner = ToolPinner.from_policy_settings(policy_engine.get_settings(), inspector=metadata_inspector)
 
 
 def set_policy_path(path: str) -> None:

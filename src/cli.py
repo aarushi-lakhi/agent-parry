@@ -10,6 +10,7 @@ import os
 import shlex
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,18 @@ from urllib.parse import urlparse
 import httpx
 import json5
 
+from src import audit
 from src.audit import default_audit_path
-from src.models import PROXY_URL, ScanReport
+from src.models import PROXY_URL, AuditAction, AuditTransport, ScanReport, ServerPin
+from src.pins import PinStore, accept_pending, forget
+from src.policy_lint import (
+    LintFinding,
+    LintReport,
+    introduced_findings,
+    lint_policy,
+    render_findings,
+    render_report,
+)
 from src.replay import (
     BUCKET_WIDTHS,
     DEFAULT_BUCKET,
@@ -29,7 +40,12 @@ from src.replay import (
     read_log,
     render_text,
 )
-from src.rule_generator import RuleGenerator, plan_autogen_merge, write_policy_text
+from src.rule_generator import (
+    AutogenMergePlan,
+    RuleGenerator,
+    plan_autogen_merge,
+    write_policy_text,
+)
 from src.scanner import (
     OUTCOME_FALSE_NEGATIVE,
     OUTCOME_FALSE_POSITIVE,
@@ -41,6 +57,7 @@ from src.scanner import (
     result_outcome,
     save_scan_outputs,
 )
+from src.stdio_proxy import DEFAULT_RELOAD_INTERVAL
 from src.stdio_proxy import main_argv as stdio_main_argv
 
 EXIT_OK = 0
@@ -50,10 +67,10 @@ EXIT_VULNERABLE = 3
 EXIT_ABORTED = 4
 EXIT_INTERRUPTED = 130
 
-STDIO_RESTART_NOTE = (
-    "Note: the stdio proxy (agentparry wrap) builds its policy engine once at startup and has no "
-    "reload path, so a running wrap session keeps the old rules. Restart your MCP client to pick "
-    "up this policy."
+STDIO_RELOAD_NOTE = (
+    "Note: a running `agentparry wrap` session picks this policy up on its own within a few "
+    "seconds, and keeps the previous rules if the file does not parse. A session started with "
+    "--no-reload-on-change keeps the old rules until you restart your MCP client."
 )
 
 
@@ -131,6 +148,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         proxy_argv.extend(["--audit", args.audit])
     if args.no_audit:
         proxy_argv.append("--no-audit")
+    if not args.reload_on_change:
+        proxy_argv.append("--no-reload-on-change")
+    if args.reload_interval is not None:
+        proxy_argv.extend(["--reload-interval", str(args.reload_interval)])
     if args.verbose:
         proxy_argv.append("--verbose")
     proxy_argv.append("--wrap")
@@ -361,6 +382,22 @@ def _print_analysis(analysis: RescanAnalysis, *, full: bool, max_vulns: int) -> 
         )
 
 
+def _lint_merge(plan: AutogenMergePlan, policy_path: str, payloads_path: str) -> list[LintFinding]:
+    """High-severity findings the merge would add to the policy.
+
+    The candidate text is linted from a tempfile rather than the policy path,
+    because linting the path would only see the rules that already shipped and
+    the rules being written are the ones worth checking.
+    """
+    payloads = payloads_path if Path(payloads_path).is_file() else None
+    before = lint_policy(policy_path, payloads)
+    with tempfile.TemporaryDirectory(prefix="agentparry-harden-") as tmp:
+        candidate = Path(tmp) / Path(policy_path).name
+        candidate.write_text(plan.after_text, encoding="utf-8")
+        after = lint_policy(candidate, payloads)
+    return introduced_findings(before, after)
+
+
 async def _run_after_scan(
     scanner: Scanner,
     before: ScanReport,
@@ -413,6 +450,14 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
     diff = plan.diff(args.policy)
     print(diff if diff else "(no change to the policy file)")
 
+    introduced: list[LintFinding] = []
+    if plan.changed and not args.no_lint:
+        introduced = _lint_merge(plan, args.policy, args.payloads)
+    if introduced:
+        print()
+        print(f"Policy lint: {len(introduced)} high-severity finding(s) introduced by these rules")
+        print("\n".join(render_findings(introduced)))
+
     if args.dry_run:
         print("Dry run: nothing written.")
         return EXIT_OK
@@ -420,6 +465,15 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
     if not plan.changed:
         print("Policy already contains these rules; nothing written.")
         return vulnerability_exit_code(_count_remaining(before), args.max_vulns)
+
+    if introduced and not args.force:
+        print(
+            "Refusing to write: these rules block legitimate traffic or cannot fire as written. "
+            "Fix them, re-run with --force to write them anyway, or --no-lint to skip the check."
+        )
+        return EXIT_VULNERABLE
+    if introduced:
+        print("Writing anyway: --force.")
 
     if not args.yes and not _confirm(f"Write these {len(rules)} rules to {args.policy}? [y/N] "):
         print("Aborted; policy left unchanged.")
@@ -434,7 +488,7 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
         print("Skipped policy reload (--no-reload); reload the proxy yourself for this to take effect.")
     else:
         await _reload_policy(args.target)
-    print(STDIO_RESTART_NOTE)
+    print(STDIO_RELOAD_NOTE)
 
     after = await _run_after_scan(
         scanner,
@@ -565,6 +619,220 @@ def cmd_replay(args: argparse.Namespace) -> int:
     gate = args.max_new_blocks
     if gate is not None and report.diff is not None and report.diff.newly_blocked > gate:
         return EXIT_VULNERABLE
+    return EXIT_OK
+
+
+LINT_FAIL_LEVELS = ("high", "medium", "low", "never")
+_LINT_SEVERITY_ORDER = {"high": 1, "medium": 2, "low": 3}
+
+
+def lint_exit_code(report: LintReport, fail_on: str) -> int:
+    """Map a lint report onto an exit code, so CI can gate on over-blocking.
+
+    Shares `EXIT_VULNERABLE` with the scan path: a rule that blocks legitimate
+    traffic is a policy defect the same way a passed-through attack is.
+    """
+    if fail_on == "never":
+        return EXIT_OK
+    limit = _LINT_SEVERITY_ORDER[fail_on]
+    if any(_LINT_SEVERITY_ORDER.get(f.severity, 9) <= limit for f in report.findings):
+        return EXIT_VULNERABLE
+    return EXIT_OK
+
+
+def cmd_lint_policy(args: argparse.Namespace) -> int:
+    """Analyze a policy file for over-blocking, statically and against the benign corpus."""
+    payloads = None if args.no_corpus else args.payloads
+    try:
+        report = lint_policy(args.policy, payloads, probes=not args.no_probes)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+    if args.format == "json":
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_report(report))
+    return lint_exit_code(report, args.fail_on)
+
+
+def _pin_store(args: argparse.Namespace) -> PinStore:
+    return PinStore(args.pins)
+
+
+def _resolve_pin_key(store: PinStore, selector: str) -> str:
+    """Resolve a user-supplied selector to exactly one pin key.
+
+    Exact key first, then a unique substring of a key or a target. An ambiguous
+    selector is an error rather than a guess, because the next thing the operator
+    does with it is transfer trust.
+    """
+    servers = store.load().servers
+    if selector in servers:
+        return selector
+    matches = sorted(
+        key for key, pin in servers.items() if selector in key or (pin.target and selector in pin.target)
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"error: no pinned server matches {selector!r} in {store.path}")
+    listed = "\n  ".join(matches)
+    raise SystemExit(f"error: {selector!r} matches {len(matches)} pinned servers:\n  {listed}")
+
+
+def _pin_status(pin: ServerPin) -> str:
+    if pin.pending is not None:
+        return "CHANGED"
+    if not pin.trusted:
+        return "UNTRUSTED"
+    return "ok"
+
+
+def _print_pin_diff(pin: ServerPin) -> None:
+    """Print what changed for one pin, or say that nothing has."""
+    print(f"{pin.key}")
+    print(f"  target:  {pin.target or '-'}  ({pin.transport.value})")
+    if not pin.trusted:
+        print(f"  not accepted yet: {pin.untrusted_reason}")
+    if pin.pending is None:
+        print("  no pending change")
+        return
+    diff = pin.pending.diff
+    print(f"  observed: {pin.pending.observed_at}")
+    for name in diff.changed:
+        print(f"  changed:  {name}")
+    for name in diff.added:
+        print(f"  added:    {name}")
+    for name in diff.removed:
+        print(f"  removed:  {name}")
+    if diff.server_info_changed:
+        print("  changed:  serverInfo")
+    if diff.instructions_changed:
+        print("  changed:  initialize instructions")
+    for finding in diff.escalated:
+        print(f"  [{finding.severity}] {finding.field}: {finding.description}")
+
+
+def _record_acceptance(pin: ServerPin, detail: str) -> None:
+    writer = audit.AuditWriter(transport=AuditTransport.CLI)
+    try:
+        writer.write(writer.build(action=AuditAction.PIN_ACCEPTED, tool=pin.key, detail=detail))
+    finally:
+        writer.close()
+
+
+def cmd_pins_list(args: argparse.Namespace) -> int:
+    store = _pin_store(args)
+    servers = store.load().servers
+    if not servers:
+        print(f"No pinned servers in {store.path}")
+        return EXIT_OK
+    print(f"{store.path}")
+    for key, pin in sorted(servers.items()):
+        print(
+            f"  {_pin_status(pin):<9} tools={len(pin.tools):<3} last_seen={pin.last_seen or '-':<25} {key}"
+        )
+    return EXIT_OK
+
+
+def cmd_pins_show(args: argparse.Namespace) -> int:
+    store = _pin_store(args)
+    key = _resolve_pin_key(store, args.server)
+    pin = store.get(key)
+    if pin is None:
+        raise SystemExit(f"error: no pinned server {key!r}")
+    print(pin.model_dump_json(indent=2))
+    return EXIT_OK
+
+
+def cmd_pins_diff(args: argparse.Namespace) -> int:
+    """Print pending changes. Exits 3 when any pin is unaccepted, for CI."""
+    store = _pin_store(args)
+    servers = store.load().servers
+    if args.server is not None:
+        key = _resolve_pin_key(store, args.server)
+        servers = {key: servers[key]}
+    if not servers:
+        print(f"No pinned servers in {store.path}")
+        return EXIT_OK
+    outstanding = 0
+    for _key, pin in sorted(servers.items()):
+        if pin.pending is None and pin.trusted:
+            continue
+        outstanding += 1
+        _print_pin_diff(pin)
+    if not outstanding:
+        print("Every pinned server matches its pin.")
+        return EXIT_OK
+    print(f"{outstanding} pinned server(s) need review. Accept with: agentparry pins accept <server>")
+    return EXIT_VULNERABLE
+
+
+def cmd_pins_accept(args: argparse.Namespace) -> int:
+    """Promote observed metadata into the pin, after showing what changes."""
+    store = _pin_store(args)
+    servers = store.load().servers
+    if args.all:
+        if not args.yes:
+            raise SystemExit(
+                "error: accepting every pending change transfers trust to whatever those servers now "
+                "advertise. Review it with `agentparry pins diff`, then re-run with --yes."
+            )
+        keys = sorted(key for key, pin in servers.items() if pin.pending is not None or not pin.trusted)
+    else:
+        if args.server is None:
+            raise SystemExit("error: name a server, or pass --all --yes")
+        keys = [_resolve_pin_key(store, args.server)]
+
+    if not keys:
+        print("Nothing to accept.")
+        return EXIT_OK
+
+    for key in keys:
+        pin = servers.get(key)
+        if pin is not None:
+            _print_pin_diff(pin)
+
+    if not args.yes and not _confirm(f"Accept the metadata above for {len(keys)} server(s)? [y/N] "):
+        print("Aborted; pins left unchanged.")
+        return EXIT_ABORTED
+
+    accepted = 0
+    for key in keys:
+        pin = accept_pending(store, key)
+        if pin is None:
+            print(f"Nothing to accept for {key}")
+            continue
+        accepted += 1
+        _record_acceptance(pin, f"pin accepted: {len(pin.tools)} tool(s) now trusted")
+        print(f"Accepted {key}")
+    return EXIT_OK
+
+
+def cmd_pins_forget(args: argparse.Namespace) -> int:
+    """Delete pins. The next discovery re-pins whatever the server says then."""
+    store = _pin_store(args)
+    servers = store.load().servers
+    if args.all:
+        if not args.yes:
+            raise SystemExit("error: --all deletes every pin. Re-run with --yes.")
+        keys = sorted(servers)
+    else:
+        if args.server is None:
+            raise SystemExit("error: name a server, or pass --all --yes")
+        keys = [_resolve_pin_key(store, args.server)]
+
+    if not keys:
+        print("Nothing to forget.")
+        return EXIT_OK
+    if not args.yes and not _confirm(f"Forget {len(keys)} pin(s)? The next run re-pins whatever it sees. [y/N] "):
+        print("Aborted; pins left unchanged.")
+        return EXIT_ABORTED
+    for key in keys:
+        if forget(store, key):
+            print(f"Forgot {key}")
+        else:
+            print(f"No pin for {key}")
     return EXIT_OK
 
 
@@ -929,6 +1197,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the JSONL audit log (same as AGENTPARRY_AUDIT=0)",
     )
+    p_wrap.add_argument(
+        "--reload-on-change",
+        dest="reload_on_change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reload the policy file when it changes on disk (default: enabled)",
+    )
+    p_wrap.add_argument(
+        "--reload-interval",
+        dest="reload_interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=f"Policy file poll interval in seconds (default: {DEFAULT_RELOAD_INTERVAL})",
+    )
     p_wrap.add_argument("--verbose", action="store_true", help="Verbose logging to stderr and log file")
     p_wrap.set_defaults(handler=cmd_wrap)
 
@@ -989,8 +1272,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "Additive: existing autogen_ rules are kept, same-named ones replaced, handwritten\n"
             "rules preserved. Backs the policy up to a .bak sibling, prints a unified diff, and\n"
             "asks before writing unless --yes.\n"
-            "Exit codes: 0 clean, 1 error, 2 usage, 3 vulnerabilities remain or a regression was\n"
-            "found, 4 aborted at the prompt, 130 interrupted.\n"
+            "The rules about to be written are linted against the benign payloads in --payloads\n"
+            "first, and a merge that introduces a high-severity over-block is refused unless\n"
+            "--force. A dry run reports the findings without changing its exit code.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 vulnerabilities remain, a regression was\n"
+            "found or the lint refused the write, 4 aborted at the prompt, 130 interrupted.\n"
             "Examples:\n"
             "  agentparry harden --target http://localhost:9090/mcp --dry-run\n"
             "  agentparry harden --target http://localhost:9090/mcp --yes --full\n"
@@ -1010,6 +1296,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the diff and exit 0 without writing anything",
     )
     p_harden.add_argument("--yes", action="store_true", help="Write the policy without confirming")
+    p_harden.add_argument(
+        "--force",
+        action="store_true",
+        help="Write even when the new rules introduce a high-severity over-block finding",
+    )
+    p_harden.add_argument(
+        "--no-lint",
+        action="store_true",
+        dest="no_lint",
+        help="Do not lint the rules for over-blocking before writing them",
+    )
     p_harden.add_argument(
         "--no-reload",
         action="store_true",
@@ -1151,6 +1448,114 @@ def _build_parser() -> argparse.ArgumentParser:
         help="With --against, exit 3 when more than N recorded allows would now be stopped",
     )
     p_replay.set_defaults(handler=cmd_replay)
+
+    p_lint = sub.add_parser(
+        "lint-policy",
+        help="Predict which policy rules over-block, statically and against the benign corpus",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Offline: no proxy, no network. Static checks read each rule's regexes; the empirical\n"
+            "half evaluates every rule on its own through PolicyEngine against the benign payloads\n"
+            "in --payloads, and reports the matched span of every benign block. --no-corpus falls\n"
+            "back to generated plausible-benign strings only.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 findings at or above --fail-on.\n"
+            "Examples:\n"
+            "  agentparry lint-policy\n"
+            "  agentparry lint-policy --policy config/default_policy.yaml --format json\n"
+            "  agentparry lint-policy --fail-on medium\n"
+        ),
+    )
+    p_lint.add_argument(
+        "--policy",
+        default="config/default_policy.yaml",
+        help="Policy YAML to lint (default: config/default_policy.yaml)",
+    )
+    p_lint.add_argument("--payloads", default="attacks/payloads.yaml", help="Payload YAML holding the benign corpus")
+    p_lint.add_argument(
+        "--no-corpus",
+        action="store_true",
+        dest="no_corpus",
+        help="Skip the payload file and rely on generated benign strings",
+    )
+    p_lint.add_argument(
+        "--no-probes",
+        action="store_true",
+        dest="no_probes",
+        help="Static checks and corpus only, no generated benign strings",
+    )
+    p_lint.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Report format (default: text)",
+    )
+    p_lint.add_argument(
+        "--fail-on",
+        choices=LINT_FAIL_LEVELS,
+        default="high",
+        dest="fail_on",
+        help="Lowest severity that exits 3 (default: high)",
+    )
+    p_lint.set_defaults(handler=cmd_lint_policy)
+
+    p_pins = sub.add_parser(
+        "pins",
+        help="Inspect and accept the pinned tool metadata of wrapped MCP servers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "A pin records what a server advertised the first time it was seen, so a description\n"
+            "rewritten later is reported instead of silently reaching the model. It does not\n"
+            "protect against a server that is malicious on day one; that is what metadata\n"
+            "inspection is for.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 a pin needs review, 4 aborted at the prompt.\n"
+            "Examples:\n"
+            "  agentparry pins list\n"
+            "  agentparry pins diff\n"
+            "  agentparry pins accept 'npx some-mcp-server'\n"
+            "  agentparry pins accept --all --yes\n"
+        ),
+    )
+    pins_sub = p_pins.add_subparsers(dest="pins_command", required=True)
+
+    def _add_pins_file_arg(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--pins",
+            default=None,
+            metavar="PATH",
+            help="Pin store (default: ~/.agentparry/pins.json or AGENTPARRY_PINS_PATH)",
+        )
+
+    p_pins_list = pins_sub.add_parser("list", help="List every pinned server and its status")
+    _add_pins_file_arg(p_pins_list)
+    p_pins_list.set_defaults(handler=cmd_pins_list)
+
+    p_pins_show = pins_sub.add_parser("show", help="Print one pin as JSON")
+    p_pins_show.add_argument("server", help="Pin key, or a unique part of it or of the command")
+    _add_pins_file_arg(p_pins_show)
+    p_pins_show.set_defaults(handler=cmd_pins_show)
+
+    p_pins_diff = pins_sub.add_parser("diff", help="Show pending metadata changes; exits 3 when any remain")
+    p_pins_diff.add_argument("server", nargs="?", default=None, help="Limit to one server")
+    _add_pins_file_arg(p_pins_diff)
+    p_pins_diff.set_defaults(handler=cmd_pins_diff)
+
+    p_pins_accept = pins_sub.add_parser(
+        "accept",
+        help="Trust what a server now advertises and clear its pending change",
+        epilog="--all requires --yes: accepting transfers trust, so the diff has to be seen first.",
+    )
+    p_pins_accept.add_argument("server", nargs="?", default=None, help="Pin key, or a unique part of it")
+    p_pins_accept.add_argument("--all", action="store_true", help="Accept every pending change (needs --yes)")
+    p_pins_accept.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    _add_pins_file_arg(p_pins_accept)
+    p_pins_accept.set_defaults(handler=cmd_pins_accept)
+
+    p_pins_forget = pins_sub.add_parser("forget", help="Delete a pin so the next run records a fresh one")
+    p_pins_forget.add_argument("server", nargs="?", default=None, help="Pin key, or a unique part of it")
+    p_pins_forget.add_argument("--all", action="store_true", help="Delete every pin (needs --yes)")
+    p_pins_forget.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    _add_pins_file_arg(p_pins_forget)
+    p_pins_forget.set_defaults(handler=cmd_pins_forget)
 
     p_claude = sub.add_parser(
         "install-claude",

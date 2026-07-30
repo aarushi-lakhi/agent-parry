@@ -33,6 +33,13 @@ Its own code rather than -32002 because nothing was called: the poison is in the
 tool catalogue, so an operator seeing this knows discovery failed, not a tool.
 """
 
+PIN_BLOCK_ERROR_CODE = -32004
+"""Pin-side block: discovery was refused because the pinned metadata changed.
+
+Distinct from -32003 because nothing here failed a content scan. The catalogue
+may be perfectly clean; it is simply not the catalogue that was pinned.
+"""
+
 TOOLS_CALL_METHOD = "tools/call"
 
 MCP_EXACT_METHODS = frozenset(
@@ -111,14 +118,6 @@ class PolicyAction(str, Enum):
     REDACT_OUTPUT = "REDACT_OUTPUT"
 
 
-class PolicyDecision(BaseModel):
-    """Represents the final policy decision for a request."""
-
-    action: PolicyAction = PolicyAction.ALLOW
-    rule_name: str | None = None
-    message: str = ""
-
-
 class Finding(BaseModel):
     """Represents an individual security finding from policy checks.
 
@@ -142,6 +141,21 @@ class Finding(BaseModel):
         if value is None or len(value) <= MATCHED_TEXT_LIMIT:
             return value
         return value[:MATCHED_TEXT_LIMIT]
+
+
+class PolicyDecision(BaseModel):
+    """Represents the final policy decision for a request.
+
+    ``findings`` carries the matches that produced the decision, each with the
+    normalized view it was seen in and the span mapped back to the original
+    argument. Defaulted empty, so a caller that only reads the action is
+    unaffected and an ALLOW stays cheap.
+    """
+
+    action: PolicyAction = PolicyAction.ALLOW
+    rule_name: str | None = None
+    message: str = ""
+    findings: list[Finding] = Field(default_factory=list)
 
 
 AUDIT_SCHEMA_VERSION = 1
@@ -170,21 +184,27 @@ class AuditAction(str, Enum):
     BLOCK_INJECTION = "BLOCK_INJECTION"
     BLOCK_RESULT_INJECTION = "BLOCK_RESULT_INJECTION"
     BLOCK_METADATA = "BLOCK_METADATA"
+    BLOCK_PIN = "BLOCK_PIN"
     NEUTRALIZE_RESULT = "NEUTRALIZE_RESULT"
     REDACT_METADATA = "REDACT_METADATA"
+    PIN_CREATED = "PIN_CREATED"
+    PIN_DIFF = "PIN_DIFF"
+    PIN_ACCEPTED = "PIN_ACCEPTED"
     REQUIRE_APPROVAL = "REQUIRE_APPROVAL"
     REDACT_OUTPUT = "REDACT_OUTPUT"
     INVALID_PARAMS = "INVALID_PARAMS"
     METHOD_NOT_FOUND = "METHOD_NOT_FOUND"
     PASSTHROUGH = "PASSTHROUGH"
     FAIL_OPEN = "FAIL_OPEN"
+    POLICY_RELOAD = "POLICY_RELOAD"
 
 
 class AuditTransport(str, Enum):
-    """Which proxy emitted a record."""
+    """Which proxy emitted a record, or the CLI for an operator action."""
 
     HTTP = "http"
     STDIO = "stdio"
+    CLI = "cli"
 
 
 class AuditDirection(str, Enum):
@@ -305,6 +325,164 @@ class AttackStep(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     name: str = ""
     description: str = ""
+
+
+PIN_SCHEMA_VERSION = 1
+
+
+class ToolPin(BaseModel):
+    """One pinned tool: the digest of its raw canonical JSON.
+
+    Raw, not normalized. Hashing a normalized view would let an attacker flip
+    zero-width characters freely and add invisible instructions to a description
+    without changing the digest.
+    """
+
+    fingerprint: str
+    updated: str = ""
+
+
+class PinDiff(BaseModel):
+    """What changed between a recorded pin and an observed catalogue.
+
+    ``escalated`` holds the findings from re-inspecting only the changed metadata
+    with every severity raised one level. It is an :class:`AuditFinding` and not a
+    :class:`Finding` on purpose: that model has no ``matched_text`` field, so a
+    pin file cannot grow a copy of the payload it is warning about.
+    """
+
+    changed: list[str] = Field(default_factory=list)
+    added: list[str] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+    set_changed: bool = False
+    server_info_changed: bool = False
+    instructions_changed: bool = False
+    escalated: list[AuditFinding] = Field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        """True when nothing about the pinned metadata moved."""
+        return not (
+            self.changed
+            or self.added
+            or self.removed
+            or self.set_changed
+            or self.server_info_changed
+            or self.instructions_changed
+        )
+
+    def summary(self) -> str:
+        """One line naming what moved, for an audit detail or a CLI listing."""
+        parts: list[str] = []
+        if self.changed:
+            parts.append(f"changed={','.join(self.changed)}")
+        if self.added:
+            parts.append(f"added={','.join(self.added)}")
+        if self.removed:
+            parts.append(f"removed={','.join(self.removed)}")
+        if self.server_info_changed:
+            parts.append("serverInfo=changed")
+        if self.instructions_changed:
+            parts.append("instructions=changed")
+        if self.escalated:
+            highest = max_severity(finding.severity for finding in self.escalated)
+            parts.append(f"escalated={len(self.escalated)}@{highest}")
+        return " ".join(parts) or "no change"
+
+    def merge(self, other: PinDiff) -> PinDiff:
+        """Union two diffs, so a pending tools diff survives an identity diff."""
+        return PinDiff(
+            changed=sorted(set(self.changed) | set(other.changed)),
+            added=sorted(set(self.added) | set(other.added)),
+            removed=sorted(set(self.removed) | set(other.removed)),
+            set_changed=self.set_changed or other.set_changed,
+            server_info_changed=self.server_info_changed or other.server_info_changed,
+            instructions_changed=self.instructions_changed or other.instructions_changed,
+            escalated=[*self.escalated, *other.escalated],
+        )
+
+
+class PinSnapshot(BaseModel):
+    """An observed catalogue held aside until someone accepts it.
+
+    Every fingerprint field is nullable because one observation only ever sees
+    part of the picture: ``initialize`` carries identity and no tools, and a
+    paginated ``tools/list`` carries one page of tools and no trustworthy
+    set-level hash. ``None`` means "this observation says nothing about that
+    field", so accepting it leaves the pinned value alone.
+    """
+
+    observed_at: str = ""
+    identity: bool = False
+    set_fingerprint: str | None = None
+    tool_count: int | None = None
+    tools: dict[str, ToolPin] | None = None
+    merge_tools: bool = False
+    server_info: dict[str, Any] | None = None
+    server_info_fingerprint: str | None = None
+    instructions_fingerprint: str | None = None
+    diff: PinDiff = Field(default_factory=PinDiff)
+
+
+class ServerPin(BaseModel):
+    """The pinned metadata of one MCP server, keyed on how it is launched.
+
+    ``server_info`` is recorded but never keyed on: ``serverInfo.name`` is
+    attacker-controlled, so keying on it would let a malicious server rename
+    itself out of its own pin. Recorded inside the pin, a change to it is itself
+    a reported diff.
+    """
+
+    key: str
+    target: str = ""
+    transport: AuditTransport = AuditTransport.STDIO
+    created: str = ""
+    updated: str = ""
+    last_seen: str = ""
+    trusted: bool = True
+    untrusted_reason: str = ""
+    tools_seen: bool = False
+    identity_seen: bool = False
+    set_fingerprint: str | None = None
+    tool_count: int | None = None
+    tools: dict[str, ToolPin] = Field(default_factory=dict)
+    server_info: dict[str, Any] | None = None
+    server_info_fingerprint: str | None = None
+    instructions_fingerprint: str | None = None
+    pending: PinSnapshot | None = None
+
+
+class PinFile(BaseModel):
+    """The whole on-disk pin store, merged per server key rather than overwritten."""
+
+    schema_version: int = PIN_SCHEMA_VERSION
+    servers: dict[str, ServerPin] = Field(default_factory=dict)
+
+
+class PinObservation(BaseModel):
+    """Outcome of checking one discovery response against the recorded pin.
+
+    ``status`` is what happened to the pin, ``action`` what was done to the
+    response. ``skipped`` means the store was unreadable or the lock was busy:
+    pins are advisory and must never hold up the MCP stream.
+    """
+
+    status: Literal["off", "created", "unchanged", "changed", "skipped"] = "off"
+    key: str = ""
+    trusted: bool = True
+    diff: PinDiff | None = None
+    action: Literal["none", "warn", "redact_changed", "block"] = "none"
+    blocked: bool = False
+    block_message: str = ""
+    redact_tools: list[str] = Field(default_factory=list)
+    redact_instructions: bool = False
+    paginated: bool = False
+    detail: str = ""
+
+    @property
+    def reportable(self) -> bool:
+        """True when an operator needs to hear about this observation."""
+        return self.status in ("created", "changed") or not self.trusted
 
 
 class AttackPayload(BaseModel):
@@ -476,6 +654,7 @@ class ProxyStats(BaseModel):
     neutralized: int = 0
     metadata_injections: int = 0
     metadata_tools_dropped: int = 0
+    pin_diffs: int = 0
 
     def increment(
         self,
@@ -489,6 +668,7 @@ class ProxyStats(BaseModel):
         neutralized: int = 0,
         metadata_injections: int = 0,
         metadata_tools_dropped: int = 0,
+        pin_diffs: int = 0,
     ) -> None:
         """Increment one or more counters by non-negative deltas."""
 
@@ -502,6 +682,7 @@ class ProxyStats(BaseModel):
             "neutralized": neutralized,
             "metadata_injections": metadata_injections,
             "metadata_tools_dropped": metadata_tools_dropped,
+            "pin_diffs": pin_diffs,
         }
 
         for name, delta in deltas.items():
@@ -517,6 +698,7 @@ class ProxyStats(BaseModel):
         self.neutralized += neutralized
         self.metadata_injections += metadata_injections
         self.metadata_tools_dropped += metadata_tools_dropped
+        self.pin_diffs += pin_diffs
 
     def reset(self) -> None:
         """Reset all counters to zero."""
@@ -530,6 +712,7 @@ class ProxyStats(BaseModel):
         self.neutralized = 0
         self.metadata_injections = 0
         self.metadata_tools_dropped = 0
+        self.pin_diffs = 0
 
 
 __all__ = [
@@ -542,6 +725,8 @@ __all__ = [
     "METADATA_BLOCK_ERROR_CODE",
     "MOCK_SERVER_PORT",
     "MOCK_SERVER_URL",
+    "PIN_BLOCK_ERROR_CODE",
+    "PIN_SCHEMA_VERSION",
     "PROXY_PORT",
     "PROXY_URL",
     "RESULT_INJECTION_ERROR_CODE",
@@ -562,11 +747,17 @@ __all__ = [
     "JsonRpcRequest",
     "JsonRpcResponse",
     "MetadataInspection",
+    "PinDiff",
+    "PinFile",
+    "PinObservation",
+    "PinSnapshot",
     "PolicyAction",
     "PolicyDecision",
     "ProxyStats",
     "ResultInspection",
     "ScanReport",
+    "ServerPin",
+    "ToolPin",
     "is_known_mcp_method",
     "is_tools_call",
     "max_severity",
