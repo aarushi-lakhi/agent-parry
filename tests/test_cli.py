@@ -61,6 +61,32 @@ def test_wrap_forwards_log_and_verbose() -> None:
     )
 
 
+def test_wrap_forwards_audit_path() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(
+        ["wrap", "--command", "uvx pkg", "--policy", "pol.yaml", "--audit", "/tmp/ap-audit.jsonl"]
+    )
+    with patch.object(cli, "stdio_main_argv", return_value=0) as mock_run:
+        assert cli.cmd_wrap(args) == 0
+    mock_run.assert_called_once_with(
+        ["--policy", "pol.yaml", "--audit", "/tmp/ap-audit.jsonl", "--wrap", "uvx", "pkg"]
+    )
+
+
+def test_wrap_forwards_no_audit() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(["wrap", "--command", "uvx pkg", "--policy", "pol.yaml", "--no-audit"])
+    with patch.object(cli, "stdio_main_argv", return_value=0) as mock_run:
+        assert cli.cmd_wrap(args) == 0
+    mock_run.assert_called_once_with(["--policy", "pol.yaml", "--no-audit", "--wrap", "uvx", "pkg"])
+
+
+def test_install_entries_do_not_bake_an_audit_path() -> None:
+    entry = cli._stdio_entry_from_command("/abs/policy.yaml", "npx some-mcp-server")
+    assert "--audit" not in entry["args"]
+    assert "AGENTPARRY_AUDIT_PATH" not in entry["env"]
+
+
 def test_scan_report_only_loads_json(tmp_path: Path) -> None:
     report = {
         "total_attacks": 1,

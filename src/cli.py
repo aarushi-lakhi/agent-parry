@@ -48,6 +48,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     proxy_argv: list[str] = ["--policy", policy]
     if args.log:
         proxy_argv.extend(["--log", args.log])
+    if args.audit:
+        proxy_argv.extend(["--audit", args.audit])
+    if args.no_audit:
+        proxy_argv.append("--no-audit")
     if args.verbose:
         proxy_argv.append("--verbose")
     proxy_argv.append("--wrap")
@@ -253,6 +257,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Policy YAML (default: config/default_policy.yaml)",
     )
     p_wrap.add_argument("--log", metavar="PATH", help="Log file (default: ~/.agentparry/proxy.log)")
+    p_wrap.add_argument(
+        "--audit",
+        metavar="PATH",
+        help="JSONL audit log (default: ~/.agentparry/audit.jsonl or AGENTPARRY_AUDIT_PATH)",
+    )
+    p_wrap.add_argument(
+        "--no-audit",
+        dest="no_audit",
+        action="store_true",
+        help="Disable the JSONL audit log (same as AGENTPARRY_AUDIT=0)",
+    )
     p_wrap.add_argument("--verbose", action="store_true", help="Verbose logging to stderr and log file")
     p_wrap.set_defaults(handler=cmd_wrap)
 

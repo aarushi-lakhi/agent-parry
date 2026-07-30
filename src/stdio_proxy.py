@@ -13,8 +13,18 @@ import threading
 from pathlib import Path
 from typing import Any, TextIO
 
+from src.audit import AuditWriter
 from src.inspector import InputInspector, OutputInspector
-from src.models import PolicyAction, is_known_mcp_method, is_tools_call
+from src.models import (
+    TOOLS_CALL_METHOD,
+    AuditAction,
+    AuditDirection,
+    AuditTransport,
+    Finding,
+    PolicyAction,
+    is_known_mcp_method,
+    is_tools_call,
+)
 from src.policy import PolicyEngine
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -184,11 +194,13 @@ class StdioMcpProxy:
         input_inspector: InputInspector,
         output_inspector: OutputInspector,
         stdout_lock: asyncio.Lock,
+        audit: AuditWriter,
     ) -> None:
         self._policy = policy_engine
         self._input_inspector = input_inspector
         self._output_inspector = output_inspector
         self._stdout_lock = stdout_lock
+        self._audit = audit
         self._pending_forwarded: dict[Any, str] = {}
         self._pending_tools: dict[Any, str] = {}
 
@@ -202,20 +214,39 @@ class StdioMcpProxy:
 
             await asyncio.to_thread(_write)
 
-    def _log_line(
+    def _record(
         self,
-        direction: str,
-        method: str | None,
-        decision: str,
-        details: str,
+        action: AuditAction,
+        *,
+        direction: AuditDirection = AuditDirection.CLIENT_TO_SERVER,
+        method: str | None = None,
+        tool: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        rule: str | None = None,
+        request_id: Any = None,
+        findings: list[Finding] | None = None,
+        pii_redactions: int | None = None,
+        detail: str = "",
     ) -> None:
-        logging.getLogger(__name__).info(
-            "%s method=%s decision=%s %s",
-            direction,
-            method or "-",
-            decision,
-            details,
+        """Append one audit record for an already-computed decision.
+
+        Synchronous on the event loop on purpose, unlike `write_stdout`: this is
+        one small unsynced syscall, and going off-loop via asyncio.to_thread
+        would reorder audit records relative to stdout writes for no gain.
+        """
+        record = self._audit.build(
+            action=action,
+            direction=direction,
+            method=method,
+            tool=tool,
+            rule=rule,
+            request_id=request_id,
+            arguments=arguments,
+            findings=findings,
+            pii_redactions=pii_redactions,
+            detail=detail,
         )
+        self._audit.write(record)
 
     async def handle_client_message(self, msg: dict[str, Any]) -> dict[str, Any] | None:
         """
@@ -227,11 +258,11 @@ class StdioMcpProxy:
             return None
         if msg.get("jsonrpc") != "2.0":
             raw_method = msg.get("method")
-            self._log_line(
-                "client→server",
-                raw_method if isinstance(raw_method, str) else None,
-                "passthrough",
-                "non-2.0 jsonrpc",
+            self._record(
+                AuditAction.PASSTHROUGH,
+                method=raw_method if isinstance(raw_method, str) else None,
+                request_id=msg.get("id"),
+                detail="jsonrpc field is not 2.0; forwarded uninspected",
             )
             return msg
 
@@ -244,85 +275,164 @@ class StdioMcpProxy:
                 self._pending_forwarded[req_id] = m
             if isinstance(method, str) and not is_known_mcp_method(method):
                 logger.warning("Forwarding unknown MCP method without inspection method=%s", method)
-                self._log_line("client→server", method, "passthrough", "unknown_method")
+                self._record(
+                    AuditAction.PASSTHROUGH,
+                    method=method,
+                    request_id=req_id,
+                    detail="unknown MCP method forwarded without inspection",
+                )
             else:
-                self._log_line("client→server", method if isinstance(method, str) else None, "allow", "passthrough")
+                self._record(
+                    AuditAction.PASSTHROUGH,
+                    method=method if isinstance(method, str) else None,
+                    request_id=req_id,
+                    detail="known MCP method forwarded without tool inspection",
+                )
             return msg
 
         params = msg.get("params")
         tool_name, arguments = _get_tool_payload(params)
 
         if tool_name is None:
-            if req_id is not None:
-                await self.write_stdout(
-                    _error_response(
-                        req_id,
-                        code=-32602,
-                        message="Invalid params: 'name' must be a string.",
-                    )
-                )
-            else:
+            if req_id is None:
                 logger.warning("tools/call missing tool name (notification); forwarding")
+                self._record(
+                    AuditAction.FAIL_OPEN,
+                    method=method,
+                    detail="tools/call with invalid 'name' and no id; forwarded (fail-open)",
+                )
                 return msg
-            self._log_line("client→server", "tools/call", "block", "invalid tool name")
+            await self.write_stdout(
+                _error_response(
+                    req_id,
+                    code=-32602,
+                    message="Invalid params: 'name' must be a string.",
+                )
+            )
+            self._record(
+                AuditAction.INVALID_PARAMS,
+                method=method,
+                request_id=req_id,
+                detail="'name' must be a string",
+            )
             return None
 
         if arguments is None:
-            if req_id is not None:
-                await self.write_stdout(
-                    _error_response(
-                        req_id,
-                        code=-32602,
-                        message="Invalid params: 'arguments' must be an object.",
-                    )
-                )
-            else:
+            if req_id is None:
                 logger.warning("tools/call missing arguments object (notification); forwarding")
+                self._record(
+                    AuditAction.FAIL_OPEN,
+                    method=method,
+                    tool=tool_name,
+                    detail="tools/call with invalid 'arguments' and no id; forwarded (fail-open)",
+                )
                 return msg
-            self._log_line("client→server", "tools/call", "block", "invalid arguments")
+            await self.write_stdout(
+                _error_response(
+                    req_id,
+                    code=-32602,
+                    message="Invalid params: 'arguments' must be an object.",
+                )
+            )
+            self._record(
+                AuditAction.INVALID_PARAMS,
+                method=method,
+                tool=tool_name,
+                request_id=req_id,
+                detail="'arguments' must be an object",
+            )
             return None
 
         findings: list[Any] = []
         try:
             findings = self._input_inspector.inspect(tool_name, arguments)
-        except Exception:
+        except Exception as exc:
             logger.exception("InputInspector failed for %s; allowing (fail-open)", tool_name)
+            self._record(
+                AuditAction.FAIL_OPEN,
+                method=method,
+                tool=tool_name,
+                arguments=arguments,
+                request_id=req_id,
+                detail=f"InputInspector raised {type(exc).__name__}; injection check skipped and call allowed",
+            )
 
         if any(getattr(f, "severity", None) == "critical" for f in findings):
-            if req_id is not None:
-                await self.write_stdout(
-                    _error_response(
-                        req_id,
-                        code=-32001,
-                        message="Blocked: critical prompt injection pattern detected",
-                    )
-                )
-            else:
+            if req_id is None:
                 logger.warning("Critical injection in tools/call notification; forwarding (fail-open)")
+                self._record(
+                    AuditAction.FAIL_OPEN,
+                    method=method,
+                    tool=tool_name,
+                    arguments=arguments,
+                    findings=findings,
+                    detail="critical injection but notification has no id to answer; forwarded (fail-open)",
+                )
                 return msg
-            self._log_line("client→server", "tools/call", "block", "critical injection")
+            await self.write_stdout(
+                _error_response(
+                    req_id,
+                    code=-32001,
+                    message="Blocked: critical prompt injection pattern detected",
+                )
+            )
+            self._record(
+                AuditAction.BLOCK_INJECTION,
+                method=method,
+                tool=tool_name,
+                arguments=arguments,
+                request_id=req_id,
+                findings=findings,
+                detail="critical prompt injection pattern",
+            )
             return None
 
         decision = None
         try:
             decision = self._policy.evaluate(tool_name, arguments)
-        except Exception:
+        except Exception as exc:
             logger.exception("PolicyEngine.evaluate failed for %s; allowing (fail-open)", tool_name)
+            self._record(
+                AuditAction.FAIL_OPEN,
+                method=method,
+                tool=tool_name,
+                arguments=arguments,
+                request_id=req_id,
+                findings=findings,
+                detail=f"PolicyEngine.evaluate raised {type(exc).__name__}; no policy applied and call allowed",
+            )
 
         if decision is not None:
             if decision.action == PolicyAction.BLOCK:
-                if req_id is not None:
-                    await self.write_stdout(
-                        _error_response(
-                            req_id,
-                            code=-32001,
-                            message=decision.message or "Blocked by policy",
-                        )
-                    )
-                else:
+                if req_id is None:
                     logger.warning("Policy BLOCK for tools/call notification; forwarding (fail-open)")
+                    self._record(
+                        AuditAction.FAIL_OPEN,
+                        method=method,
+                        tool=tool_name,
+                        arguments=arguments,
+                        rule=decision.rule_name,
+                        findings=findings,
+                        detail="policy asked BLOCK but notification has no id to answer; forwarded (fail-open)",
+                    )
                     return msg
-                self._log_line("client→server", "tools/call", "block", decision.rule_name or "policy")
+                await self.write_stdout(
+                    _error_response(
+                        req_id,
+                        code=-32001,
+                        message=decision.message or "Blocked by policy",
+                    )
+                )
+                self._record(
+                    AuditAction.BLOCK_POLICY,
+                    method=method,
+                    tool=tool_name,
+                    arguments=arguments,
+                    request_id=req_id,
+                    rule=decision.rule_name or "policy",
+                    findings=findings,
+                    detail=decision.message,
+                )
                 return None
             if decision.action == PolicyAction.REQUIRE_APPROVAL:
                 logger.warning(
@@ -330,11 +440,27 @@ class StdioMcpProxy:
                     tool_name,
                     decision.rule_name,
                 )
-                self._log_line("client→server", "tools/call", "allow", f"approval_required rule={decision.rule_name}")
-            elif decision.action == PolicyAction.REDACT_OUTPUT:
-                self._log_line("client→server", "tools/call", "allow", f"redact_output rule={decision.rule_name}")
+                self._record(
+                    AuditAction.REQUIRE_APPROVAL,
+                    method=method,
+                    tool=tool_name,
+                    arguments=arguments,
+                    request_id=req_id,
+                    rule=decision.rule_name or "requires_approval",
+                    findings=findings,
+                    detail="policy asked REQUIRE_APPROVAL; stdio cannot prompt, so the call was allowed",
+                )
             else:
-                self._log_line("client→server", "tools/call", "allow", "policy_allow")
+                self._record(
+                    AuditAction.ALLOW,
+                    method=method,
+                    tool=tool_name,
+                    arguments=arguments,
+                    request_id=req_id,
+                    rule=decision.rule_name,
+                    findings=findings,
+                    detail=f"policy {decision.action.value}; forwarded upstream",
+                )
 
         if req_id is not None:
             self._pending_forwarded[req_id] = "tools/call"
@@ -356,8 +482,14 @@ class StdioMcpProxy:
 
         if rid is not None and not is_request and rid in self._pending_tools:
             tool_name = self._pending_tools.pop(rid)
+            inbound = {
+                "direction": AuditDirection.SERVER_TO_CLIENT,
+                "method": TOOLS_CALL_METHOD,
+                "tool": tool_name,
+                "request_id": rid,
+            }
             if msg.get("error") is not None:
-                self._log_line("server→client", "tools/call", "allow", f"tool error tool={tool_name}")
+                self._record(AuditAction.ALLOW, detail="upstream returned a tool error", **inbound)
                 return msg
             result = msg.get("result")
             if isinstance(result, dict):
@@ -366,25 +498,45 @@ class StdioMcpProxy:
                     if pii_findings:
                         msg = dict(msg)
                         msg["result"] = sanitized
-                        self._log_line(
-                            "server→client",
-                            "tools/call",
-                            "redact",
-                            f"{len(pii_findings)} finding(s) tool={tool_name}",
+                        self._record(
+                            AuditAction.REDACT_OUTPUT,
+                            findings=pii_findings,
+                            pii_redactions=len(pii_findings),
+                            detail="PII redacted from tool result",
+                            **inbound,
                         )
                     else:
-                        self._log_line("server→client", "tools/call", "allow", f"tool={tool_name}")
-                except Exception:
+                        self._record(AuditAction.ALLOW, detail="tool result inspected, no findings", **inbound)
+                except Exception as exc:
                     logger.exception("OutputInspector failed for %s; forwarding raw (fail-open)", tool_name)
-                    self._log_line("server→client", "tools/call", "allow", "inspect_error_fail_open")
+                    self._record(
+                        AuditAction.FAIL_OPEN,
+                        detail=(
+                            f"OutputInspector raised {type(exc).__name__}; "
+                            "result forwarded unredacted (fail-open)"
+                        ),
+                        **inbound,
+                    )
             else:
-                self._log_line("server→client", "tools/call", "allow", "non-dict result")
+                self._record(AuditAction.ALLOW, detail="tool result is not an object; not inspected", **inbound)
             return msg
 
         if is_request:
-            self._log_line("server→client", msg.get("method"), "passthrough", "server request")
+            method = msg.get("method")
+            self._record(
+                AuditAction.PASSTHROUGH,
+                direction=AuditDirection.SERVER_TO_CLIENT,
+                method=method if isinstance(method, str) else None,
+                request_id=rid,
+                detail="server-initiated request forwarded uninspected",
+            )
         elif "result" in msg or msg.get("error") is not None:
-            self._log_line("server→client", "-", "passthrough", "response")
+            self._record(
+                AuditAction.PASSTHROUGH,
+                direction=AuditDirection.SERVER_TO_CLIENT,
+                request_id=rid,
+                detail="response to an untracked request forwarded uninspected",
+            )
 
         return msg
 
@@ -427,6 +579,7 @@ async def _run_proxy(argv: list[str]) -> int:
                 "\n"
                 "Default policy path: config/default_policy.yaml, overridden by AGENTPARRY_POLICY.\n"
                 "Default log file: ~/.agentparry/proxy.log\n"
+                "Default audit log: ~/.agentparry/audit.jsonl, overridden by AGENTPARRY_AUDIT_PATH.\n"
             ),
             formatter_class=argparse.RawDescriptionHelpFormatter,
         )
@@ -440,6 +593,18 @@ async def _run_proxy(argv: list[str]) -> int:
             dest="log_path",
             metavar="PATH",
             help="Log file (default: ~/.agentparry/proxy.log)",
+        )
+        help_parser.add_argument(
+            "--audit",
+            dest="audit_path",
+            metavar="PATH",
+            help="JSONL audit log (default: ~/.agentparry/audit.jsonl or AGENTPARRY_AUDIT_PATH)",
+        )
+        help_parser.add_argument(
+            "--no-audit",
+            dest="no_audit",
+            action="store_true",
+            help="Disable the JSONL audit log (same as AGENTPARRY_AUDIT=0)",
         )
         help_parser.add_argument("--verbose", action="store_true", help="Verbose logging to stderr and log file")
         help_parser.add_argument(
@@ -462,6 +627,18 @@ async def _run_proxy(argv: list[str]) -> int:
         dest="log_path",
         default=None,
         help="Log file path (default: ~/.agentparry/proxy.log)",
+    )
+    parser.add_argument(
+        "--audit",
+        dest="audit_path",
+        default=None,
+        help="JSONL audit log path (default: ~/.agentparry/audit.jsonl or AGENTPARRY_AUDIT_PATH)",
+    )
+    parser.add_argument(
+        "--no-audit",
+        dest="no_audit",
+        action="store_true",
+        help="Disable the JSONL audit log (same as AGENTPARRY_AUDIT=0)",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose logging to stderr and log file")
     parsed = parser.parse_args(before)
@@ -498,12 +675,30 @@ async def _run_proxy(argv: list[str]) -> int:
         stderr_log_handle = open(os.devnull, "a", encoding="utf-8")  # noqa: SIM115
         logger.exception("Could not open log file for stderr mirror; discarding child stderr mirror")
 
+    try:
+        audit_writer = AuditWriter(
+            transport=AuditTransport.STDIO,
+            path=parsed.audit_path,
+            enabled=False if parsed.no_audit else None,
+        )
+    except Exception:
+        # A misconfigured audit path must not stop a client session.
+        logger.exception("Could not construct the audit writer; auditing disabled for this run")
+        audit_writer = AuditWriter(transport=AuditTransport.STDIO, enabled=False)
+    logger.info(
+        "Audit log enabled=%s path=%s args_mode=%s",
+        audit_writer.enabled,
+        audit_writer.path,
+        audit_writer.args_mode.value,
+    )
+
     stdout_lock = asyncio.Lock()
     proxy = StdioMcpProxy(
         policy_engine=policy_engine,
         input_inspector=input_inspector,
         output_inspector=output_inspector,
         stdout_lock=stdout_lock,
+        audit=audit_writer,
     )
 
     loop = asyncio.get_running_loop()
@@ -616,6 +811,9 @@ async def _run_proxy(argv: list[str]) -> int:
         stderr_task.cancel()
     with contextlib.suppress(Exception):
         stderr_log_handle.close()
+    if audit_writer.drops:
+        logger.warning("Audit log dropped %d record(s) this run", audit_writer.drops)
+    audit_writer.close()
 
     return 0 if code in (0, None) else 1
 
