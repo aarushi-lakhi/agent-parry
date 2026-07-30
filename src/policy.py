@@ -65,7 +65,11 @@ class Rule:
 class PolicyEngine:
     """Rule engine that applies first-match-wins policy decisions."""
 
-    def __init__(self, policy_path: str = "config/default_policy.yaml") -> None:
+    def __init__(
+        self,
+        policy_path: str = "config/default_policy.yaml",
+        policy: dict[str, Any] | None = None,
+    ) -> None:
         self.policy_path = Path(policy_path)
         self._raw_policy: dict[str, Any] = {"rules": [], "settings": {}}
         self._raw_rules: list[dict[str, Any]] = []
@@ -73,7 +77,10 @@ class PolicyEngine:
         self._default_views: ViewFlags = (True, False)
         self._base_settings = NormalizerSettings()
         self._normalizers: dict[ViewFlags, Normalizer] = {}
-        self.reload()
+        if policy is None:
+            self.reload()
+        else:
+            self.load_mapping(policy)
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PolicyDecision:
         """Evaluate one tool call against loaded rules in-memory."""
@@ -136,10 +143,18 @@ class PolicyEngine:
 
     def reload(self) -> None:
         """Reload policy YAML and recompile runtime rule cache."""
-        loaded = self._load_policy()
-        self._raw_policy = loaded
-        self._raw_rules = list(loaded.get("rules") or [])
-        self._load_normalization_settings(loaded.get("settings") or {})
+        self.load_mapping(self._load_policy())
+
+    def load_mapping(self, policy: dict[str, Any]) -> None:
+        """Adopt an already-parsed policy mapping without reading the file.
+
+        Lets a caller that must validate the YAML itself, such as a hot reload
+        that refuses to install an empty policy, compile exactly the document it
+        checked rather than re-reading a file that may have changed since.
+        """
+        self._raw_policy = policy
+        self._raw_rules = list(policy.get("rules") or [])
+        self._load_normalization_settings(policy.get("settings") or {})
         self._rebuild_compiled_rules()
 
     def _load_normalization_settings(self, settings: Any) -> None:
@@ -190,6 +205,16 @@ class PolicyEngine:
     def get_rules(self) -> list[dict[str, Any]]:
         """Return current raw rule definitions."""
         return list(self._raw_rules)
+
+    @property
+    def active_rule_count(self) -> int:
+        """Number of rules that compiled, so the number that can actually match.
+
+        Lower than ``len(get_rules())`` whenever a rule was malformed and skipped,
+        which is the count a caller deciding whether a policy still enforces
+        anything has to look at.
+        """
+        return len(self._rules)
 
     def get_settings(self) -> dict[str, Any]:
         """Return the raw ``settings`` block, for consumers other than the rules.

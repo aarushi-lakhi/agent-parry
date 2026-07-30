@@ -94,6 +94,13 @@ what was recorded earlier instead of inspecting the payload on its own.
 trust from the CLI, which is why the group spans both directions.
 """
 
+LIFECYCLE_ACTIONS = frozenset({AuditAction.POLICY_RELOAD})
+"""Proxy lifecycle, not a verdict on any message.
+
+A rejected reload is the one worth reading: it means the policy file on disk is
+not the policy in force, and the sample line carries the reason.
+"""
+
 RESPONSE_SIDE_ACTIONS = RESULT_ACTIONS | METADATA_ACTIONS | OUTPUT_ACTIONS
 
 BLOCKING_ACTIONS = frozenset(
@@ -220,6 +227,8 @@ class LogSummary(BaseModel):
     stdio_require_approval_tools: dict[str, int] = Field(default_factory=dict)
     response_side: ResponseSideCounts = Field(default_factory=ResponseSideCounts)
     pins: PinCounts = Field(default_factory=PinCounts)
+    policy_reloads: int = 0
+    policy_reload_samples: list[str] = Field(default_factory=list)
     buckets: list[TimeBucket] = Field(default_factory=list)
     policy_decisions: int = 0
     with_arguments: int = 0
@@ -460,7 +469,9 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
     pins = PinCounts()
     runs: set[str] = set()
     fail_open_samples: list[str] = []
+    reload_samples: list[str] = []
     fail_open = 0
+    policy_reloads = 0
     stdio_approvals = 0
     policy_decisions = 0
     with_arguments = 0
@@ -501,6 +512,10 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
             _tally_response_side(record, response, response_tools, response_methods)
         if record.action in PIN_ACTIONS:
             _tally_pin(record, pins, pin_servers)
+        if record.action is AuditAction.POLICY_RELOAD:
+            policy_reloads += 1
+            if len(reload_samples) < MAX_SAMPLES:
+                reload_samples.append(f"seq={record.seq} {record.detail or 'no detail'}")
 
         slot = buckets.setdefault(bucket_key(record.ts, bucket), TimeBucket(bucket=bucket_key(record.ts, bucket)))
         slot.total += 1
@@ -541,6 +556,8 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
         stdio_require_approval_tools=dict(approval_tools.most_common()),
         response_side=response,
         pins=pins,
+        policy_reloads=policy_reloads,
+        policy_reload_samples=reload_samples,
         buckets=[buckets[key] for key in sorted(buckets)],
         policy_decisions=policy_decisions,
         with_arguments=with_arguments,
@@ -941,6 +958,10 @@ def render_text(report: ReplayReport) -> str:
     out.extend(_render_response_side(summary.response_side))
     if summary.pins.total:
         out.extend(_render_pins(summary.pins))
+    if summary.policy_reloads:
+        out.append(f"Policy reload attempts (a rejected one means disk and memory disagree): {summary.policy_reloads}")
+        out.extend(f"  {sample}" for sample in summary.policy_reload_samples)
+        out.append("")
 
     out.append("Rules that fired:")
     if not summary.rules:

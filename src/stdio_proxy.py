@@ -1,17 +1,26 @@
-"""Stdio MCP proxy: sits between a client (e.g. Claude) and a real MCP server."""
+"""Stdio MCP proxy: sits between a client (e.g. Claude) and a real MCP server.
+
+Also hosts the policy hot reload: `PolicyFileWatcher` polls the policy file and
+installs a validated `PolicyBundle` into the running proxy, so an edit takes
+effect without restarting the MCP client.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
+
+import yaml
 
 from src.audit import AuditWriter
 from src.inspector import (
@@ -43,6 +52,9 @@ from src.policy import PolicyEngine
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 _PROXY_STOP_STDIN = object()
+
+DEFAULT_RELOAD_INTERVAL = 2.0
+MIN_RELOAD_INTERVAL = 0.02
 
 
 def _debug_exc_info() -> bool:
@@ -199,6 +211,113 @@ def _error_response(request_id: Any, *, code: int, message: str) -> dict[str, An
     }
 
 
+class PolicyReloadError(RuntimeError):
+    """A policy file did not yield a policy that still enforces something."""
+
+
+def _policy_stamp(path: Path) -> tuple[int, int] | None:
+    """Return (mtime_ns, size) for the policy file, or None when it cannot be stat'ed."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _load_policy_document(path: Path) -> dict[str, Any]:
+    """Parse a policy file, rejecting any document that would weaken enforcement.
+
+    Every rejection path raises. A hot reload has no safe empty state: swapping in
+    zero rules is allow-everything, so a truncated write, a YAML syntax error and
+    a rule list that vanished all have to leave the loaded policy alone.
+
+    Args:
+        path: Policy YAML path.
+
+    Returns:
+        The parsed policy mapping, with `rules` present and non-empty.
+
+    Raises:
+        PolicyReloadError: The file is unreadable, is not YAML, is not a mapping,
+            or carries no usable rules.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PolicyReloadError(f"policy file unreadable: {exc}") from exc
+    try:
+        loaded = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise PolicyReloadError(f"policy YAML did not parse: {type(exc).__name__}") from exc
+    if not isinstance(loaded, dict):
+        raise PolicyReloadError("policy root is not a mapping")
+    rules = loaded.get("rules")
+    if not isinstance(rules, list):
+        raise PolicyReloadError("policy has no 'rules' list")
+    if not rules:
+        raise PolicyReloadError("policy declares zero rules, which would disable enforcement")
+    settings = loaded.get("settings")
+    if settings is not None and not isinstance(settings, dict):
+        raise PolicyReloadError("policy 'settings' is not a mapping")
+    return loaded
+
+
+@dataclass(frozen=True)
+class PolicyBundle:
+    """A policy engine plus everything else derived from the same settings block.
+
+    The pinner belongs here and not beside it: it reads
+    ``settings.tool_pinning`` and holds the metadata inspector it re-inspects
+    changed tools with, so a bundle that swapped the engine and the inspectors
+    but kept the old pinner would leave pinning enforcing the previous file.
+    """
+
+    engine: PolicyEngine
+    result_inspector: ResultInspector
+    metadata_inspector: MetadataInspector
+    tool_pinner: ToolPinner
+
+    @property
+    def rule_count(self) -> int:
+        """Number of rules the engine compiled, so the number that can match."""
+        return self.engine.active_rule_count
+
+
+def build_policy_bundle(
+    policy_path: str | Path, *, identity: ServerIdentity | None = None
+) -> PolicyBundle:
+    """Load a policy file into an engine and everything derived from its settings.
+
+    Args:
+        policy_path: Policy YAML path.
+        identity: Pin identity of the wrapped server, carried across a reload
+            because it comes from the command line and not from the policy.
+
+    Returns:
+        A bundle ready to install, built entirely off to the side.
+
+    Raises:
+        PolicyReloadError: The document was rejected by `_load_policy_document`.
+    """
+    path = Path(policy_path)
+    document = _load_policy_document(path)
+    engine = PolicyEngine(policy_path=str(path), policy=document)
+    if engine.active_rule_count == 0:
+        raise PolicyReloadError(
+            f"none of the {len(engine.get_rules())} rule(s) compiled, which would disable enforcement"
+        )
+    settings = engine.get_settings()
+    metadata_inspector = MetadataInspector.from_policy_settings(settings)
+    return PolicyBundle(
+        engine=engine,
+        result_inspector=ResultInspector.from_policy_settings(settings),
+        metadata_inspector=metadata_inspector,
+        tool_pinner=ToolPinner.from_policy_settings(
+            settings, identity=identity, inspector=metadata_inspector
+        ),
+    )
+
+
 class StdioMcpProxy:
     def __init__(
         self,
@@ -222,6 +341,37 @@ class StdioMcpProxy:
         self._audit = audit
         self._pending_forwarded: dict[Any, str] = {}
         self._pending_tools: dict[Any, str] = {}
+
+    @property
+    def rule_count(self) -> int:
+        """Number of rules currently in force."""
+        return self._policy.active_rule_count
+
+    def swap_policy(self, bundle: PolicyBundle) -> None:
+        """Install an already-built policy bundle, every settings consumer together.
+
+        Synchronous and only ever called from the event loop, so it cannot land
+        between a handler reading one of these attributes and the synchronous
+        evaluation that uses it. Nothing in the outgoing bundle is mutated, so an
+        inspection already running on a worker thread finishes against the objects
+        it started with.
+
+        Every attribute derived from the policy's settings has to move at once,
+        the pinner included: leaving it behind would keep pinning on the previous
+        settings and pointed at the previous metadata inspector.
+        """
+        self._policy = bundle.engine
+        self._result_inspector = bundle.result_inspector
+        self._metadata_inspector = bundle.metadata_inspector
+        self._tool_pinner = bundle.tool_pinner
+
+    def record_policy_reload(self, *, succeeded: bool, rules: int, reason: str = "") -> None:
+        """Audit one reload attempt, successful or rejected."""
+        if succeeded:
+            detail = f"policy reload ok; rules_loaded={rules}"
+        else:
+            detail = f"policy reload rejected; rules_in_force={rules}; {reason}"
+        self._record(AuditAction.POLICY_RELOAD, detail=detail)
 
     async def write_stdout(self, obj: dict[str, Any]) -> None:
         data = _json_dumps_line(obj)
@@ -722,6 +872,71 @@ class StdioMcpProxy:
         return observation
 
 
+class PolicyFileWatcher:
+    """Hot-reload the policy of a live proxy when its policy file changes on disk.
+
+    Polls `(mtime_ns, size)` instead of taking a signal or exposing a control
+    endpoint: the proxy runs as a child of an MCP client, so there is no pid a
+    user can find, no port they can reach, and the inbound JSON-RPC stream is the
+    untrusted path a control surface must not live on.
+    """
+
+    def __init__(
+        self,
+        proxy: StdioMcpProxy,
+        policy_path: str | Path,
+        *,
+        interval: float = DEFAULT_RELOAD_INTERVAL,
+        identity: ServerIdentity | None = None,
+    ) -> None:
+        self._proxy = proxy
+        self._path = Path(policy_path)
+        self._interval = max(float(interval), MIN_RELOAD_INTERVAL)
+        self._identity = identity
+        self._stamp = _policy_stamp(self._path)
+
+    async def poll_once(self) -> bool:
+        """Reload if the file changed, keeping the loaded policy on any failure.
+
+        Returns:
+            True when a new policy took effect.
+        """
+        logger = logging.getLogger(__name__)
+        stamp = await asyncio.to_thread(_policy_stamp, self._path)
+        if stamp is None or stamp == self._stamp:
+            return False
+        self._stamp = stamp
+        try:
+            bundle = await asyncio.to_thread(
+                functools.partial(build_policy_bundle, self._path, identity=self._identity)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Policy reload rejected path=%s reason=%s; keeping the %d rule(s) already in force",
+                self._path,
+                exc,
+                self._proxy.rule_count,
+                exc_info=_debug_exc_info(),
+            )
+            self._proxy.record_policy_reload(succeeded=False, rules=self._proxy.rule_count, reason=str(exc))
+            return False
+        self._proxy.swap_policy(bundle)
+        logger.info("Policy reloaded path=%s rules=%d", self._path, bundle.rule_count)
+        self._proxy.record_policy_reload(succeeded=True, rules=bundle.rule_count)
+        return True
+
+    async def run(self) -> None:
+        """Poll until cancelled."""
+        while True:
+            await asyncio.sleep(self._interval)
+            try:
+                await self.poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.getLogger(__name__).exception("Policy watch failed; keeping the loaded policy")
+
+
 async def _drain_stderr(proc: asyncio.subprocess.Process, log_file: TextIO) -> None:
     logger = logging.getLogger(__name__)
     assert proc.stderr is not None
@@ -761,6 +976,7 @@ async def _run_proxy(argv: list[str]) -> int:
                 "Default policy path: config/default_policy.yaml, overridden by AGENTPARRY_POLICY.\n"
                 "Default log file: ~/.agentparry/proxy.log\n"
                 "Default audit log: ~/.agentparry/audit.jsonl, overridden by AGENTPARRY_AUDIT_PATH.\n"
+                "Policy edits are picked up while running; pass --no-reload-on-change to opt out.\n"
             ),
             formatter_class=argparse.RawDescriptionHelpFormatter,
         )
@@ -786,6 +1002,21 @@ async def _run_proxy(argv: list[str]) -> int:
             dest="no_audit",
             action="store_true",
             help="Disable the JSONL audit log (same as AGENTPARRY_AUDIT=0)",
+        )
+        help_parser.add_argument(
+            "--reload-on-change",
+            dest="reload_on_change",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Reload the policy file when it changes on disk (default: enabled)",
+        )
+        help_parser.add_argument(
+            "--reload-interval",
+            dest="reload_interval",
+            type=float,
+            metavar="SECONDS",
+            default=DEFAULT_RELOAD_INTERVAL,
+            help=f"Policy file poll interval in seconds (default: {DEFAULT_RELOAD_INTERVAL})",
         )
         help_parser.add_argument("--verbose", action="store_true", help="Verbose logging to stderr and log file")
         help_parser.add_argument(
@@ -821,6 +1052,21 @@ async def _run_proxy(argv: list[str]) -> int:
         action="store_true",
         help="Disable the JSONL audit log (same as AGENTPARRY_AUDIT=0)",
     )
+    parser.add_argument(
+        "--reload-on-change",
+        dest="reload_on_change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reload the policy file when it changes on disk (default: enabled)",
+    )
+    parser.add_argument(
+        "--reload-interval",
+        dest="reload_interval",
+        type=float,
+        metavar="SECONDS",
+        default=DEFAULT_RELOAD_INTERVAL,
+        help=f"Policy file poll interval in seconds (default: {DEFAULT_RELOAD_INTERVAL})",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose logging to stderr and log file")
     parsed = parser.parse_args(before)
 
@@ -832,6 +1078,7 @@ async def _run_proxy(argv: list[str]) -> int:
     cmd, child_args = _parse_child_command(wrap_argv)
     logger.info("Starting wrapped server command=%s args=%s policy=%s", cmd, child_args, policy_path)
 
+    pin_identity = ServerIdentity.for_command([cmd, *child_args], transport=AuditTransport.STDIO)
     try:
         policy_engine = PolicyEngine(policy_path=str(policy_path))
         input_inspector = InputInspector()
@@ -840,7 +1087,7 @@ async def _run_proxy(argv: list[str]) -> int:
         metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
         tool_pinner = ToolPinner.from_policy_settings(
             policy_engine.get_settings(),
-            identity=ServerIdentity.for_command([cmd, *child_args], transport=AuditTransport.STDIO),
+            identity=pin_identity,
             inspector=metadata_inspector,
         )
     except Exception:
@@ -897,6 +1144,14 @@ async def _run_proxy(argv: list[str]) -> int:
         stdout_lock=stdout_lock,
         audit=audit_writer,
     )
+
+    watch_task: asyncio.Task[None] | None = None
+    if parsed.reload_on_change:
+        watcher = PolicyFileWatcher(
+            proxy, policy_path, interval=parsed.reload_interval, identity=pin_identity
+        )
+        watch_task = asyncio.create_task(watcher.run())
+        logger.info("Watching policy for changes path=%s interval=%ss", policy_path, parsed.reload_interval)
 
     loop = asyncio.get_running_loop()
     stdin_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -979,6 +1234,11 @@ async def _run_proxy(argv: list[str]) -> int:
     for item in results:
         if isinstance(item, BaseException):
             logger.error("Proxy task failed", exc_info=item)
+
+    if watch_task is not None:
+        watch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watch_task
 
     code = proc.returncode
     if code is None:

@@ -239,6 +239,7 @@ def test_every_audit_action_falls_in_exactly_one_reported_group() -> None:
         replay.METADATA_ACTIONS,
         replay.OUTPUT_ACTIONS,
         replay.PIN_ACTIONS,
+        replay.LIFECYCLE_ACTIONS,
     )
     union: set[AuditAction] = set()
     for group in groups:
@@ -283,6 +284,22 @@ def test_pin_actions_are_counted_and_rendered(tmp_path: Path) -> None:
     assert (pins.total, pins.created, pins.changed, pins.blocked, pins.accepted) == (4, 1, 1, 1, 1)
     assert pins.servers == {"npx some-mcp-server": 4}
     assert "Tool-list pinning: 4" in replay.render_text(report)
+
+
+def test_policy_reload_attempts_are_counted_and_sampled(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    _emit(writer, action=AuditAction.POLICY_RELOAD, detail="policy reload ok; rules_loaded=7")
+    _emit(
+        writer,
+        action=AuditAction.POLICY_RELOAD,
+        detail="policy reload rejected; rules_in_force=7; policy YAML did not parse",
+    )
+    writer.close()
+    report = replay.build_report(replay.read_log(tmp_path / "audit.jsonl"))
+    assert report.summary.policy_reloads == 2
+    text = replay.render_text(report)
+    assert "Policy reload attempts" in text
+    assert "policy reload rejected" in text
 
 
 def test_metadata_and_result_blocks_count_as_blocks_in_the_histogram(tmp_path: Path) -> None:

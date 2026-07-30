@@ -196,6 +196,7 @@ class AuditAction(str, Enum):
     METHOD_NOT_FOUND = "METHOD_NOT_FOUND"
     PASSTHROUGH = "PASSTHROUGH"
     FAIL_OPEN = "FAIL_OPEN"
+    POLICY_RELOAD = "POLICY_RELOAD"
 
 
 class AuditTransport(str, Enum):
