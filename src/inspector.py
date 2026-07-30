@@ -954,11 +954,13 @@ class MetadataInspector:
     descriptions at any depth, enum members, defaults, ``const``, examples and the
     property key names.
 
-    Residual risk, and it is the real one: legitimate tool descriptions contain
-    imperative prose, so redaction on a false positive silently degrades a working
-    tool. The critical-only threshold and the ``annotate`` action exist for that,
-    and the pattern set wants tuning against a corpus of real servers before
-    anyone trusts ``redact`` in production.
+    Measured against ``tests/fixtures/real_servers/``, eight real servers and 75
+    tools: no pattern in either table matches any real description, and the
+    shipped default rewrites nothing. Two ``medium`` findings come from the
+    structural heuristics, both below threshold. Lowering
+    ``severity_threshold`` to ``medium`` is not free: on that same corpus it
+    drops one working tool and redacts one description the model needs.
+    ``docs/real-servers.md`` has the numbers.
     """
 
     def __init__(

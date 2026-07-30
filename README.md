@@ -61,6 +61,8 @@ Outcomes roll up into a confusion matrix, so a scan reports a pair of numbers in
 
 `vulnerability_score` counts attack payloads only, so adding benign payloads cannot deflate it. `detection_rate`, `false_positive_rate` and `balanced_score` return `n/a` when their denominator is empty, because "no benign payloads" is not "zero over-blocking". The payload set ships fifteen `expected_behavior: allow` payloads and the default policy over-blocks none of them; the scan report's "False positives" section names the rule at fault when it does.
 
+**Those fifteen benign payloads target four mock tool names that exist on no real server, so "over-blocking 0%" is a regression score, not a property of AgentParry.** [docs/real-servers.md](docs/real-servers.md) measures what the same code does against eight real MCP servers and says which numbers to stop quoting.
+
 Only error code `-32001` counts as a proxy block. `-32601` and `-32602` mean the call never reached policy evaluation and score as indeterminate.
 
 A result the proxy neutralized is observed as `neutralize`, read off the `_agentparry.result_injection` marker rather than a redaction marker. Strictness runs allow < neutralize < redact < block, so a neutralize satisfies `expected: redact` and `expected: neutralize` but not `expected: block`: fencing alters what the model reads without stopping the call, and it is advisory. Those rows are counted separately in `ConfusionMatrix.neutralized` and rendered "NEUTRALIZED ONLY" when they still miss.
