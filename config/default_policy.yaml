@@ -20,7 +20,7 @@ rules:
   - type: pattern_match
     field: body
     patterns:
-    - disregard.*rules|override.*safety
+    - disregard\s+(?:all|any|every|the\s+(?:previous|prior|earlier|preceding|above|system|safety))\b.{0,30}\b(?:rules|instructions|guidelines|policies|restrictions|directives)\b|override\s+(?:your|all|the)\s+(?:safety|security)\b
 - name: autogen_pe-004
   tool: shell_exec
   action: BLOCK

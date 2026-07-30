@@ -92,22 +92,15 @@ def test_committed_policy_reports_its_remaining_over_blocks() -> None:
     report = committed_report()
 
     blocked = {(b.rule, b.payload_id): b for b in report.blocks}
-    assert set(blocked) == {
-        ("autogen_pi-004", "bn-004"),
-        ("block_dangerous_shell", "bn-007"),
-    }
-
-    disregard = blocked[("autogen_pi-004", "bn-004")]
-    assert disregard.pattern == "disregard.*rules|override.*safety"
-    assert disregard.matched_text == "disregard the old onboarding rules"
+    assert set(blocked) == {("block_dangerous_shell", "bn-007")}
 
     sudo = blocked[("block_dangerous_shell", "bn-007")]
     assert sudo.pattern == r"sudo\s+"
     assert sudo.field == "command"
     assert sudo.matched_text == "sudo "
 
-    assert report.over_block_rate == pytest.approx(22.2)
-    assert report.high_rules == ["autogen_pi-004", "block_dangerous_shell"]
+    assert report.over_block_rate == pytest.approx(11.1)
+    assert report.high_rules == ["block_dangerous_shell"]
 
 
 def test_require_approval_on_a_benign_payload_is_friction_not_over_block() -> None:
@@ -144,9 +137,9 @@ def test_corpus_free_run_still_flags_the_same_rules() -> None:
     report = lint_policy(COMMITTED_POLICY, None)
     assert report.benign_total == 0
     assert report.over_block_rate is None
-    assert report.high_rules == ["autogen_pi-004", "block_dangerous_shell"]
+    assert report.high_rules == ["block_dangerous_shell"]
     assert report.corpus_confirmed_rules == []
-    assert report.probe_only_rules == ["autogen_pi-004", "block_dangerous_shell"]
+    assert report.probe_only_rules == ["block_dangerous_shell"]
 
 
 def test_committed_policy_matches_the_decoded_view_too() -> None:
@@ -428,7 +421,7 @@ def test_missing_payload_file_raises(tmp_path: Path) -> None:
 
 def test_render_report_includes_spans_and_summary() -> None:
     text = render_report(committed_report())
-    assert "over-block rate: 2/9 = 22.2%" in text
+    assert "over-block rate: 1/9 = 11.1%" in text
     assert "BLOCK  bn-007  shell_exec  block_dangerous_shell" in text
     assert "matched 'sudo ' in the original view" in text
     assert "matched views: original, canonical, decoded" in text

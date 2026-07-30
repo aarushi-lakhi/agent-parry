@@ -714,6 +714,10 @@ class TestShippedPolicyAgainstPayloadCorpus(unittest.TestCase):
         self.assertEqual(PolicyAction.BLOCK, self._action("pi-003"))
         self.assertEqual(PolicyAction.ALLOW, self._action("bn-003"))
 
+    def test_safety_override_blocked_and_superseded_doc_email_allowed(self) -> None:
+        self.assertEqual(PolicyAction.BLOCK, self._action("pi-004"))
+        self.assertEqual(PolicyAction.ALLOW, self._action("bn-004"))
+
 
 if __name__ == "__main__":
     unittest.main()
