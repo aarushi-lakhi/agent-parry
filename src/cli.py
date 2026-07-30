@@ -19,6 +19,7 @@ import httpx
 import json5
 
 from src.models import PROXY_URL, ScanReport
+from src.rule_generator import RuleGenerator, plan_autogen_merge, write_policy_text
 from src.scanner import (
     OUTCOME_FALSE_NEGATIVE,
     OUTCOME_FALSE_POSITIVE,
@@ -241,6 +242,15 @@ class RescanAnalysis:
         return self.regressed_attacks > 0 or self.introduced_false_positives > 0
 
 
+def _count_remaining(report: ScanReport) -> int:
+    """Attack payloads the policy still lets through, by outcome."""
+    return sum(
+        1
+        for r in report.results
+        if result_outcome(r, safe=report.safe_mode) == OUTCOME_FALSE_NEGATIVE
+    )
+
+
 def _analyze_rescan(before: ScanReport, after: ScanReport) -> RescanAnalysis:
     """Compare two reports by outcome rather than by flags.
 
@@ -250,11 +260,7 @@ def _analyze_rescan(before: ScanReport, after: ScanReport) -> RescanAnalysis:
     """
     after_by_id = {r.payload.id: r for r in after.results}
 
-    remaining = sum(
-        1
-        for r in after.results
-        if result_outcome(r, safe=after.safe_mode) == OUTCOME_FALSE_NEGATIVE
-    )
+    remaining = _count_remaining(after)
 
     fixed = 0
     regressed = 0
@@ -312,6 +318,96 @@ async def _run_after_scan(
     if full:
         return await scanner.run_scan(proxy_url=target, discover=discover, safe=safe)
     return await scanner.run_rescan(target, before, safe=safe)
+
+
+async def _cmd_harden_live(args: argparse.Namespace) -> int:
+    scanner = Scanner(payloads_path=args.payloads)
+    await _probe_target(args.target, safe=args.safe)
+
+    before = await scanner.run_scan(
+        proxy_url=args.target,
+        discover=args.discover,
+        safe=args.safe,
+    )
+    scanner.print_report(before)
+    if args.output:
+        for path in save_scan_outputs(scanner, before, args.output, args.format):
+            print(f"Report saved: {path}", file=sys.stderr)
+
+    rules = RuleGenerator().generate_rules(before, include_policy_allowed=args.safe)
+    if not rules:
+        print("No autogen rules to add; policy left unchanged.")
+        return vulnerability_exit_code(_count_remaining(before), args.max_vulns)
+
+    plan = plan_autogen_merge(rules, args.policy)
+    print()
+    print(
+        f"Rules: {len(plan.added)} new, {len(plan.replaced)} replaced, "
+        f"{len(plan.kept_autogen)} existing autogen kept, {len(plan.handwritten)} handwritten kept"
+    )
+    diff = plan.diff(args.policy)
+    print(diff if diff else "(no change to the policy file)")
+
+    if args.dry_run:
+        print("Dry run: nothing written.")
+        return EXIT_OK
+
+    if not plan.changed:
+        print("Policy already contains these rules; nothing written.")
+        return vulnerability_exit_code(_count_remaining(before), args.max_vulns)
+
+    if not args.yes and not _confirm(f"Write these {len(rules)} rules to {args.policy}? [y/N] "):
+        print("Aborted; policy left unchanged.")
+        return EXIT_ABORTED
+
+    backup = write_policy_text(plan.after_text, args.policy)
+    if backup:
+        print(f"Backup: {backup}")
+    print(f"Policy updated: {args.policy}")
+
+    if args.no_reload:
+        print("Skipped policy reload (--no-reload); reload the proxy yourself for this to take effect.")
+    else:
+        await _reload_policy(args.target)
+    print(STDIO_RESTART_NOTE)
+
+    after = await _run_after_scan(
+        scanner,
+        before,
+        target=args.target,
+        full=args.full,
+        discover=args.discover,
+        safe=args.safe,
+    )
+    scanner.print_comparison(before, after)
+    analysis = _analyze_rescan(before, after)
+    _print_analysis(analysis, full=args.full, max_vulns=args.max_vulns)
+    return vulnerability_exit_code(
+        analysis.remaining, args.max_vulns, regression=analysis.regression
+    )
+
+
+def cmd_harden(args: argparse.Namespace) -> int:
+    """Scan, generate rules, merge them into the policy, then re-scan."""
+    if args.target is None:
+        args.target = PROXY_URL
+    _guard_live_target(args.target, safe=args.safe, allow_remote=args.allow_remote)
+
+    if not Path(args.policy).is_file():
+        raise SystemExit(f"error: policy file not found: {args.policy}")
+
+    if not args.yes and not args.dry_run and not _stdin_is_tty():
+        raise SystemExit(
+            "error: stdin is not a terminal, so the policy change cannot be confirmed. "
+            "Re-run with --yes to accept it, or --dry-run to see the diff."
+        )
+
+    try:
+        return asyncio.run(_cmd_harden_live(args))
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
 
 
 def _claude_config_path() -> Path:
@@ -454,6 +550,50 @@ def cmd_install_openclaw(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_scan_target_args(parser: argparse.ArgumentParser) -> None:
+    """Target selection and payload-execution safety flags, shared by harden and verify."""
+    parser.add_argument(
+        "--target",
+        default=None,
+        metavar="URL",
+        help=f"Proxy JSON-RPC URL (default: {PROXY_URL})",
+    )
+    parser.add_argument("--payloads", default="attacks/payloads.yaml", help="Attack payloads YAML")
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Call tools/list first; remap YAML payloads and add schema-driven probes",
+    )
+    parser.add_argument(
+        "--safe",
+        action="store_true",
+        help="Input-side checks only: the proxy evaluates policy but does not forward tool calls",
+    )
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        dest="allow_remote",
+        help="Permit a non-loopback --target without --safe. The payloads really execute upstream",
+    )
+
+
+def _add_verify_scope_args(parser: argparse.ArgumentParser) -> None:
+    """Rescan scope and the vulnerability threshold, shared by harden and verify."""
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Re-run the whole payload set instead of replaying only what got through (CI mode)",
+    )
+    parser.add_argument(
+        "--max-vulns",
+        type=int,
+        default=0,
+        dest="max_vulns",
+        metavar="N",
+        help="Exit 3 when more than N vulnerabilities remain (default: 0)",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentparry",
@@ -528,6 +668,55 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Input-side checks only: proxy evaluates policy but does not forward tool calls",
     )
     p_scan.set_defaults(handler=cmd_scan)
+
+    p_harden = sub.add_parser(
+        "harden",
+        help="Scan, merge generated rules into the policy, then re-scan to verify",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Additive: existing autogen_ rules are kept, same-named ones replaced, handwritten\n"
+            "rules preserved. Backs the policy up to a .bak sibling, prints a unified diff, and\n"
+            "asks before writing unless --yes.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 vulnerabilities remain or a regression was\n"
+            "found, 4 aborted at the prompt, 130 interrupted.\n"
+            "Examples:\n"
+            "  agentparry harden --target http://localhost:9090/mcp --dry-run\n"
+            "  agentparry harden --target http://localhost:9090/mcp --yes --full\n"
+            "  agentparry harden --target https://prod.example/mcp --safe --yes\n"
+        ),
+    )
+    _add_scan_target_args(p_harden)
+    p_harden.add_argument(
+        "--policy",
+        default="config/default_policy.yaml",
+        help="Policy YAML to merge rules into (default: config/default_policy.yaml)",
+    )
+    p_harden.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Print the diff and exit 0 without writing anything",
+    )
+    p_harden.add_argument("--yes", action="store_true", help="Write the policy without confirming")
+    p_harden.add_argument(
+        "--no-reload",
+        action="store_true",
+        dest="no_reload",
+        help="Do not POST /policy/reload on the target after writing",
+    )
+    p_harden.add_argument(
+        "--output",
+        default=None,
+        help="Save the pre-hardening scan here, for a later `agentparry verify --before`",
+    )
+    p_harden.add_argument(
+        "--format",
+        choices=("json", "md", "both"),
+        default="json",
+        help="Format for --output (default: json)",
+    )
+    _add_verify_scope_args(p_harden)
+    p_harden.set_defaults(handler=cmd_harden)
 
     p_claude = sub.add_parser(
         "install-claude",
