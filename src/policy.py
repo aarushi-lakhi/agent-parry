@@ -78,7 +78,12 @@ class PolicyEngine:
             findings: list[Finding] = []
             if self._rule_matches(rule, arguments, findings, view_cache):
                 self._log_rule_match(rule=rule, tool_name=tool_name, findings=findings)
-                return PolicyDecision(action=rule.action, rule_name=rule.name, message=rule.message)
+                return PolicyDecision(
+                    action=rule.action,
+                    rule_name=rule.name,
+                    message=rule.message,
+                    findings=findings,
+                )
         return PolicyDecision(action=PolicyAction.ALLOW)
 
     def _views(
