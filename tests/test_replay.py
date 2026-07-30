@@ -238,6 +238,7 @@ def test_every_audit_action_falls_in_exactly_one_reported_group() -> None:
         replay.RESULT_ACTIONS,
         replay.METADATA_ACTIONS,
         replay.OUTPUT_ACTIONS,
+        replay.PIN_ACTIONS,
     )
     union: set[AuditAction] = set()
     for group in groups:
@@ -270,6 +271,18 @@ def test_response_side_actions_are_counted_by_kind(tmp_path: Path) -> None:
     assert side.pii_redactions == 3
     assert side.tools == {"file_read": 2, "pii_tool": 1}
     assert side.methods == {"tools/list": 2}
+
+
+def test_pin_actions_are_counted_and_rendered(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    for action in replay.PIN_ACTIONS:
+        _emit(writer, action=action, method="tools/list", tool="npx some-mcp-server")
+    writer.close()
+    report = replay.build_report(replay.read_log(tmp_path / "audit.jsonl"))
+    pins = report.summary.pins
+    assert (pins.total, pins.created, pins.changed, pins.blocked, pins.accepted) == (4, 1, 1, 1, 1)
+    assert pins.servers == {"npx some-mcp-server": 4}
+    assert "Tool-list pinning: 4" in replay.render_text(report)
 
 
 def test_metadata_and_result_blocks_count_as_blocks_in_the_histogram(tmp_path: Path) -> None:

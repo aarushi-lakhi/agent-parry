@@ -24,16 +24,20 @@ from src.inspector import (
 from src.models import (
     INJECTION_BLOCK_ERROR_CODE,
     METADATA_BLOCK_ERROR_CODE,
+    PIN_BLOCK_ERROR_CODE,
     RESULT_INJECTION_ERROR_CODE,
     TOOLS_CALL_METHOD,
     AuditAction,
     AuditDirection,
     AuditTransport,
     Finding,
+    MetadataInspection,
+    PinObservation,
     PolicyAction,
     is_known_mcp_method,
     is_tools_call,
 )
+from src.pins import ServerIdentity, ToolPinner, audit_findings_for
 from src.policy import PolicyEngine
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -206,12 +210,14 @@ class StdioMcpProxy:
         audit: AuditWriter,
         result_inspector: ResultInspector | None = None,
         metadata_inspector: MetadataInspector | None = None,
+        tool_pinner: ToolPinner | None = None,
     ) -> None:
         self._policy = policy_engine
         self._input_inspector = input_inspector
         self._output_inspector = output_inspector
         self._result_inspector = result_inspector or ResultInspector()
         self._metadata_inspector = metadata_inspector or MetadataInspector()
+        self._tool_pinner = tool_pinner or ToolPinner()
         self._stdout_lock = stdout_lock
         self._audit = audit
         self._pending_forwarded: dict[Any, str] = {}
@@ -618,6 +624,7 @@ class StdioMcpProxy:
             self._record(AuditAction.ALLOW, detail="discovery result is not an object; not inspected", **inbound)
             return msg
 
+        inspection: MetadataInspection | None = None
         try:
             inspection = await asyncio.to_thread(self._metadata_inspector.inspect, method, result)
         except Exception as exc:
@@ -630,24 +637,28 @@ class StdioMcpProxy:
                 ),
                 **inbound,
             )
-            return msg
 
-        if not inspection.findings:
+        if inspection is None:
+            findings: list[Finding] = []
+        elif inspection.findings:
+            affected = inspection.dropped_tools + inspection.redacted_tools
+            detail = f"{inspection.action}: {len(inspection.findings)} poisoned metadata finding(s)"
+            if affected:
+                detail += f" tools={','.join(affected)}"
+            self._record(
+                AuditAction.BLOCK_METADATA if inspection.blocked else AuditAction.REDACT_METADATA,
+                findings=inspection.findings,
+                detail=detail,
+                **inbound,
+            )
+            findings = inspection.findings
+        else:
             self._record(AuditAction.ALLOW, detail="discovery metadata inspected, no findings", **inbound)
-            return msg
+            findings = []
 
-        affected = inspection.dropped_tools + inspection.redacted_tools
-        detail = f"{inspection.action}: {len(inspection.findings)} poisoned metadata finding(s)"
-        if affected:
-            detail += f" tools={','.join(affected)}"
-        self._record(
-            AuditAction.BLOCK_METADATA if inspection.blocked else AuditAction.REDACT_METADATA,
-            findings=inspection.findings,
-            detail=detail,
-            **inbound,
-        )
+        observation = await self._observe_pin(method, result, findings, inbound)
 
-        if inspection.blocked:
+        if inspection is not None and inspection.blocked:
             return {
                 "jsonrpc": msg.get("jsonrpc", "2.0"),
                 "id": rid,
@@ -656,10 +667,59 @@ class StdioMcpProxy:
                     "message": inspection.block_message,
                 },
             }
+        if observation.blocked:
+            return {
+                "jsonrpc": msg.get("jsonrpc", "2.0"),
+                "id": rid,
+                "error": {"code": PIN_BLOCK_ERROR_CODE, "message": observation.block_message},
+            }
 
+        payload = result if inspection is None else inspection.result
+        payload = self._tool_pinner.apply(payload, observation)
+        if payload is result and not (inspection is not None and inspection.findings):
+            return msg
         updated = dict(msg)
-        updated["result"] = inspection.result
+        updated["result"] = payload
         return updated
+
+    async def _observe_pin(
+        self,
+        method: str,
+        result: dict[str, Any],
+        findings: list[Finding],
+        inbound: dict[str, Any],
+    ) -> PinObservation:
+        """Diff the raw discovery result against the pin on disk, failing open.
+
+        The raw result, not the redacted one: pinning what metadata inspection
+        rewrote would diff on every run, and would pin poison it had already
+        removed as if it were clean. The check touches the filesystem, so it runs
+        on a worker thread like the scan above it.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            observation = await asyncio.to_thread(self._tool_pinner.observe, method, result, findings)
+        except Exception as exc:
+            logger.exception("Tool-list pin check failed for %s; forwarding raw (fail-open)", method)
+            self._record(
+                AuditAction.FAIL_OPEN,
+                detail=f"ToolPinner raised {type(exc).__name__}; pin not checked (fail-open)",
+                **inbound,
+            )
+            return PinObservation()
+
+        if not observation.reportable:
+            return observation
+        action = AuditAction.PIN_CREATED if observation.status == "created" else AuditAction.PIN_DIFF
+        if observation.blocked:
+            action = AuditAction.BLOCK_PIN
+        self._record(
+            action,
+            findings=audit_findings_for(observation),
+            detail=observation.detail,
+            **inbound,
+        )
+        return observation
 
 
 async def _drain_stderr(proc: asyncio.subprocess.Process, log_file: TextIO) -> None:
@@ -778,9 +838,20 @@ async def _run_proxy(argv: list[str]) -> int:
         output_inspector = OutputInspector()
         result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
         metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
+        tool_pinner = ToolPinner.from_policy_settings(
+            policy_engine.get_settings(),
+            identity=ServerIdentity.for_command([cmd, *child_args], transport=AuditTransport.STDIO),
+            inspector=metadata_inspector,
+        )
     except Exception:
         logger.exception("Failed to initialize policy/inspectors; exiting")
         return 1
+    logger.info(
+        "Tool-list pin action=%s key=%s store=%s",
+        tool_pinner.settings.action,
+        tool_pinner.identity_key,
+        tool_pinner.store.path,
+    )
 
     proc = await asyncio.create_subprocess_exec(
         cmd,
@@ -822,6 +893,7 @@ async def _run_proxy(argv: list[str]) -> int:
         output_inspector=output_inspector,
         result_inspector=result_inspector,
         metadata_inspector=metadata_inspector,
+        tool_pinner=tool_pinner,
         stdout_lock=stdout_lock,
         audit=audit_writer,
     )
