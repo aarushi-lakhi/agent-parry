@@ -10,7 +10,8 @@ from __future__ import annotations
 import copy
 import logging
 import re
-from typing import Any, ClassVar
+from dataclasses import dataclass
+from typing import Any, ClassVar, Literal
 
 from src.models import Finding
 from src.normalize import (
@@ -26,6 +27,69 @@ logger = logging.getLogger(__name__)
 
 _OPAQUE_BLOB_SIGNAL = "opaque encoded blob"
 
+Severity = Literal["low", "medium", "high", "critical"]
+
+_SEVERITY_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+@dataclass(frozen=True, slots=True)
+class InjectionPattern:
+    """One compiled prompt-injection signature.
+
+    Shared by every inspector that looks for injected instructions, so an
+    argument-side signature and a result-side signature can never drift apart.
+    """
+
+    pattern: re.Pattern[str]
+    severity: Severity
+    description: str
+
+
+INJECTION_PATTERNS: tuple[InjectionPattern, ...] = (
+    InjectionPattern(
+        re.compile(r"ignore\s+(?:all\s|any\s)?(?:previous\s|prior\s)?instructions", re.IGNORECASE),
+        "critical",
+        "Attempt to ignore instructions",
+    ),
+    InjectionPattern(
+        re.compile(r"\b(?:you are now|act as|pretend to be)\b", re.IGNORECASE),
+        "high",
+        "Role manipulation attempt",
+    ),
+    InjectionPattern(
+        re.compile(r"^\s*(?:SYSTEM:|\[SYSTEM\]|<<SYS>>)", re.IGNORECASE),
+        "critical",
+        "System-level instruction injection at value start",
+    ),
+    InjectionPattern(
+        re.compile(r"\b(?:do not follow|disregard|override\s+(?:your|all|the))\b", re.IGNORECASE),
+        "high",
+        "Instruction override/disregard attempt",
+    ),
+    InjectionPattern(
+        re.compile(r"\bforget\s+(?:your|all|everything|previous)\b", re.IGNORECASE),
+        "high",
+        "Attempt to force instruction forgetting",
+    ),
+    InjectionPattern(
+        re.compile(r"(?:<script|javascript:|onerror=)", re.IGNORECASE),
+        "medium",
+        "Potential HTML/script injection payload",
+    ),
+    InjectionPattern(
+        re.compile(
+            r"(?:/etc/(?:passwd|shadow|sudoers)"
+            r"|\.ssh/id_[a-z0-9]+"
+            r"|\.aws/credentials"
+            r"|/proc/self/environ"
+            r"|\.env\b(?!\w))",
+            re.IGNORECASE,
+        ),
+        "high",
+        "Reference to a credential or sensitive system file",
+    ),
+)
+
 
 class InputInspector:
     """Detect suspicious prompt-injection strings in tool arguments."""
@@ -36,50 +100,7 @@ class InputInspector:
         Pass :func:`src.normalize.raw_only_normalizer` to match raw input only.
         """
         self._normalizer = normalizer or detection_normalizer()
-        self._patterns: list[tuple[re.Pattern[str], str, str]] = [
-            (
-                re.compile(r"ignore\s+(?:all\s|any\s)?(?:previous\s|prior\s)?instructions", re.IGNORECASE),
-                "critical",
-                "Attempt to ignore instructions",
-            ),
-            (
-                re.compile(r"\b(?:you are now|act as|pretend to be)\b", re.IGNORECASE),
-                "high",
-                "Role manipulation attempt",
-            ),
-            (
-                re.compile(r"^\s*(?:SYSTEM:|\[SYSTEM\]|<<SYS>>)", re.IGNORECASE),
-                "critical",
-                "System-level instruction injection at value start",
-            ),
-            (
-                re.compile(r"\b(?:do not follow|disregard|override\s+(?:your|all|the))\b", re.IGNORECASE),
-                "high",
-                "Instruction override/disregard attempt",
-            ),
-            (
-                re.compile(r"\bforget\s+(?:your|all|everything|previous)\b", re.IGNORECASE),
-                "high",
-                "Attempt to force instruction forgetting",
-            ),
-            (
-                re.compile(r"(?:<script|javascript:|onerror=)", re.IGNORECASE),
-                "medium",
-                "Potential HTML/script injection payload",
-            ),
-            (
-                re.compile(
-                    r"(?:/etc/(?:passwd|shadow|sudoers)"
-                    r"|\.ssh/id_[a-z0-9]+"
-                    r"|\.aws/credentials"
-                    r"|/proc/self/environ"
-                    r"|\.env\b(?!\w))",
-                    re.IGNORECASE,
-                ),
-                "high",
-                "Reference to a credential or sensitive system file",
-            ),
-        ]
+        self._patterns: tuple[InjectionPattern, ...] = INJECTION_PATTERNS
 
     def inspect(self, tool_name: str, arguments: dict[str, Any]) -> list[Finding]:
         """Scan all nested string values and return deduped findings."""
@@ -87,17 +108,17 @@ class InputInspector:
         for field_path, value in self._iter_strings(arguments):
             views = self._views(value)
             candidates: list[Finding] = []
-            for pattern, severity, description in self._patterns:
+            for entry in self._patterns:
                 for view in views:
-                    match = pattern.search(view.text)
+                    match = entry.pattern.search(view.text)
                     if match is None:
                         continue
                     candidates.append(
                         Finding(
-                            severity=severity,  # type: ignore[arg-type]
-                            description=f"{description} in {tool_name}",
+                            severity=entry.severity,
+                            description=f"{entry.description} in {tool_name}",
                             field=field_path,
-                            matched_pattern=pattern.pattern,
+                            matched_pattern=entry.pattern.pattern,
                             view=view.name,
                             matched_text=match.group(0),
                             span=view.map_span(*match.span()),
