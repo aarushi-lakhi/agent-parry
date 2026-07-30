@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -15,6 +17,8 @@ from src.policy import PolicyEngine
 ZWSP = "\u200b"
 NBSP = "\u00a0"
 CYRILLIC_O = "\u043e"
+SOFT_HYPHEN = "\u00ad"
+CGJ = "\u034f"
 
 
 class TestPolicyEngine(unittest.TestCase):
@@ -277,6 +281,25 @@ class TestHostHelpers(unittest.TestCase):
     def test_normalize_host_idna_encodes_unicode(self) -> None:
         self.assertEqual(PolicyEngine._normalize_host("münchen.example"), "xn--mnchen-3ya.example")
 
+    def test_normalize_host_refuses_invisible_characters(self) -> None:
+        for invisible in (ZWSP, SOFT_HYPHEN, CGJ, "‍", "⁠", "﻿", "‮"):
+            with self.subTest(invisible=hex(ord(invisible))):
+                self.assertIsNone(PolicyEngine._normalize_host(f"comp{invisible}any.com"))
+
+    def test_normalize_host_refuses_every_format_character(self) -> None:
+        for code in range(sys.maxunicode + 1):
+            char = chr(code)
+            if unicodedata.category(char) != "Cf":
+                continue
+            with self.subTest(code=hex(code)):
+                self.assertIsNone(PolicyEngine._normalize_host(f"comp{char}any.com"))
+
+    def test_normalize_host_keeps_visible_unicode_hosts(self) -> None:
+        self.assertEqual(PolicyEngine._normalize_host("münchen.example"), "xn--mnchen-3ya.example")
+        self.assertEqual(
+            PolicyEngine._normalize_host(f"c{CYRILLIC_O}mpany.com"), "xn--cmpany-wqf.com"
+        )
+
     def test_normalize_host_never_raises_on_bad_labels(self) -> None:
         for value in ("", "a..b", "." * 5, "x" * 80 + ".example", "\udcff.example"):
             with self.subTest(value=value):
@@ -436,6 +459,24 @@ class TestDomainAllowlistHosts(unittest.TestCase):
                 with self.subTest(value=value):
                     self._assert(engine, {"url": value}, PolicyAction.ALLOW)
             self._assert(engine, {"url": "http://127.0.0.2/x"}, PolicyAction.REQUIRE_APPROVAL)
+
+    def test_invisible_character_in_host_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), ["company.com"], field="to")
+            self._assert(engine, {"to": "dev@company.com"}, PolicyAction.ALLOW)
+            for invisible in (ZWSP, SOFT_HYPHEN, CGJ):
+                with self.subTest(invisible=hex(ord(invisible))):
+                    self._assert(
+                        engine,
+                        {"to": f"dev@comp{invisible}any.com"},
+                        PolicyAction.REQUIRE_APPROVAL,
+                    )
+
+    def test_invisible_character_in_allowlist_entry_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir), [f"comp{ZWSP}any.com"], field="to")
+            self.assertEqual(set(), engine._rules[0].conditions[0].allowed_domains)
+            self._assert(engine, {"to": "dev@company.com"}, PolicyAction.REQUIRE_APPROVAL)
 
     def test_unparseable_value_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -614,8 +655,10 @@ class TestDomainAllowlistIsNeverNormalized(unittest.TestCase):
 
     Folding a Cyrillic-o spelling of an allowlisted domain onto its ASCII spelling
     would make an attacker's confusable domain pass. The correct treatment for an
-    allowlist is the inverse, flagging mixed-script hosts, and belongs in a
-    follow-up. These tests exist so nobody "fixes" this by reflex.
+    allowlist is the inverse, flagging the suspicious host, which is what
+    _normalize_host does for an invisible character; flagging mixed-script hosts
+    is the same move and still belongs in a follow-up. These tests exist so nobody
+    "fixes" this by reflex.
     """
 
     def _engine(self, root: Path, *, settings: dict | None = None) -> PolicyEngine:
@@ -653,6 +696,14 @@ class TestDomainAllowlistIsNeverNormalized(unittest.TestCase):
             self.assertNotEqual("alice@company.com", spoofed)
             decision = engine.evaluate("email_send", {"to": spoofed})
             self.assertEqual(PolicyAction.REQUIRE_APPROVAL, decision.action)
+
+    def test_invisible_host_is_flagged_while_confusable_stays_unfolded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = self._engine(Path(tmpdir))
+            for spoofed in (f"alice@comp{ZWSP}any.com", f"alice@c{CYRILLIC_O}mpany.com"):
+                with self.subTest(spoofed=ascii(spoofed)):
+                    decision = engine.evaluate("email_send", {"to": spoofed})
+                    self.assertEqual(PolicyAction.REQUIRE_APPROVAL, decision.action)
 
     def test_allowlisted_and_external_hosts_are_unaffected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
