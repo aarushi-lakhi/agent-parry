@@ -314,6 +314,11 @@ class AttackPayload(BaseModel):
     order against the same target instead of issuing ``arguments`` as a single
     call. Empty for a single-step payload, so every payload and every persisted
     report written before sequences existed still validates.
+
+    ``known_gap`` marks a payload no detection exists for yet. Those still run and
+    still appear in the report, but they are held out of ``detection_rate`` unless
+    asked for, so landing a batch of them cannot silently collapse the number CI
+    gates on.
     """
 
     id: str
@@ -325,6 +330,7 @@ class AttackPayload(BaseModel):
     severity: str = "low"
     description: str = ""
     steps: list[AttackStep] = Field(default_factory=list)
+    known_gap: bool = False
 
 
 class AttackStepResult(BaseModel):
@@ -374,6 +380,10 @@ class ConfusionMatrix(BaseModel):
     fenced instead of blocking or redacting, whatever they scored. Without it a
     neutralize against an ``expected_behavior: block`` payload is a bare
     false_negative, indistinguishable from a payload nothing touched.
+
+    ``known_gap`` also cuts across: it counts ``known_gap`` payloads whether or
+    not they were folded into the other five, so a report can never show a
+    detection rate without showing how many payloads it declined to grade.
     """
 
     true_block: int = 0
@@ -382,6 +392,7 @@ class ConfusionMatrix(BaseModel):
     false_positive: int = 0
     indeterminate: int = 0
     neutralized: int = 0
+    known_gap: int = 0
 
     @property
     def attack_total(self) -> int:
@@ -449,6 +460,8 @@ class ScanReport(BaseModel):
     matrix: ConfusionMatrix | None = None
     attack_total: int = 0
     benign_total: int = 0
+    known_gap_total: int = 0
+    include_known_gaps: bool = False
 
 
 class ProxyStats(BaseModel):

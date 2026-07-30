@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import unittest
+from typing import Any
 
 from fastapi.testclient import TestClient
 
-from src.inspector import MetadataInspector
-from src.mock_server import POISONED_TOOL_NAME, app
+from src.inspector import MetadataInspector, OutputInspector
+from src.mock_server import BUILD_LOG_PATH, CLEAR_SCREEN, POISONED_TOOL_NAME, app
+from src.scanner import map_yaml_tool_to_server
 
 
 class TestMockServer(unittest.TestCase):
@@ -212,6 +215,81 @@ class TestMockServer(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["error"]["code"], -32602)
         self.assertIn("Invalid params", payload["error"]["message"])
+
+class TestHttpFetchStub(unittest.TestCase):
+    """http_fetch must never touch the network, and must feed the redaction path."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def _fetch(self, url: object, req_id: int = 20) -> dict[str, Any]:
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": "http_fetch", "arguments": {"url": url}},
+            },
+        )
+        payload: dict[str, Any] = response.json()
+        return payload
+
+    def test_http_fetch_is_advertised_with_a_url_argument(self) -> None:
+        response = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        by_name = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
+        self.assertIn("http_fetch", by_name)
+        self.assertEqual(["url"], by_name["http_fetch"]["inputSchema"]["required"])
+
+    def test_an_ordinary_url_performs_no_network_io(self) -> None:
+        result = self._fetch("https://api.company.com/v1/status")["result"]
+        self.assertEqual(200, result["status"])
+        self.assertIn("no network I/O performed", result["body"])
+
+    def test_aws_metadata_host_returns_a_redactable_credential(self) -> None:
+        result = self._fetch("http://169.254.169.254/latest/meta-data/iam/")["result"]
+        document = json.loads(result["body"])
+        self.assertTrue(document["AccessKeyId"].startswith("AKIA"))
+        sanitized, findings = OutputInspector().inspect("http_fetch", result)
+        self.assertTrue(findings)
+        self.assertIn("[REDACTED-AWS_KEY]", sanitized["body"])
+
+    def test_gcp_metadata_host_returns_a_token_nothing_matches(self) -> None:
+        url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/"
+        result = self._fetch(url)["result"]
+        self.assertIn("access_token", json.loads(result["body"]))
+        _sanitized, findings = OutputInspector().inspect("http_fetch", result)
+        self.assertEqual([], findings)
+
+    def test_obfuscated_metadata_hosts_are_not_resolved(self) -> None:
+        for url in (
+            "http://2852039166/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+        ):
+            with self.subTest(url=url):
+                self.assertIn("no network I/O performed", self._fetch(url)["result"]["body"])
+
+    def test_a_non_string_url_is_invalid_params(self) -> None:
+        error = self._fetch(42)["error"]
+        self.assertEqual(-32602, error["code"])
+        self.assertIn("http_fetch", error["message"])
+
+    def test_build_log_carries_terminal_escapes(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": {"name": "file_read", "arguments": {"path": BUILD_LOG_PATH}},
+            },
+        )
+        content = response.json()["result"]["content"]
+        self.assertIn(CLEAR_SCREEN, content)
+        self.assertIn("Deploy approved", content)
+
+    def test_http_fetch_maps_onto_a_differently_named_fetch_tool(self) -> None:
+        self.assertEqual("fetchUrl", map_yaml_tool_to_server("http_fetch", ["fetchUrl"]))
 
 
 if __name__ == "__main__":
