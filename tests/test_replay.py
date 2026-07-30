@@ -185,6 +185,128 @@ def _seed_mixed_log(tmp_path: Path) -> Path:
     return tmp_path / "audit.jsonl"
 
 
+def _seed_response_side_log(tmp_path: Path) -> Path:
+    writer = _writer(tmp_path)
+    _emit(
+        writer,
+        action=AuditAction.REDACT_METADATA,
+        direction=AuditDirection.SERVER_TO_CLIENT,
+        method="tools/list",
+        detail="redact: 2 poisoned metadata finding(s) tools=notes_write",
+        findings=[Finding(severity="high", description="metadata injection", field="description")],
+    )
+    _emit(
+        writer,
+        action=AuditAction.BLOCK_METADATA,
+        direction=AuditDirection.SERVER_TO_CLIENT,
+        method="tools/list",
+        detail="block: 1 poisoned metadata finding(s)",
+    )
+    _emit(
+        writer,
+        action=AuditAction.NEUTRALIZE_RESULT,
+        direction=AuditDirection.SERVER_TO_CLIENT,
+        method="tools/call",
+        tool="file_read",
+        detail="neutralize: fenced 1 injected tool result",
+    )
+    _emit(
+        writer,
+        action=AuditAction.BLOCK_RESULT_INJECTION,
+        direction=AuditDirection.SERVER_TO_CLIENT,
+        method="tools/call",
+        tool="file_read",
+        detail="block: injected tool result",
+    )
+    _emit(
+        writer,
+        action=AuditAction.REDACT_OUTPUT,
+        direction=AuditDirection.SERVER_TO_CLIENT,
+        method="tools/call",
+        tool="pii_tool",
+        pii_redactions=3,
+    )
+    _emit(writer, action=AuditAction.ALLOW, method="tools/call", tool="file_read", arguments={"path": "a"})
+    writer.close()
+    return tmp_path / "audit.jsonl"
+
+
+def test_every_audit_action_falls_in_exactly_one_reported_group() -> None:
+    groups = (
+        replay.POLICY_SCOPE_ACTIONS,
+        replay.UNPOLICED_INPUT_ACTIONS,
+        replay.RESULT_ACTIONS,
+        replay.METADATA_ACTIONS,
+        replay.OUTPUT_ACTIONS,
+    )
+    union: set[AuditAction] = set()
+    for group in groups:
+        assert not (union & group)
+        union |= set(group)
+    assert union == set(AuditAction)
+    assert union >= replay.BLOCKING_ACTIONS
+
+
+def test_every_audit_action_is_summarized_without_an_other_bucket(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    for action in AuditAction:
+        _emit(writer, action=action, method="tools/call", tool="shell_exec")
+    writer.close()
+    summary = replay.summarize(replay.read_log(tmp_path / "audit.jsonl"))
+    assert summary.records == len(list(AuditAction))
+    assert set(summary.actions) == {action.value for action in AuditAction}
+    assert all(count == 1 for count in summary.actions.values())
+
+
+def test_response_side_actions_are_counted_by_kind(tmp_path: Path) -> None:
+    summary = replay.summarize(replay.read_log(_seed_response_side_log(tmp_path)))
+    side = summary.response_side
+    assert side.total == 5
+    assert side.metadata_redacted == 1
+    assert side.metadata_blocked == 1
+    assert side.result_neutralized == 1
+    assert side.result_injection_blocked == 1
+    assert side.output_redacted == 1
+    assert side.pii_redactions == 3
+    assert side.tools == {"file_read": 2, "pii_tool": 1}
+    assert side.methods == {"tools/list": 2}
+
+
+def test_metadata_and_result_blocks_count_as_blocks_in_the_histogram(tmp_path: Path) -> None:
+    summary = replay.summarize(replay.read_log(_seed_response_side_log(tmp_path)))
+    assert summary.buckets[0].blocks == 2
+    assert summary.buckets[0].response_side == 5
+
+
+def test_response_side_decisions_are_rendered(tmp_path: Path) -> None:
+    log = replay.read_log(_seed_response_side_log(tmp_path))
+    text = replay.render_text(replay.build_report(log))
+    assert "Response-side decisions" in text
+    assert "tool metadata: 1 blocked, 1 redacted" in text
+    assert "tool results: 1 blocked, 1 neutralized" in text
+    assert AuditAction.BLOCK_RESULT_INJECTION.value in text
+
+
+def test_response_side_records_are_out_of_scope_broken_down_by_action(tmp_path: Path) -> None:
+    log = replay.read_log(_seed_response_side_log(tmp_path))
+    diff = replay.replay_policy(log, _policy(tmp_path, "p.yaml", CANDIDATE_POLICY))
+    assert diff.considered == 1
+    assert diff.out_of_scope == 5
+    assert diff.out_of_scope_actions == {
+        AuditAction.REDACT_METADATA.value: 1,
+        AuditAction.BLOCK_METADATA.value: 1,
+        AuditAction.NEUTRALIZE_RESULT.value: 1,
+        AuditAction.BLOCK_RESULT_INJECTION.value: 1,
+        AuditAction.REDACT_OUTPUT.value: 1,
+    }
+
+
+def test_classify_will_not_verdict_an_action_no_rule_produced() -> None:
+    for action in replay.RESPONSE_SIDE_ACTIONS | replay.UNPOLICED_INPUT_ACTIONS:
+        assert replay.classify(action, PolicyAction.BLOCK) == replay.VERDICT_INDETERMINATE
+        assert replay.classify(action, PolicyAction.ALLOW) == replay.VERDICT_INDETERMINATE
+
+
 def test_reader_recovers_every_record(tmp_path: Path) -> None:
     path = _seed_mixed_log(tmp_path)
     log = replay.read_log(path)
@@ -430,6 +552,39 @@ def test_removing_a_load_bearing_rule_shows_up(tmp_path: Path) -> None:
     assert no_longer.new_action == "ALLOW"
 
 
+def test_samples_carry_a_run_id_because_seq_restarts_per_run(tmp_path: Path) -> None:
+    path = _seed_mixed_log(tmp_path)
+    baseline = _policy(tmp_path, "baseline.yaml", BASELINE_POLICY)
+    candidate = _policy(tmp_path, "candidate.yaml", CANDIDATE_POLICY)
+    log = replay.read_log(path)
+    diff = replay.replay_policy(log, candidate, baseline_path=baseline)
+    assert diff.samples
+    for change in diff.samples:
+        assert len(change.run) == replay.RUN_ID_CHARS
+    text = replay._render_diff(diff)
+    assert any("run=" in line for line in text)
+
+
+def test_sample_list_honors_the_cap(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    for index in range(5):
+        _emit(
+            writer,
+            action=AuditAction.ALLOW,
+            method="tools/call",
+            tool="notes_write",
+            arguments={"text": str(index)},
+        )
+    writer.close()
+    log = replay.read_log(tmp_path / "audit.jsonl")
+    candidate = _policy(tmp_path, "candidate.yaml", CANDIDATE_POLICY)
+    assert len(replay.replay_policy(log, candidate).samples) == 5
+    capped = replay.build_report(log, candidate_policy=candidate, max_samples=2)
+    assert capped.diff is not None
+    assert len(capped.diff.samples) == 2
+    assert capped.diff.counts[replay.VERDICT_NEWLY_BLOCKED] == 5
+
+
 def test_out_of_scope_records_are_not_replayed(tmp_path: Path) -> None:
     path = _seed_mixed_log(tmp_path)
     log = replay.read_log(path)
@@ -470,11 +625,41 @@ def test_cli_replay_prints_the_report(tmp_path: Path, capsys: pytest.CaptureFixt
 
 
 def test_cli_replay_json_format_round_trips(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    path = _seed_mixed_log(tmp_path)
+    path = _seed_response_side_log(tmp_path)
     assert cli.cmd_replay(_replay_args("--log", str(path), "--format", "json")) == cli.EXIT_OK
     payload = json.loads(capsys.readouterr().out)
-    assert payload["summary"]["fail_open"] == 1
+    assert payload["summary"]["fail_open"] == 0
+    assert payload["summary"]["response_side"]["metadata_blocked"] == 1
+    assert payload["summary"]["response_side"]["result_neutralized"] == 1
     assert payload["diff"] is None
+
+
+def test_cli_replay_max_samples_caps_the_list(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    writer = _writer(tmp_path)
+    for index in range(4):
+        _emit(
+            writer,
+            action=AuditAction.ALLOW,
+            method="tools/call",
+            tool="notes_write",
+            arguments={"text": str(index)},
+        )
+    writer.close()
+    candidate = _policy(tmp_path, "candidate.yaml", CANDIDATE_POLICY)
+    args = _replay_args(
+        "--log",
+        str(tmp_path / "audit.jsonl"),
+        "--against",
+        str(candidate),
+        "--max-samples",
+        "1",
+        "--format",
+        "json",
+    )
+    assert cli.cmd_replay(args) == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["diff"]["samples"]) == 1
+    assert payload["diff"]["counts"]["newly_blocked"] == 4
 
 
 def test_cli_replay_defaults_to_the_configured_audit_path(
