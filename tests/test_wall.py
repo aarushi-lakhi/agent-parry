@@ -64,20 +64,43 @@ def _run_checks() -> list[CheckResult]:
     with httpx.Client(timeout=10.0) as client:
         _require_server_health(client)
 
-        # 1) tools/list -> should return 3 tools
+        # 1) tools/list -> the three baseline tools survive discovery
         list_payload = _rpc_request(client, req_id=1, method="tools/list")
         tools = _result_obj(list_payload).get("tools", [])
-        passed = isinstance(tools, list) and len(tools) == 3
+        names = {t.get("name") for t in tools if isinstance(t, dict)} if isinstance(tools, list) else set()
+        baseline = {"email_send", "shell_exec", "file_read"}
         results.append(
             CheckResult(
                 name="tools/list pass-through",
-                expected="3 tools returned",
-                actual=f"{len(tools) if isinstance(tools, list) else 'invalid'} tools",
-                passed=passed,
+                expected="email_send, shell_exec, file_read returned",
+                actual=f"{len(names)} tools: {', '.join(sorted(str(n) for n in names))}",
+                passed=baseline <= names,
             )
         )
 
-        # 2) shell_exec ls -la -> ALLOW
+        results.append(
+            CheckResult(
+                name="tools/list metadata poisoning",
+                expected="customer_lookup dropped from the catalogue",
+                actual="dropped" if "customer_lookup" not in names else "still advertised",
+                passed="customer_lookup" not in names,
+            )
+        )
+
+        # 3) initialize instructions are inspected before the client sees them
+        init_payload = _rpc_request(client, req_id=99, method="initialize")
+        instructions = str(_result_obj(init_payload).get("instructions", ""))
+        clean = "IMPORTANT" not in instructions and "mcp.json" not in instructions
+        results.append(
+            CheckResult(
+                name="initialize instructions inspected",
+                expected="poisoned instructions removed",
+                actual="removed" if clean else f"leaked: {instructions[:60]}",
+                passed=clean,
+            )
+        )
+
+        # 4) shell_exec ls -la -> ALLOW
         allow_payload = _rpc_request(
             client,
             req_id=2,
@@ -96,7 +119,7 @@ def _run_checks() -> list[CheckResult]:
             )
         )
 
-        # 3) shell_exec rm -rf / -> BLOCK
+        # 5) shell_exec rm -rf / -> BLOCK
         block_rm_payload = _rpc_request(
             client,
             req_id=3,
@@ -114,7 +137,7 @@ def _run_checks() -> list[CheckResult]:
             )
         )
 
-        # 4) shell_exec curl | bash -> BLOCK
+        # 6) shell_exec curl | bash -> BLOCK
         block_curl_payload = _rpc_request(
             client,
             req_id=4,
@@ -132,7 +155,7 @@ def _run_checks() -> list[CheckResult]:
             )
         )
 
-        # 5) email_send external -> REQUIRE_APPROVAL (via stats increment)
+        # 7) email_send external -> REQUIRE_APPROVAL (via stats increment)
         stats_before = _get_stats(client)
         approval_payload = _rpc_request(
             client,
@@ -164,7 +187,7 @@ def _run_checks() -> list[CheckResult]:
             )
         )
 
-        # 6) file_read contacts -> SSN REDACTED
+        # 8) file_read contacts -> SSN REDACTED
         redact_payload = _rpc_request(
             client,
             req_id=6,
@@ -184,7 +207,7 @@ def _run_checks() -> list[CheckResult]:
             )
         )
 
-        # 7) email_send injection body -> BLOCK
+        # 9) email_send injection body -> BLOCK
         injection_payload = _rpc_request(
             client,
             req_id=7,
