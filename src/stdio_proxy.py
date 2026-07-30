@@ -13,8 +13,8 @@ import threading
 from pathlib import Path
 from typing import Any, TextIO
 
-from src.inspector import InputInspector, OutputInspector
-from src.models import PolicyAction
+from src.inspector import InputInspector, OutputInspector, ResultInspector
+from src.models import INJECTION_BLOCK_ERROR_CODE, RESULT_INJECTION_ERROR_CODE, PolicyAction
 from src.policy import PolicyEngine
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -184,10 +184,12 @@ class StdioMcpProxy:
         input_inspector: InputInspector,
         output_inspector: OutputInspector,
         stdout_lock: asyncio.Lock,
+        result_inspector: ResultInspector | None = None,
     ) -> None:
         self._policy = policy_engine
         self._input_inspector = input_inspector
         self._output_inspector = output_inspector
+        self._result_inspector = result_inspector or ResultInspector()
         self._stdout_lock = stdout_lock
         self._pending_forwarded: dict[Any, str] = {}
         self._pending_tools: dict[Any, str] = {}
@@ -289,7 +291,7 @@ class StdioMcpProxy:
                 await self.write_stdout(
                     _error_response(
                         req_id,
-                        code=-32001,
+                        code=INJECTION_BLOCK_ERROR_CODE,
                         message="Blocked: critical prompt injection pattern detected",
                     )
                 )
@@ -311,7 +313,7 @@ class StdioMcpProxy:
                     await self.write_stdout(
                         _error_response(
                             req_id,
-                            code=-32001,
+                            code=INJECTION_BLOCK_ERROR_CODE,
                             message=decision.message or "Blocked by policy",
                         )
                     )
@@ -360,18 +362,43 @@ class StdioMcpProxy:
                 try:
                     sanitized, pii_findings = self._output_inspector.inspect(tool_name, result)
                     if pii_findings:
-                        msg = dict(msg)
-                        msg["result"] = sanitized
                         self._log_line(
                             "server→client",
                             "tools/call",
                             "redact",
                             f"{len(pii_findings)} finding(s) tool={tool_name}",
                         )
+                    # PII first, so the injection scan sees what the model will see.
+                    inspection = self._result_inspector.inspect(tool_name, sanitized)
+                    if inspection.blocked:
+                        msg = {
+                            "jsonrpc": msg.get("jsonrpc", "2.0"),
+                            "id": rid,
+                            "error": {
+                                "code": RESULT_INJECTION_ERROR_CODE,
+                                "message": inspection.block_message,
+                            },
+                        }
+                        self._log_line(
+                            "server→client",
+                            "tools/call",
+                            "block",
+                            f"result injection tool={tool_name} findings={len(inspection.findings)}",
+                        )
+                    elif pii_findings or inspection.findings:
+                        msg = dict(msg)
+                        msg["result"] = inspection.result
+                        if inspection.findings:
+                            self._log_line(
+                                "server→client",
+                                "tools/call",
+                                inspection.action,
+                                f"result injection tool={tool_name} findings={len(inspection.findings)}",
+                            )
                     else:
                         self._log_line("server→client", "tools/call", "allow", f"tool={tool_name}")
                 except Exception:
-                    logger.exception("OutputInspector failed for %s; forwarding raw (fail-open)", tool_name)
+                    logger.exception("Result inspection failed for %s; forwarding raw (fail-open)", tool_name)
                     self._log_line("server→client", "tools/call", "allow", "inspect_error_fail_open")
             else:
                 self._log_line("server→client", "tools/call", "allow", "non-dict result")
@@ -474,6 +501,7 @@ async def _run_proxy(argv: list[str]) -> int:
         policy_engine = PolicyEngine(policy_path=str(policy_path))
         input_inspector = InputInspector()
         output_inspector = OutputInspector()
+        result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
     except Exception:
         logger.exception("Failed to initialize policy/inspectors; exiting")
         return 1
@@ -499,6 +527,7 @@ async def _run_proxy(argv: list[str]) -> int:
         policy_engine=policy_engine,
         input_inspector=input_inspector,
         output_inspector=output_inspector,
+        result_inspector=result_inspector,
         stdout_lock=stdout_lock,
     )
 

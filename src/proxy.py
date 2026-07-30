@@ -22,8 +22,16 @@ from rich.console import Console
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
-from src.inspector import InputInspector, OutputInspector
-from src.models import MOCK_SERVER_URL, JsonRpcRequest, JsonRpcResponse, PolicyAction, ProxyStats
+from src.inspector import InputInspector, OutputInspector, ResultInspector
+from src.models import (
+    INJECTION_BLOCK_ERROR_CODE,
+    MOCK_SERVER_URL,
+    RESULT_INJECTION_ERROR_CODE,
+    JsonRpcRequest,
+    JsonRpcResponse,
+    PolicyAction,
+    ProxyStats,
+)
 from src.policy import PolicyEngine
 
 app = FastAPI(title="AgentParry Proxy", version="1.0")
@@ -31,6 +39,7 @@ console = Console()
 policy_engine = PolicyEngine()
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
+result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
 stats = ProxyStats()
 _bypass_all: bool = False
 
@@ -192,6 +201,10 @@ def _log_inject(tool_name: str) -> None:
     _print_log_line(f"[INJECT]  {tool_name:<10} prompt injection detected (critical)")
 
 
+def _log_result_inject(tool_name: str, action: str, count: int) -> None:
+    _print_log_line(f"[RESULT]  {tool_name:<10} {action}: {count} injection finding(s) in tool result")
+
+
 def _get_tool_payload(request: JsonRpcRequest) -> tuple[str | None, dict[str, Any] | None]:
     params = request.params or {}
     tool_name = params.get("name")
@@ -267,7 +280,7 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
         _log_inject(tool_name)
         return _jsonrpc_error(
             request_id=request.id,
-            code=-32001,
+            code=INJECTION_BLOCK_ERROR_CODE,
             message="Blocked: critical prompt injection pattern detected",
         )
 
@@ -277,7 +290,7 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
         _log_block(tool_name, arguments, decision.rule_name or "policy_block")
         return _jsonrpc_error(
             request_id=request.id,
-            code=-32001,
+            code=INJECTION_BLOCK_ERROR_CODE,
             message=decision.message or "Blocked by policy",
         )
 
@@ -302,8 +315,23 @@ def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> Json
     if pii_findings:
         stats.increment(redacted=1)
         _log_redact(tool_name, len(pii_findings))
-        upstream_payload["result"] = sanitized_result
 
+    # PII first, so the injection scan sees the text the model will actually see.
+    inspection = result_inspector.inspect(tool_name, sanitized_result)
+    if inspection.findings:
+        stats.increment(result_injections=1)
+        if inspection.action in ("neutralize", "redact"):
+            stats.increment(neutralized=1)
+        _log_result_inject(tool_name, inspection.action, len(inspection.findings))
+    if inspection.blocked:
+        stats.increment(blocked=1)
+        return _jsonrpc_error(
+            request_id=request.id,
+            code=RESULT_INJECTION_ERROR_CODE,
+            message=inspection.block_message,
+        )
+
+    upstream_payload["result"] = inspection.result
     return JsonRpcResponse.model_validate(upstream_payload)
 
 
@@ -350,7 +378,9 @@ def enable_policy() -> dict[str, str]:
 
 @app.post("/policy/reload")
 def reload_policy() -> dict[str, Any]:
+    global result_inspector
     policy_engine.reload()
+    result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
     return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
 
 
