@@ -9,6 +9,7 @@ AgentParry helps you **scan**, **protect**, and **verify** autonomous AI agents 
 - **Audit log** (`src/audit.py`): one JSONL line per policy decision, same schema from both transports.
 - **Replay** (`agentparry replay`): reads the audit log back, reports what actually happened, and gates CI on `FAIL_OPEN`.
 - **Closed loop** (`agentparry harden` / `agentparry verify`): scan, generate policy rules from the findings, re-scan, and report both what got fixed and what the new rules broke.
+- **Policy linter** (`agentparry lint-policy`): predicts which rules over-block, offline, by evaluating each rule against a benign payload corpus and by reading its regexes. `harden` refuses to write rules that fail it.
 
 ## Stdio proxy (Claude / MCP)
 
@@ -131,6 +132,8 @@ Before writing, `harden` backs the policy up to a `.bak` sibling, prints a unifi
 | `--full` | Re-run the whole payload set after applying rules instead of replaying only what got through. The CI mode |
 | `--max-vulns N` | Tolerate up to N remaining vulnerabilities before exiting 3 |
 | `--no-reload` | Skip the `POST /policy/reload` attempt |
+| `--force` | Write even when the new rules introduce a high-severity lint finding |
+| `--no-lint` | Skip the over-block lint entirely |
 
 `verify` requires `--before` pointing at a saved scan JSON. A baseline scanned in the same invocation would be taken after the rules landed, so the comparison would always look clean. `--target` defaults to the before report's `target_url`. A `--safe` before report has no passed-through results to replay, so `verify` refuses it without `--full`.
 
@@ -145,9 +148,40 @@ Exit codes, since both are meant for CI:
 | 0 | Clean |
 | 1 | Error |
 | 2 | Bad command line |
-| 3 | Vulnerabilities remain above `--max-vulns`, or a regression was detected |
+| 3 | Vulnerabilities remain above `--max-vulns`, a regression was detected, or `harden` refused the write |
 | 4 | `harden` aborted at the confirmation prompt |
 | 130 | Interrupted |
+
+## Policy linting
+
+`agentparry lint-policy` predicts which rules over-block **before** the policy ships. Offline: no proxy, no network, no MCP server.
+
+```bash
+agentparry lint-policy                                   # committed policy + benign corpus
+agentparry lint-policy --no-corpus                       # generated benign strings only
+agentparry lint-policy --format json --fail-on high      # CI
+```
+
+Two halves. The **empirical** half writes each rule to a one-rule policy, loads it with a real `PolicyEngine`, evaluates it against the nine `category: benign` payloads in `attacks/payloads.yaml`, and reports the matched span of every benign block. One rule at a time, because `evaluate` is first-match-wins and would otherwise attribute a payload to whichever rule happens to be first. The **static** half walks each pattern's parse tree and reports shapes that over-block: unanchored short literals, generic classes with a low repetition floor, unbounded `.*` bridges, patterns matching the empty string, empty domain allowlists, autogen rules that cannot match their originating payload, and ReDoS-shaped nesting.
+
+The committed `config/default_policy.yaml` is clean: 0 of 9 benign payloads blocked and no high-severity finding, which is what CI gates on. It was not, and the three rules the linter named are what got fixed: `autogen_pi-003` blocked any 40-character alphanumeric run and now matches its payload's decoded plaintext, `autogen_pi-004` blocked `disregard.*rules` and now needs a scoped instruction object, and `block_dangerous_shell` blocked `sudo\s+` as a substring and now needs a command position. `flag_external_email` on `bn-002` is reported separately as friction rather than a block, because `REQUIRE_APPROVAL` logs and allows over stdio.
+
+**Gate CI on high severity. Treat medium as review advice.** At `--fail-on high` the committed policy passes; at `--fail-on medium` it names 5 of 7 rules, which is the useless-linter mode. The report measures its own noise for that reason: with the high findings fixed, 100% of the rules still flagged are unconfirmed, all of them at medium or low.
+
+The empirical half is the one that earns its place. `sudo\s+` produced **no static finding at all** (a 4-character literal that no ordinary word contains), so a static-only linter ships that bug. What it does not cover: no cross-rule analysis, so first-match-wins shadowing is invisible; no schema awareness, since that would need `tools/list`; ReDoS is a timed growth estimate, not a proof; no shell parsing, so a dangerous command quoted after a real separator still matches; and generated probe strings are evidence of a shape, not measured traffic. Nine benign payloads across three mock tools is nowhere near a real corpus, and "no benign block" is weak evidence rather than a clean sheet.
+
+Both halves run under the policy's own `settings.normalization` block and per-rule `normalize:` overrides, so a rule that matches only in the canonical view is reported with that view and a span back in the original argument. `result_inspection` and `metadata_inspection` get static checks only, flagging actions that discard a tool call or a tool on a false positive; there is no benign corpus of tool results or tool metadata to measure them against, and the report says so.
+
+`agentparry harden` runs the same lint on the rules it is about to write and refuses the merge when it introduces a high-severity finding. The comparison is against a lint of the current file, so a policy that already over-blocks does not make every later run unwritable.
+
+| Flag | Meaning |
+|---|---|
+| `--policy PATH` | Policy YAML to lint (default: `config/default_policy.yaml`) |
+| `--payloads PATH` | Payload YAML holding the benign corpus |
+| `--no-corpus` | Skip the payload file and rely on generated benign strings |
+| `--no-probes` | Static checks and corpus only |
+| `--fail-on {high,medium,low,never}` | Lowest severity that exits 3 (default: `high`) |
+| `--format {text,json}` | Report format |
 
 ## HTTP proxy
 

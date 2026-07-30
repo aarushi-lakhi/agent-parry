@@ -111,14 +111,6 @@ class PolicyAction(str, Enum):
     REDACT_OUTPUT = "REDACT_OUTPUT"
 
 
-class PolicyDecision(BaseModel):
-    """Represents the final policy decision for a request."""
-
-    action: PolicyAction = PolicyAction.ALLOW
-    rule_name: str | None = None
-    message: str = ""
-
-
 class Finding(BaseModel):
     """Represents an individual security finding from policy checks.
 
@@ -142,6 +134,21 @@ class Finding(BaseModel):
         if value is None or len(value) <= MATCHED_TEXT_LIMIT:
             return value
         return value[:MATCHED_TEXT_LIMIT]
+
+
+class PolicyDecision(BaseModel):
+    """Represents the final policy decision for a request.
+
+    ``findings`` carries the matches that produced the decision, each with the
+    normalized view it was seen in and the span mapped back to the original
+    argument. Defaulted empty, so a caller that only reads the action is
+    unaffected and an ALLOW stays cheap.
+    """
+
+    action: PolicyAction = PolicyAction.ALLOW
+    rule_name: str | None = None
+    message: str = ""
+    findings: list[Finding] = Field(default_factory=list)
 
 
 AUDIT_SCHEMA_VERSION = 1
