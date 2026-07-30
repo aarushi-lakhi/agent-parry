@@ -6,12 +6,14 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 PROXY_PORT = 9090
 MOCK_SERVER_PORT = 8080
 PROXY_URL = "http://127.0.0.1:9090/mcp"
 MOCK_SERVER_URL = "http://127.0.0.1:8080/mcp"
+
+MATCHED_TEXT_LIMIT = 120
 
 
 class JsonRpcRequest(BaseModel):
@@ -58,12 +60,28 @@ class PolicyDecision(BaseModel):
 
 
 class Finding(BaseModel):
-    """Represents an individual security finding from policy checks."""
+    """Represents an individual security finding from policy checks.
+
+    ``view``, ``matched_text`` and ``span`` describe where a match was found once
+    normalization is in play. All three are defaulted so persisted scan-report
+    JSON written before they existed still validates.
+    """
 
     severity: Literal["low", "medium", "high", "critical"] = "low"
     description: str = ""
     field: str | None = None
     matched_pattern: str | None = None
+    view: str = "original"
+    matched_text: str | None = None
+    span: tuple[int, int] | None = None
+
+    @field_validator("matched_text")
+    @classmethod
+    def _truncate_matched_text(cls, value: str | None) -> str | None:
+        """Cap quoted input so a finding cannot carry a whole payload into logs."""
+        if value is None or len(value) <= MATCHED_TEXT_LIMIT:
+            return value
+        return value[:MATCHED_TEXT_LIMIT]
 
 
 class AttackPayload(BaseModel):
@@ -159,6 +177,7 @@ class ProxyStats(BaseModel):
 
 
 __all__ = [
+    "MATCHED_TEXT_LIMIT",
     "MOCK_SERVER_PORT",
     "MOCK_SERVER_URL",
     "PROXY_PORT",
