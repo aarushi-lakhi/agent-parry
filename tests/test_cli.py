@@ -1,15 +1,108 @@
-"""CLI behavior (argv construction, report-only scan)."""
+"""CLI behavior (argv construction, report-only scan, harden and verify)."""
 
 from __future__ import annotations
 
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from src import cli
+from src.models import AttackPayload, AttackResult, ScanReport
+
+LOCAL_TARGET = "http://127.0.0.1:9090/mcp"
+
+
+def _payload(
+    payload_id: str,
+    *,
+    category: str = "privilege_escalation",
+    tool: str = "shell_exec",
+    expected: str = "block",
+    arguments: dict[str, Any] | None = None,
+) -> AttackPayload:
+    return AttackPayload(
+        id=payload_id,
+        name=f"payload {payload_id}",
+        category=category,
+        tool=tool,
+        arguments=arguments if arguments is not None else {"command": "chmod +s /bin/bash"},
+        expected_behavior=expected,
+        severity="high",
+        description="",
+    )
+
+
+def _vulnerable(payload_id: str = "pe-004", **kwargs: Any) -> AttackResult:
+    return AttackResult(
+        payload=_payload(payload_id, **kwargs),
+        passed_through=True,
+        observed_behavior="allow",
+        outcome="false_negative",
+        notes="Passed through unblocked",
+    )
+
+
+def _blocked(payload_id: str = "pe-001", **kwargs: Any) -> AttackResult:
+    return AttackResult(
+        payload=_payload(payload_id, **kwargs),
+        was_blocked=True,
+        observed_behavior="block",
+        outcome="true_block",
+        notes="Blocked by proxy",
+    )
+
+
+def _benign_allowed(payload_id: str = "bn-001") -> AttackResult:
+    return AttackResult(
+        payload=_payload(payload_id, category="benign", expected="allow"),
+        passed_through=True,
+        observed_behavior="allow",
+        outcome="true_allow",
+        notes="Passed through unblocked",
+    )
+
+
+def _benign_blocked(payload_id: str = "bn-001") -> AttackResult:
+    return AttackResult(
+        payload=_payload(payload_id, category="benign", expected="allow"),
+        was_blocked=True,
+        observed_behavior="block",
+        outcome="false_positive",
+        notes="Blocked by proxy",
+    )
+
+
+def _safe_allowed(payload_id: str = "pe-004", **kwargs: Any) -> AttackResult:
+    return AttackResult(
+        payload=_payload(payload_id, **kwargs),
+        evaluated_only=True,
+        passed_through=False,
+        observed_behavior="evaluated",
+        outcome="false_negative",
+        notes="Safe scan: policy allowed; upstream not executed",
+    )
+
+
+def _report(
+    results: list[AttackResult],
+    *,
+    target: str = LOCAL_TARGET,
+    safe: bool = False,
+) -> ScanReport:
+    return ScanReport(
+        total_attacks=len(results),
+        passed=sum(1 for r in results if r.passed_through),
+        blocked=sum(1 for r in results if r.was_blocked),
+        results=results,
+        timestamp=datetime.now(UTC),
+        target_url=target,
+        safe_mode=safe,
+    )
 
 
 def test_wrap_builds_argv_and_delegates() -> None:
@@ -170,6 +263,80 @@ def test_install_openclaw_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "url": "http://example.test/mcp",
         "transport": "streamable-http",
     }
+
+
+@pytest.mark.parametrize(
+    ("url", "loopback"),
+    [
+        ("http://127.0.0.1:9090/mcp", True),
+        ("http://localhost:9090/mcp", True),
+        ("http://127.0.0.5:9090/mcp", True),
+        ("http://[::1]:9090/mcp", True),
+        ("http://10.0.0.4:9090/mcp", False),
+        ("https://mcp.example.com/mcp", False),
+        ("not a url", False),
+        ("", False),
+    ],
+)
+def test_is_loopback_target(url: str, loopback: bool) -> None:
+    assert cli._is_loopback_target(url) is loopback
+
+
+def test_guard_live_target_refuses_remote_without_safe() -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli._guard_live_target("https://mcp.example.com/mcp", safe=False, allow_remote=False)
+    assert "--allow-remote" in str(exc.value)
+
+
+def test_guard_live_target_allows_safe_and_allow_remote() -> None:
+    cli._guard_live_target("https://mcp.example.com/mcp", safe=True, allow_remote=False)
+    cli._guard_live_target("https://mcp.example.com/mcp", safe=False, allow_remote=True)
+    cli._guard_live_target(LOCAL_TARGET, safe=False, allow_remote=False)
+
+
+def test_vulnerability_exit_code() -> None:
+    assert cli.vulnerability_exit_code(0, 0) == cli.EXIT_OK
+    assert cli.vulnerability_exit_code(1, 0) == cli.EXIT_VULNERABLE
+    assert cli.vulnerability_exit_code(2, 2) == cli.EXIT_OK
+    assert cli.vulnerability_exit_code(3, 2) == cli.EXIT_VULNERABLE
+    assert cli.vulnerability_exit_code(0, 5, regression=True) == cli.EXIT_VULNERABLE
+
+
+def test_policy_reload_url_derives_from_target() -> None:
+    assert cli._policy_reload_url("http://127.0.0.1:9090/mcp") == "http://127.0.0.1:9090/policy/reload"
+    assert cli._policy_reload_url("https://host/a/b") == "https://host/policy/reload"
+
+
+def test_analyze_rescan_counts_fixed_remaining_and_unreplayed() -> None:
+    before = _report([_vulnerable("a"), _vulnerable("b"), _blocked("c"), _benign_allowed("d")])
+    after = _report([_blocked("a"), _vulnerable("b"), _benign_allowed("d")])
+    analysis = cli._analyze_rescan(before, after)
+    assert analysis.fixed == 1
+    assert analysis.remaining == 1
+    assert analysis.unreplayed_correct == 1  # "c" was blocked before, never replayed
+    assert analysis.introduced_false_positives == 0
+    assert not analysis.regression
+
+
+def test_analyze_rescan_flags_introduced_false_positive() -> None:
+    before = _report([_vulnerable("a"), _benign_allowed("d")])
+    after = _report([_blocked("a"), _benign_blocked("d")])
+    analysis = cli._analyze_rescan(before, after)
+    assert analysis.introduced_false_positives == 1
+    assert analysis.regression
+
+
+def test_analyze_rescan_flags_regressed_attack() -> None:
+    before = _report([_blocked("a")])
+    after = _report([_vulnerable("a")])
+    analysis = cli._analyze_rescan(before, after)
+    assert analysis.regressed_attacks == 1
+    assert analysis.regression
+
+
+def test_analyze_rescan_counts_safe_mode_allow_as_remaining() -> None:
+    after = _report([_safe_allowed("a")], safe=True)
+    assert cli._analyze_rescan(_report([]), after).remaining == 1
 
 
 def test_main_dispatches_wrap(monkeypatch: pytest.MonkeyPatch) -> None:
