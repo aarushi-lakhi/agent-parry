@@ -233,6 +233,35 @@ async def phase4_verify(
     return rescan_report
 
 
+def _summary_lines(before: ScanReport | None, after: ScanReport | None) -> list[str]:
+    """Render the closing panel body for a finished demo run.
+
+    Pure so the wording can be tested without booting servers.
+    """
+    before_score = before.vulnerability_score if before else 0.0
+    after_score = after.vulnerability_score if after else before_score
+
+    if after is not None:
+        now_blocked = after.blocked + after.redacted
+        total_vuln = after.total_attacks
+    else:
+        now_blocked = 0
+        total_vuln = 0
+
+    if before_score > 0:
+        percentage = round(((before_score - after_score) / before_score) * 100, 1)
+    else:
+        percentage = 100.0
+
+    return [
+        "[bold green]✅ AgentShield Demo Complete[/bold green]",
+        "",
+        f"Vulnerability score: {before_score}% → {after_score}%",
+        f"{now_blocked} of {total_vuln} attack vectors now blocked",
+        f"Your agent is {percentage}% more secure",
+    ]
+
+
 # ── MAIN ────────────────────────────────────────────────────────────
 
 
@@ -335,28 +364,10 @@ async def main(fast: bool = False) -> None:
 
     # ── FINAL SUMMARY ───────────────────────────────────
     try:
-        before_score = original_report.vulnerability_score if original_report else 0.0
-        after_score = rescan_report.vulnerability_score if rescan_report else before_score
-
-        if rescan_report is not None:
-            now_blocked = rescan_report.blocked + rescan_report.redacted
-            total_vuln = rescan_report.total_attacks
-        else:
-            now_blocked = 0
-            total_vuln = 0
-
-        if before_score > 0:
-            percentage = round(((before_score - after_score) / before_score) * 100, 1)
-        else:
-            percentage = 100.0
-
         console.print()
         console.print(
             Panel(
-                f"[bold green]\u2705 AgentShield Demo Complete[/bold green]\n\n"
-                f"Vulnerability score: {before_score}% \u2192 {after_score}%\n"
-                f"{now_blocked} of {total_vuln} attack vectors now blocked\n"
-                f"Your agent is {percentage}% more secure",
+                "\n".join(_summary_lines(original_report, rescan_report)),
                 border_style="green",
                 padding=(1, 4),
             )
