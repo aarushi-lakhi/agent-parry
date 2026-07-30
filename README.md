@@ -116,6 +116,8 @@ Both proxies append one JSON object per line to `~/.agentparry/audit.jsonl` for 
 
 Order records by `(run_id, seq)`, not by `ts`: wall-clock time can step backwards under NTP.
 
+The response-side inspectors get their own `action` values rather than reusing `REDACT_OUTPUT`, so filtering the column stays unambiguous when PII redaction and an injection rewrite both fire on one response: `NEUTRALIZE_RESULT` and `BLOCK_RESULT_INJECTION` for tool results, `REDACT_METADATA` and `BLOCK_METADATA` for `tools/list` and `initialize`. All four are stamped `direction: server->client`. Adding enum values is additive, so `AUDIT_SCHEMA_VERSION` is unchanged.
+
 The file is `0600` inside a `0700` directory, and rotates once at 8 MB to `audit.jsonl.1`. There is no `fsync`, so a hard crash can lose the tail.
 
 ### Argument tiers
