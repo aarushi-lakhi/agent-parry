@@ -16,9 +16,16 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
-from src.models import ScanReport
+from src.models import AttackResult, ConfusionMatrix, ScanReport
 from src.rule_generator import RuleGenerator
-from src.scanner import Scanner
+from src.scanner import (
+    OUTCOME_FALSE_POSITIVE,
+    Scanner,
+    classify_outcome,
+    compute_confusion_matrix,
+    is_attack_payload,
+    observed_from_result,
+)
 
 console = Console(force_terminal=True)
 
@@ -233,33 +240,104 @@ async def phase4_verify(
     return rescan_report
 
 
+def _rate(value: float | None) -> str:
+    """Render a rate, or "n/a" when its denominator was empty."""
+    return "n/a" if value is None else f"{value}%"
+
+
+def _matrix_of(report: ScanReport) -> ConfusionMatrix:
+    """The report's own matrix, recomputed when the report predates the field."""
+    return report.matrix or compute_confusion_matrix(report.results, safe=report.safe_mode)
+
+
+def _outcome_of(result: AttackResult, *, safe: bool) -> str:
+    """The scored outcome for one result, recomputed when it was never stored."""
+    if result.outcome:
+        return result.outcome
+    return classify_outcome(
+        result.payload.expected_behavior,
+        observed_from_result(result, safe=safe),
+        safe=safe,
+    )
+
+
+def _introduced_false_positives(before: ScanReport, after: ScanReport) -> int:
+    """Benign payloads the second scan stopped that the first one let through."""
+    after_lookup = {r.payload.id: r for r in after.results}
+    count = 0
+    for r_before in before.results:
+        if is_attack_payload(r_before.payload):
+            continue
+        r_after = after_lookup.get(r_before.payload.id)
+        if r_after is None:
+            continue
+        was_fp = _outcome_of(r_before, safe=before.safe_mode) == OUTCOME_FALSE_POSITIVE
+        now_fp = _outcome_of(r_after, safe=after.safe_mode) == OUTCOME_FALSE_POSITIVE
+        if now_fp and not was_fp:
+            count += 1
+    return count
+
+
+def _scan_block(heading: str, report: ScanReport) -> list[str]:
+    """Detection and over-block for one scan, each count labelled with its set."""
+    matrix = _matrix_of(report)
+    lines = [
+        heading,
+        f"  Attack payloads stopped: {matrix.true_block}/{matrix.attack_total}"
+        f" (detection {_rate(matrix.detection_rate)})",
+        f"  Benign payloads allowed: {matrix.true_allow}/{matrix.benign_total}"
+        f" (over-block {_rate(matrix.false_positive_rate)})",
+        f"  Balanced score, detection minus over-block: {_rate(matrix.balanced_score)}",
+    ]
+    if matrix.indeterminate:
+        lines.append(f"  Not measurable: {matrix.indeterminate} payloads")
+    return lines
+
+
 def _summary_lines(before: ScanReport | None, after: ScanReport | None) -> list[str]:
     """Render the closing panel body for a finished demo run.
 
-    Pure so the wording can be tested without booting servers.
+    Reports detection and over-block side by side for both scans rather than one
+    "more secure" number: rules that close a vulnerability by blocking
+    legitimate traffic must not read as a clean win. Pure so the wording can be
+    tested without booting servers.
     """
-    before_score = before.vulnerability_score if before else 0.0
-    after_score = after.vulnerability_score if after else before_score
+    if before is None:
+        return ["[yellow]⚠️  AgentParry demo incomplete — no scan to summarize.[/yellow]"]
 
-    if after is not None:
-        now_blocked = after.blocked + after.redacted
-        total_vuln = after.total_attacks
-    else:
-        now_blocked = 0
-        total_vuln = 0
+    if after is None:
+        return [
+            "[yellow]⚠️  AgentParry demo incomplete — the verification rescan did not run.[/yellow]",
+            "",
+            *_scan_block(f"Initial scan, all {len(before.results)} payloads:", before),
+        ]
 
-    if before_score > 0:
-        percentage = round(((before_score - after_score) / before_score) * 100, 1)
-    else:
-        percentage = 100.0
+    introduced = _introduced_false_positives(before, after)
+    title = (
+        "[bold yellow]⚠️  AgentParry demo complete, with new over-blocking[/bold yellow]"
+        if introduced
+        else "[bold green]✅ AgentParry demo complete[/bold green]"
+    )
 
-    return [
-        "[bold green]✅ AgentShield Demo Complete[/bold green]",
+    lines = [
+        title,
         "",
-        f"Vulnerability score: {before_score}% → {after_score}%",
-        f"{now_blocked} of {total_vuln} attack vectors now blocked",
-        f"Your agent is {percentage}% more secure",
+        *_scan_block(f"Initial scan, all {len(before.results)} payloads:", before),
+        *_scan_block(
+            f"Rescan, replaying the {len(after.results)} calls that got through:", after
+        ),
+        "",
     ]
+
+    if introduced:
+        lines.append(
+            f"[red]The generated rules newly blocked {introduced} benign"
+            f" call(s) — see the Benign Traffic table above.[/red]"
+        )
+    else:
+        lines.append("[green]The generated rules blocked no benign calls.[/green]")
+
+    return lines
 
 
 # ── MAIN ────────────────────────────────────────────────────────────
@@ -364,11 +442,16 @@ async def main(fast: bool = False) -> None:
 
     # ── FINAL SUMMARY ───────────────────────────────────
     try:
+        if original_report is not None and rescan_report is not None:
+            introduced = _introduced_false_positives(original_report, rescan_report)
+        else:
+            introduced = 0
+
         console.print()
         console.print(
             Panel(
                 "\n".join(_summary_lines(original_report, rescan_report)),
-                border_style="green",
+                border_style="yellow" if introduced else "green",
                 padding=(1, 4),
             )
         )
