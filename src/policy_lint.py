@@ -48,6 +48,12 @@ MAXREPEAT = regex_parser.MAXREPEAT
 VIEW_DECODED = "decoded"
 _INHERITED_VIEWS: ViewFlags = (True, False)
 
+SCOPE_RULE = "rule"
+SCOPE_SETTINGS = "settings"
+
+_METADATA_SEVERITY_ORDER = ("medium", "high", "critical")
+_MUTATING_METADATA_ACTIONS = frozenset({"redact", "drop", "block"})
+
 _LARGE_CLASS = 36
 _FLOOR_MIN = 8
 _FLOOR_MAX = 64
@@ -134,12 +140,19 @@ _PROBE_WRAPPERS: dict[str, tuple[str, ...]] = {
 
 
 class LintFinding(BaseModel):
-    """One actionable observation about a single rule."""
+    """One actionable observation about a single rule or settings block.
+
+    ``scope`` is ``settings`` for findings about an inspection block rather than a
+    rule. Those stay out of every per-rule rate: counting a settings finding as a
+    flagged rule would inflate the flag rate and the unconfirmed rate against a
+    rule count it does not belong to.
+    """
 
     rule: str
     check: str
     severity: str
     message: str
+    scope: str = SCOPE_RULE
     pattern: str | None = None
     field: str | None = None
     example: str | None = None
@@ -593,6 +606,69 @@ def _allowlist_findings(rule_name: str, rule: dict[str, Any]) -> list[LintFindin
     return findings
 
 
+def _settings_findings(settings: dict[str, Any]) -> list[LintFinding]:
+    """Inspection blocks configured to act destructively on a false positive.
+
+    Static only, and it stays that way until there is a benign corpus of tool
+    results and tool metadata. Both inspectors run a fixed pattern set over
+    response text rather than rule regexes, so there is nothing here for the
+    static regex checks to read and nothing for the benign payload corpus, which
+    carries request arguments only, to exercise.
+    """
+    findings: list[LintFinding] = []
+    result = settings.get("result_inspection")
+    if isinstance(result, dict) and result.get("enabled", True) and result.get("action") == "block":
+        findings.append(
+            LintFinding(
+                rule="settings.result_inspection",
+                check="result_inspection_blocks",
+                severity=SEV_MEDIUM,
+                scope=SCOPE_SETTINGS,
+                message=(
+                    "action: block fails the whole tool call when an injection pattern fires on the "
+                    "result, and these patterns cannot tell text that instructs the model from text "
+                    "that quotes it. neutralize costs a fence on a false positive instead of the task"
+                ),
+            )
+        )
+
+    metadata = settings.get("metadata_inspection")
+    if not isinstance(metadata, dict) or not metadata.get("enabled", True):
+        return findings
+    action = str(metadata.get("action") or "redact")
+    if action in ("drop", "block"):
+        findings.append(
+            LintFinding(
+                rule="settings.metadata_inspection",
+                check="metadata_inspection_discards_tools",
+                severity=SEV_MEDIUM,
+                scope=SCOPE_SETTINGS,
+                message=(
+                    f"action: {action} removes a tool from discovery on a false positive, and "
+                    "legitimate tool descriptions are imperative prose. redact or annotate leave the "
+                    "tool callable"
+                ),
+            )
+        )
+    threshold = str(metadata.get("severity_threshold") or "critical")
+    if action in _MUTATING_METADATA_ACTIONS and threshold in ("medium", "high"):
+        findings.append(
+            LintFinding(
+                rule="settings.metadata_inspection",
+                check="metadata_inspection_low_threshold",
+                severity=SEV_MEDIUM,
+                scope=SCOPE_SETTINGS,
+                message=(
+                    f"severity_threshold: {threshold} with action: {action} rewrites tool metadata on "
+                    f"{len(_METADATA_SEVERITY_ORDER) - _METADATA_SEVERITY_ORDER.index(threshold)} of "
+                    f"{len(_METADATA_SEVERITY_ORDER)} severity tiers, so ordinary imperative "
+                    "descriptions are degraded. critical-only is the default for that reason"
+                ),
+            )
+        )
+    return findings
+
+
 def _always_findings(rule_name: str, pattern: str, field: str | None) -> list[LintFinding]:
     """Patterns that match the empty string or nearly every ordinary string."""
     try:
@@ -1004,7 +1080,7 @@ def lint_policy(
     benign = [p for p in all_payloads if _is_benign(p)]
     resolved_views = _resolved_views(path)
 
-    findings: list[LintFinding] = []
+    findings: list[LintFinding] = _settings_findings(settings)
     pattern_count = 0
     for rule in rules:
         name = str(rule.get("name") or "")
@@ -1064,11 +1140,12 @@ def _summarize(report: LintReport) -> LintReport:
     Confirmation means a concrete blocked string: a benign corpus payload, or a
     probe that mutated the pattern rather than merely quoting its keyword.
     """
-    flagged = _ordered({f.rule for f in report.findings})
-    high = _ordered({f.rule for f in report.findings if f.severity == SEV_HIGH})
+    rule_findings = [f for f in report.findings if f.scope == SCOPE_RULE]
+    flagged = _ordered({f.rule for f in rule_findings})
+    high = _ordered({f.rule for f in rule_findings if f.severity == SEV_HIGH})
     corpus = _ordered({b.rule for b in report.blocks})
     confirming = {
-        f.rule for f in report.findings if f.check == "probe_over_block" and f.kind != "mention"
+        f.rule for f in rule_findings if f.check == "probe_over_block" and f.kind != "mention"
     }
     probe_only = [r for r in flagged if r not in corpus and r in confirming]
     unconfirmed = [r for r in flagged if r not in corpus and r not in probe_only]
@@ -1094,6 +1171,16 @@ def _ordered(names: set[str]) -> list[str]:
 def _pct(value: float | None) -> str:
     """Percentage for display, or n/a on an empty denominator."""
     return "n/a" if value is None else f"{value}%"
+
+
+def render_findings(findings: list[LintFinding]) -> list[str]:
+    """Render findings as two indented lines each: the header, then the message."""
+    lines: list[str] = []
+    for finding in findings:
+        head = f"  [{finding.severity}] {finding.rule}  {finding.check}"
+        lines.append(head if finding.pattern is None else f"{head}  `{finding.pattern}` on `{finding.field}`")
+        lines.append(f"         {finding.message}")
+    return lines
 
 
 def render_report(report: LintReport) -> str:
@@ -1126,14 +1213,22 @@ def render_report(report: LintReport) -> str:
     lines.append(f"  over-block rate: {blocked}/{report.benign_total} = {_pct(report.over_block_rate)}")
 
     lines.extend(["", "STATIC AND PROBE FINDINGS"])
-    if not report.findings:
-        lines.append("  none")
-    for finding in report.findings:
-        if finding.check == "benign_corpus_block":
-            continue
-        head = f"  [{finding.severity}] {finding.rule}  {finding.check}"
-        lines.append(head if finding.pattern is None else f"{head}  `{finding.pattern}` on `{finding.field}`")
-        lines.append(f"         {finding.message}")
+    static = [
+        f
+        for f in report.findings
+        if f.scope == SCOPE_RULE and f.check != "benign_corpus_block"
+    ]
+    lines.extend(render_findings(static) or ["  none"])
+
+    settings_findings = [f for f in report.findings if f.scope == SCOPE_SETTINGS]
+    if settings_findings:
+        lines.extend(
+            [
+                "",
+                "INSPECTION SETTINGS (static only: there is no benign corpus of tool results or metadata)",
+                *render_findings(settings_findings),
+            ]
+        )
 
     counts = f"{report.count(SEV_HIGH)} high, {report.count(SEV_MEDIUM)} medium, {report.count(SEV_LOW)} low"
     high_names = f" -> {', '.join(report.high_rules)}" if report.high_rules else ""

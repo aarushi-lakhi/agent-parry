@@ -189,6 +189,74 @@ def test_decoded_views_are_not_flagged_by_default(tmp_path: Path) -> None:
     assert "decoded_view_widens_match" not in checks_for(report, "r")
 
 
+def test_committed_inspection_settings_are_not_flagged() -> None:
+    report = committed_report()
+    assert [f for f in report.findings if f.scope == "settings"] == []
+
+
+def test_result_inspection_block_action_is_flagged(tmp_path: Path) -> None:
+    policy = write_policy(
+        tmp_path,
+        [pattern_rule("r", [r"^\s*rm\s+-rf\s+/\s*$"])],
+        settings={"result_inspection": {"enabled": True, "action": "block"}},
+    )
+    report = lint_policy(policy, None)
+    finding = findings_for(report, "settings.result_inspection", "result_inspection_blocks")[0]
+    assert finding.severity == "medium"
+    assert finding.scope == "settings"
+
+
+def test_metadata_inspection_drop_and_low_threshold_are_flagged(tmp_path: Path) -> None:
+    policy = write_policy(
+        tmp_path,
+        [pattern_rule("r", [r"^\s*rm\s+-rf\s+/\s*$"])],
+        settings={"metadata_inspection": {"action": "drop", "severity_threshold": "medium"}},
+    )
+    report = lint_policy(policy, None)
+    assert checks_for(report, "settings.metadata_inspection") == {
+        "metadata_inspection_discards_tools",
+        "metadata_inspection_low_threshold",
+    }
+    threshold = findings_for(report, "settings.metadata_inspection", "metadata_inspection_low_threshold")[0]
+    assert "3 of 3 severity tiers" in threshold.message
+
+
+def test_disabled_inspection_settings_are_not_flagged(tmp_path: Path) -> None:
+    policy = write_policy(
+        tmp_path,
+        [pattern_rule("r", [r"^\s*rm\s+-rf\s+/\s*$"])],
+        settings={
+            "result_inspection": {"enabled": False, "action": "block"},
+            "metadata_inspection": {"enabled": False, "action": "drop"},
+        },
+    )
+    assert lint_policy(policy, None).findings == []
+
+
+def test_settings_findings_stay_out_of_the_per_rule_rates(tmp_path: Path) -> None:
+    policy = write_policy(
+        tmp_path,
+        [pattern_rule("r", [r"^\s*rm\s+-rf\s+/\s*$"])],
+        settings={"result_inspection": {"action": "block"}},
+    )
+    report = lint_policy(policy, None)
+    assert len(report.findings) == 1
+    assert report.flagged_rules == []
+    assert report.flag_rate == 0.0
+    assert report.unconfirmed_rate is None
+
+
+def test_render_report_separates_the_inspection_settings_section(tmp_path: Path) -> None:
+    policy = write_policy(
+        tmp_path,
+        [pattern_rule("r", [r"^\s*rm\s+-rf\s+/\s*$"])],
+        settings={"result_inspection": {"action": "block"}},
+    )
+    text = render_report(lint_policy(policy, None))
+    assert "STATIC AND PROBE FINDINGS\n  none" in text
+    assert "INSPECTION SETTINGS (static only" in text
+
+
 def test_low_floor_generic_class_is_high(tmp_path: Path) -> None:
     report = lint_rules(tmp_path, [pattern_rule("r", ["[A-Za-z0-9]{40,}"], field="body")])
     finding = findings_for(report, "r", "low_floor_generic_class")[0]
