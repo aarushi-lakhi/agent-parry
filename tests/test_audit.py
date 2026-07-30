@@ -352,13 +352,14 @@ class TestFileHandling(AuditWriterTestCase):
 
 class TestFailureBehavior(AuditWriterTestCase):
     def test_unwritable_path_returns_false(self) -> None:
-        writer = self.make_writer(path=self.audit_path.parent / "not-a-dir")
-        writer.path.parent.mkdir(parents=True, exist_ok=True)
-        writer.path.write_text("i am a file\n", encoding="utf-8")
-        bad = self.make_writer(path=writer.path / "audit.jsonl")
-        with patch.object(audit.logging, "getLogger"):
-            self.assertFalse(bad.write(bad.build(action=AuditAction.ALLOW)))
-        self.assertEqual(bad.drops, 1)
+        # A regular file where a directory has to be: mkdir and open both fail.
+        blocker = self.audit_path.parent.parent / "blocker"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("i am a file\n", encoding="utf-8")
+        writer = self.make_writer(path=blocker / "audit.jsonl")
+        with self.assertLogs("src.audit", level="WARNING"):
+            self.assertFalse(writer.write(writer.build(action=AuditAction.ALLOW)))
+        self.assertEqual(writer.drops, 1)
 
     def test_permission_denied_returns_false(self) -> None:
         writer = self.make_writer()
