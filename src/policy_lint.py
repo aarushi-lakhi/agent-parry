@@ -1134,6 +1134,28 @@ def lint_policy(
     )
 
 
+def _finding_key(finding: LintFinding) -> tuple[str, str, str, str]:
+    """Identity of a finding across two lints of the same policy."""
+    return (finding.rule, finding.check, finding.pattern or "", finding.field or "")
+
+
+def introduced_findings(
+    before: LintReport,
+    after: LintReport,
+    *,
+    severity: str = SEV_HIGH,
+) -> list[LintFinding]:
+    """Findings at `severity` that `after` has and `before` does not.
+
+    A policy that already over-blocks must not make every later edit
+    unwritable, so the comparison is what an edit adds rather than what the file
+    contains. A rule replaced by a version with a different pattern reads as
+    introduced, which is the intent: the old finding is gone and this one is new.
+    """
+    known = {_finding_key(f) for f in before.findings if f.severity == severity}
+    return [f for f in after.findings if f.severity == severity and _finding_key(f) not in known]
+
+
 def _summarize(report: LintReport) -> LintReport:
     """Fill in the aggregate rates, including the linter's own unconfirmed rate.
 
