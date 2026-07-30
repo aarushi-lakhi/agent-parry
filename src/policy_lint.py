@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from src.models import Finding, PolicyAction
 from src.normalize import VIEW_CANONICAL, VIEW_ORIGINAL
 from src.policy import PolicyEngine, ViewFlags
+from src.resources import UNSET, Unset, resolve_payloads, resolve_policy
 
 SEV_HIGH = "high"
 SEV_MEDIUM = "medium"
@@ -1072,12 +1073,16 @@ def _outcome(
 
 
 def lint_policy(
-    policy_path: str | Path = "config/default_policy.yaml",
-    payloads_path: str | Path | None = "attacks/payloads.yaml",
+    policy_path: str | Path | Unset = UNSET,
+    payloads_path: str | Path | None | Unset = UNSET,
     *,
     probes: bool = True,
 ) -> LintReport:
     """Analyze a policy file statically and empirically for over-blocking."""
+    if isinstance(policy_path, Unset):
+        policy_path = resolve_policy().path
+    if isinstance(payloads_path, Unset):
+        payloads_path = resolve_payloads().path
     path = Path(policy_path)
     if not path.is_file():
         raise FileNotFoundError(f"policy file not found: {path}")

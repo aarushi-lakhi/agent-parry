@@ -38,6 +38,7 @@ from src.pins import (
     tool_fingerprint,
 )
 from src.policy import PolicyEngine
+from src.resources import packaged_policy_path
 from src.stdio_proxy import (
     PolicyFileWatcher,
     PolicyReloadError,
@@ -89,7 +90,7 @@ class TestResolvePolicyPath(unittest.TestCase):
 
     def test_default_when_no_explicit_or_env(self) -> None:
         with patch.dict(os.environ, {"AGENTPARRY_POLICY": ""}):
-            self.assertEqual(_resolve_policy_path(None), "config/default_policy.yaml")
+            self.assertEqual(_resolve_policy_path(None), str(packaged_policy_path()))
 
 
 class TestJsonFraming(unittest.TestCase):
