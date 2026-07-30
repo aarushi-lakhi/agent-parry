@@ -1,0 +1,494 @@
+"""Regression tests over discovery payloads captured from real MCP servers.
+
+The corpus under ``tests/fixtures/real_servers/`` is what eight reference and
+third-party MCP servers actually answered to ``initialize`` and ``tools/list``,
+captured once through the proxy by ``scripts/capture_real_corpus.py`` and
+sanitized. Every assertion here runs against those files, so the suite stays
+hermetic: no network, no ``npx``, no ``uvx``.
+
+The numbers pinned here are the ones ``docs/real-servers.md`` quotes. A change to
+the pattern table, the remapping heuristic or the probe generator that moves them
+is expected to fail this file and update the document.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from src.inspector import (
+    INJECTION_PATTERNS,
+    METADATA_PATTERNS,
+    MetadataInspector,
+    MetadataInspectorSettings,
+)
+from src.models import AuditTransport
+from src.pins import PinStore, ServerIdentity, ToolPinner, tools_set_fingerprint
+from src.scanner import (
+    Scanner,
+    build_dynamic_payloads,
+    filter_and_remap_payloads,
+    map_yaml_tool_to_server,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CORPUS_DIR = REPO_ROOT / "tests" / "fixtures" / "real_servers"
+PAYLOADS = REPO_ROOT / "attacks" / "payloads.yaml"
+
+EXPECTED_SERVERS = {
+    "everything": 12,
+    "fetch": 1,
+    "filesystem": 14,
+    "git": 12,
+    "memory": 9,
+    "playwright": 24,
+    "sequential_thinking": 1,
+    "time": 2,
+}
+EXPECTED_TOOL_TOTAL = 75
+
+_SENSITIVE = re.compile(
+    r"(?:/Users/[a-z]|/home/(?!USER\b)[a-z]"
+    r"|gh[pousr]_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})"
+)
+
+
+def load_corpus() -> list[dict[str, Any]]:
+    """Return every captured server entry, ordered by name."""
+    paths = sorted(CORPUS_DIR.glob("*.json"))
+    return [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+
+
+def corpus_ids() -> list[str]:
+    """Return the corpus entry names, for parametrize ids."""
+    return [path.stem for path in sorted(CORPUS_DIR.glob("*.json"))]
+
+
+CORPUS = load_corpus()
+
+
+def tools_of(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the tool objects on an entry's first ``tools/list`` page."""
+    return list(entry["tools_list"]["tools"])
+
+
+def prose_leaves(entry: dict[str, Any]) -> list[str]:
+    """Return every tool description plus the server instructions string."""
+    out = [t["description"] for t in tools_of(entry) if isinstance(t.get("description"), str)]
+    instructions = entry["initialize"].get("instructions")
+    if isinstance(instructions, str) and instructions:
+        out.append(instructions)
+    return out
+
+
+class TestCorpusShape:
+    """The fixture files themselves."""
+
+    def test_expected_servers_present(self) -> None:
+        assert {e["server"] for e in CORPUS} == set(EXPECTED_SERVERS)
+
+    def test_tool_counts_match(self) -> None:
+        assert {e["server"]: len(tools_of(e)) for e in CORPUS} == EXPECTED_SERVERS
+        assert sum(len(tools_of(e)) for e in CORPUS) == EXPECTED_TOOL_TOTAL
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_entry_is_a_wellformed_discovery_pair(self, entry: dict[str, Any]) -> None:
+        assert entry["initialize"]["protocolVersion"]
+        assert isinstance(entry["initialize"]["serverInfo"], dict)
+        for tool in tools_of(entry):
+            assert isinstance(tool["name"], str) and tool["name"]
+            assert isinstance(tool.get("inputSchema"), dict)
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_no_sensitive_strings_survived_sanitization(self, entry: dict[str, Any]) -> None:
+        blob = json.dumps(entry)
+        assert _SENSITIVE.search(blob) is None, "sanitizer let a host, home path or token through"
+
+
+class TestMetadataInspectorOnRealServers:
+    """The headline question: does poison detection fire on clean servers?
+
+    Answer, over 75 real tools: not once from the pattern table. The two findings
+    in the corpus are structural heuristics at ``medium``, below the shipped
+    ``critical`` threshold, so nothing is rewritten by default.
+    """
+
+    def test_no_injection_pattern_matches_real_prose(self) -> None:
+        patterns = INJECTION_PATTERNS + METADATA_PATTERNS
+        assert len(patterns) == 16
+        hits: list[tuple[str, str, str]] = []
+        for entry in CORPUS:
+            for text in prose_leaves(entry):
+                for pattern in patterns:
+                    if pattern.pattern.search(text):
+                        hits.append((entry["server"], pattern.description, text[:60]))
+        assert hits == []
+
+    def test_total_findings_over_the_whole_corpus(self) -> None:
+        inspector = MetadataInspector()
+        findings = []
+        for entry in CORPUS:
+            for tool in tools_of(entry):
+                findings.extend(inspector.scan_tool(tool))
+            instructions = entry["initialize"].get("instructions")
+            if isinstance(instructions, str) and instructions:
+                findings.extend(inspector.scan_instructions(instructions))
+        assert len(findings) == 2
+        assert {f.severity for f in findings} == {"medium"}
+        assert sorted(f.matched_pattern for f in findings) == [
+            "opaque encoded blob",
+            "oversized metadata",
+        ]
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_default_settings_never_damage_a_real_tool(self, entry: dict[str, Any]) -> None:
+        inspector = MetadataInspector()
+        tools_result = inspector.inspect_tools_list(entry["tools_list"])
+        assert tools_result.dropped_tools == []
+        assert tools_result.redacted_tools == []
+        assert tools_result.blocked is False
+        names = [t["name"] for t in tools_result.result["tools"]]
+        assert names == [t["name"] for t in tools_of(entry)]
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_default_settings_keep_real_instructions(self, entry: dict[str, Any]) -> None:
+        inspector = MetadataInspector()
+        before = entry["initialize"].get("instructions")
+        after = inspector.inspect_initialize(entry["initialize"]).result.get("instructions")
+        assert after == before
+
+    @pytest.mark.parametrize("threshold", ["critical", "high"])
+    def test_thresholds_above_medium_are_inert(self, threshold: str) -> None:
+        inspector = MetadataInspector(
+            MetadataInspectorSettings(action="redact", severity_threshold=threshold)
+        )
+        for entry in CORPUS:
+            result = inspector.inspect_tools_list(entry["tools_list"])
+            assert result.dropped_tools == []
+            assert result.redacted_tools == []
+
+    def test_medium_threshold_damages_two_real_tools(self) -> None:
+        """Lowering the threshold to medium is not free, and this says how much."""
+        inspector = MetadataInspector(
+            MetadataInspectorSettings(action="redact", severity_threshold="medium")
+        )
+        dropped: list[str] = []
+        redacted: list[str] = []
+        for entry in CORPUS:
+            result = inspector.inspect_tools_list(entry["tools_list"])
+            dropped.extend(result.dropped_tools)
+            redacted.extend(result.redacted_tools)
+        assert dropped == ["gzip-file-as-resource"]
+        assert redacted == ["sequentialthinking"]
+
+
+class TestRemappingAgainstRealToolNames:
+    """What ``--discover`` actually does to payload tool names on a real server."""
+
+    YAML_TOOLS = ("email_send", "file_read", "http_fetch", "shell_exec")
+
+    def test_no_yaml_tool_name_exists_on_any_real_server(self) -> None:
+        real = {t["name"] for e in CORPUS for t in tools_of(e)}
+        assert real.isdisjoint(self.YAML_TOOLS)
+        assert {n.lower() for n in real}.isdisjoint(self.YAML_TOOLS)
+
+    def test_mapping_outcome_per_server_is_pinned(self) -> None:
+        observed: dict[str, dict[str, str | None]] = {}
+        for entry in CORPUS:
+            names = sorted(t["name"] for t in tools_of(entry))
+            observed[entry["server"]] = {
+                yaml_tool: map_yaml_tool_to_server(yaml_tool, names)
+                for yaml_tool in self.YAML_TOOLS
+            }
+        assert observed == {
+            "everything": {
+                "email_send": "get-annotated-message",
+                "file_read": "gzip-file-as-resource",
+                "http_fetch": None,
+                "shell_exec": None,
+            },
+            "fetch": {
+                "email_send": None,
+                "file_read": None,
+                "http_fetch": "fetch",
+                "shell_exec": None,
+            },
+            "filesystem": {
+                "email_send": "read_file",
+                "file_read": "edit_file",
+                "http_fetch": None,
+                "shell_exec": None,
+            },
+            "git": {
+                "email_send": None,
+                "file_read": None,
+                "http_fetch": None,
+                "shell_exec": "git_show",
+            },
+            "memory": {
+                "email_send": None,
+                "file_read": "open_nodes",
+                "http_fetch": None,
+                "shell_exec": None,
+            },
+            "playwright": {
+                "email_send": "browser_console_messages",
+                "file_read": "browser_file_upload",
+                "http_fetch": "browser_click",
+                "shell_exec": "browser_snapshot",
+            },
+            "sequential_thinking": {
+                "email_send": None,
+                "file_read": None,
+                "http_fetch": None,
+                "shell_exec": None,
+            },
+            "time": {
+                "email_send": None,
+                "file_read": None,
+                "http_fetch": None,
+                "shell_exec": None,
+            },
+        }
+
+    def test_a_read_payload_lands_on_a_write_tool(self) -> None:
+        """The concrete reason a remapped scan must not run outside --safe."""
+        names = sorted(t["name"] for t in tools_of(_entry("filesystem")))
+        assert map_yaml_tool_to_server("file_read", names) == "edit_file"
+
+    def test_matched_counts_measure_fuzz_not_coverage(self) -> None:
+        scanner = Scanner(str(PAYLOADS))
+        total = len(scanner.payloads)
+        matched = {}
+        for entry in CORPUS:
+            names = sorted(t["name"] for t in tools_of(entry))
+            _, count = filter_and_remap_payloads(scanner.payloads, names)
+            matched[entry["server"]] = count
+        assert matched["playwright"] == total
+        assert matched["sequential_thinking"] == 0
+        assert matched["time"] == 0
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_every_remapped_payload_names_a_real_tool(self, entry: dict[str, Any]) -> None:
+        scanner = Scanner(str(PAYLOADS))
+        names = sorted(t["name"] for t in tools_of(entry))
+        mapped, _ = filter_and_remap_payloads(scanner.payloads, names)
+        for payload in mapped:
+            assert payload.tool in names
+            for step in payload.steps:
+                assert step.tool in names
+
+
+class TestDynamicProbesAgainstRealSchemas:
+    """Whether schema-driven probes produce arguments a real server will accept."""
+
+    @staticmethod
+    def _validity(entry: dict[str, Any]) -> tuple[int, int, int, int]:
+        tools = tools_of(entry)
+        schemas = {t["name"]: t.get("inputSchema") or {} for t in tools}
+        valid = missing = enum_violation = 0
+        probes = build_dynamic_payloads(tools, include_benign=True)
+        for payload in probes:
+            schema = schemas[payload.tool]
+            props = schema.get("properties") or {}
+            required = set(schema.get("required") or [])
+            gaps = required - set(payload.arguments)
+            bad_enum = [
+                key
+                for key, value in payload.arguments.items()
+                if "enum" in (props.get(key) or {}) and value not in props[key]["enum"]
+            ]
+            missing += bool(gaps)
+            enum_violation += bool(bad_enum)
+            valid += not gaps and not bad_enum
+        return len(probes), valid, missing, enum_violation
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_probes_only_target_real_tools(self, entry: dict[str, Any]) -> None:
+        names = {t["name"] for t in tools_of(entry)}
+        for payload in build_dynamic_payloads(tools_of(entry), include_benign=True):
+            assert payload.tool in names
+
+    def test_corpus_wide_probe_validity_is_pinned(self) -> None:
+        totals = [0, 0, 0, 0]
+        for entry in CORPUS:
+            for index, value in enumerate(self._validity(entry)):
+                totals[index] += value
+        probes, valid, missing, enum_violation = totals
+        assert probes == 149
+        assert valid == 106
+        assert missing == 28
+        assert enum_violation == 15
+
+    def test_tools_with_no_top_level_string_get_no_injection_probe(self) -> None:
+        unreachable: list[str] = []
+        for entry in CORPUS:
+            tools = tools_of(entry)
+            probed = {p.tool for p in build_dynamic_payloads(tools)}
+            unreachable.extend(t["name"] for t in tools if t["name"] not in probed)
+        assert len(unreachable) == 22
+        assert "read_multiple_files" in unreachable
+        assert "create_entities" in unreachable
+
+
+class TestPinningRealToolLists:
+    """Whether a pin taken from a real ``tools/list`` settles and stays settled."""
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_pin_is_created_then_unchanged(self, entry: dict[str, Any], tmp_path: Path) -> None:
+        pinner = ToolPinner(store=PinStore(tmp_path / "pins.json"), inspector=MetadataInspector())
+        identity = ServerIdentity.for_command(entry["command"], transport=AuditTransport.HTTP)
+        statuses = [
+            pinner.observe("tools/list", _copy(entry["tools_list"]), [], identity=identity).status
+            for _ in range(3)
+        ]
+        assert statuses == ["created", "unchanged", "unchanged"]
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_initialize_pin_is_created_then_unchanged(
+        self, entry: dict[str, Any], tmp_path: Path
+    ) -> None:
+        pinner = ToolPinner(store=PinStore(tmp_path / "pins.json"), inspector=MetadataInspector())
+        identity = ServerIdentity.for_command(entry["command"], transport=AuditTransport.HTTP)
+        statuses = [
+            pinner.observe("initialize", _copy(entry["initialize"]), [], identity=identity).status
+            for _ in range(2)
+        ]
+        assert statuses == ["created", "unchanged"]
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_set_fingerprint_ignores_tool_order(self, entry: dict[str, Any]) -> None:
+        tools = tools_of(entry)
+        assert tools_set_fingerprint(tools) == tools_set_fingerprint(list(reversed(tools)))
+
+    def test_no_captured_server_paginates_tools_list(self) -> None:
+        assert [e["server"] for e in CORPUS if e["paginated"]] == []
+        assert {e["page_count"] for e in CORPUS} == {1}
+
+    def test_paginated_tools_list_produces_a_spurious_diff(self, tmp_path: Path) -> None:
+        """Known gap, from a real catalogue split into two pages.
+
+        ``_observe_tools_list`` reads pagination off ``nextCursor`` on the page in
+        hand, so the final page has none and is diffed as a complete catalogue.
+        Every tool from the earlier pages reads as removed. Any server that
+        paginates ``tools/list`` therefore warns on every discovery and never
+        converges.
+        """
+        tools = tools_of(_entry("playwright"))
+        half = len(tools) // 2
+        pinner = ToolPinner(store=PinStore(tmp_path / "pins.json"), inspector=MetadataInspector())
+        identity = ServerIdentity.for_command("paged-server", transport=AuditTransport.HTTP)
+
+        first = pinner.observe(
+            "tools/list", {"tools": tools[:half], "nextCursor": "page2"}, [], identity=identity
+        )
+        assert first.status == "created"
+        assert first.paginated is True
+
+        last = pinner.observe("tools/list", {"tools": tools[half:]}, [], identity=identity)
+        assert last.status == "changed"
+        assert last.paginated is False
+        assert last.diff is not None
+        assert len(last.diff.removed) == half
+        assert len(last.diff.added) == len(tools) - half
+
+
+class TestBenignCorpusVersusRealSchemas:
+    """Whether the benign over-block corpus resembles real tool arguments."""
+
+    def test_benign_payloads_cover_four_mock_tools_only(self) -> None:
+        scanner = Scanner(str(PAYLOADS))
+        benign = [p for p in scanner.payloads if p.category == "benign"]
+        assert len(benign) == 15
+        assert sorted({p.tool for p in benign}) == [
+            "email_send",
+            "file_read",
+            "http_fetch",
+            "shell_exec",
+        ]
+
+    def test_most_benign_argument_names_appear_on_no_real_server(self) -> None:
+        scanner = Scanner(str(PAYLOADS))
+        benign_args = {
+            key for p in scanner.payloads if p.category == "benign" for key in p.arguments
+        }
+        real_props = {
+            key
+            for entry in CORPUS
+            for tool in tools_of(entry)
+            for key in ((tool.get("inputSchema") or {}).get("properties") or {})
+        }
+        assert len(real_props) == 98
+        assert sorted(benign_args & real_props) == ["path", "url"]
+
+    def test_real_tools_are_wider_than_the_benign_corpus(self) -> None:
+        scanner = Scanner(str(PAYLOADS))
+        benign_arity = {len(p.arguments) for p in scanner.payloads if p.category == "benign"}
+        real_arity = {
+            len((tool.get("inputSchema") or {}).get("properties") or {})
+            for entry in CORPUS
+            for tool in tools_of(entry)
+        }
+        assert benign_arity == {1, 3}
+        assert max(real_arity) == 9
+
+    def test_real_schemas_use_types_the_benign_corpus_never_exercises(self) -> None:
+        types: set[str] = set()
+        for entry in CORPUS:
+            for tool in tools_of(entry):
+                props = (tool.get("inputSchema") or {}).get("properties") or {}
+                for spec in props.values():
+                    types.add((spec or {}).get("type", "untyped"))
+        assert {"array", "object", "boolean", "number", "integer"} <= types
+
+
+class TestCaptureScriptSanitizer:
+    """The sanitizer that keeps machine-specific strings out of the corpus."""
+
+    @staticmethod
+    def _module() -> Any:
+        spec = importlib.util.spec_from_file_location(
+            "capture_real_corpus", REPO_ROOT / "scripts" / "capture_real_corpus.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_replaces_scratch_home_and_credential_shapes(self) -> None:
+        module = self._module()
+        replacements = module.build_replacements("/private/tmp/scratch")
+        text = "read /private/tmp/scratch/a.txt with Bearer abcdefghijklmnopqrstuvwxyz012345"
+        out = module.sanitize_text(text, replacements)
+        assert "/private/tmp/scratch" not in out
+        assert "REDACTED_TOKEN" in out
+
+    def test_sanitizes_nested_values_and_keys(self) -> None:
+        module = self._module()
+        replacements = module.build_replacements("/private/tmp/scratch")
+        payload = {"/private/tmp/scratch": ["/private/tmp/scratch/x", {"k": 1}]}
+        out = module.sanitize(payload, replacements)
+        assert list(out) == [module.SCRATCH_PLACEHOLDER]
+        assert out[module.SCRATCH_PLACEHOLDER][0] == f"{module.SCRATCH_PLACEHOLDER}/x"
+        assert out[module.SCRATCH_PLACEHOLDER][1] == {"k": 1}
+
+    def test_home_directory_is_replaced_without_a_scratch_dir(self) -> None:
+        module = self._module()
+        home = os.path.expanduser("~")
+        out = module.sanitize_text(f"{home}/.ssh/config", module.build_replacements(None))
+        assert home not in out
+        assert out.startswith(module.HOME_PLACEHOLDER)
+
+
+def _entry(name: str) -> dict[str, Any]:
+    return next(e for e in CORPUS if e["server"] == name)
+
+
+def _copy(value: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(value))
