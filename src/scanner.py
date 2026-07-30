@@ -20,6 +20,7 @@ from src.models import (
     PROXY_URL,
     AttackPayload,
     AttackResult,
+    ConfusionMatrix,
     ScanReport,
 )
 
@@ -35,6 +36,22 @@ OBSERVED_REDACT = "redact"
 OBSERVED_ALLOW = "allow"
 OBSERVED_EVALUATED = "evaluated"
 OBSERVED_UNAVAILABLE = "unavailable"
+
+EXPECTED_BLOCK = "block"
+EXPECTED_REDACT = "redact"
+EXPECTED_ALLOW = "allow"
+VALID_EXPECTATIONS = frozenset({EXPECTED_BLOCK, EXPECTED_REDACT, EXPECTED_ALLOW})
+
+OUTCOME_TRUE_BLOCK = "true_block"
+OUTCOME_FALSE_NEGATIVE = "false_negative"
+OUTCOME_TRUE_ALLOW = "true_allow"
+OUTCOME_FALSE_POSITIVE = "false_positive"
+OUTCOME_INDETERMINATE = "indeterminate"
+
+_SATISFIES: dict[str, frozenset[str]] = {
+    EXPECTED_BLOCK: frozenset({OBSERVED_BLOCK}),
+    EXPECTED_REDACT: frozenset({OBSERVED_REDACT, OBSERVED_BLOCK}),
+}
 
 _TOOL_KEYWORD_HINTS: dict[str, tuple[str, ...]] = {
     "shell_exec": ("shell", "bash", "cmd", "exec", "terminal", "sh"),
@@ -79,6 +96,120 @@ def map_yaml_tool_to_server(yaml_tool: str, server_tool_names: list[str]) -> str
         if best:
             return best
     return None
+
+
+def normalize_expected(expected: str) -> str:
+    """Normalize a payload's expected_behavior to one of block / redact / allow.
+
+    Payloads written before expected behavior was scored carry "", and reports
+    persisted then still do, so "" means "block". Anything unrecognized is also
+    read as "block", the conservative reading.
+    """
+    value = (expected or "").strip().lower()
+    if value in VALID_EXPECTATIONS:
+        return value
+    return EXPECTED_BLOCK
+
+
+def observed_from_result(result: AttackResult, *, safe: bool) -> str:
+    """Derive what the proxy actually did with one payload.
+
+    Prefers the recorded observed_behavior and falls back to the result flags,
+    so a report persisted before that field existed still scores.
+    """
+    if result.observed_behavior:
+        return result.observed_behavior
+
+    response = result.proxy_response if isinstance(result.proxy_response, dict) else {}
+    error = response.get("error")
+    code = result.error_code
+    if code is None and isinstance(error, dict) and isinstance(error.get("code"), int):
+        code = error["code"]
+
+    if code is not None and code in UPSTREAM_REJECTED_CODES:
+        return OBSERVED_UNAVAILABLE
+    if result.evaluated_only:
+        return OBSERVED_EVALUATED
+    if result.was_blocked or error is not None:
+        return OBSERVED_BLOCK
+    if result.was_redacted:
+        return OBSERVED_REDACT
+    if safe:
+        return OBSERVED_EVALUATED
+    return OBSERVED_ALLOW
+
+
+def classify_outcome(expected: str, observed: str, *, safe: bool) -> str:
+    """Compare an expectation against an observation and name the outcome.
+
+    `safe` is accepted so callers can pass the scan mode uniformly; safe mode is
+    already implied by an `evaluated` observation.
+    """
+    expectation = normalize_expected(expected)
+
+    if observed == OBSERVED_UNAVAILABLE:
+        return OUTCOME_INDETERMINATE
+
+    if expectation == EXPECTED_ALLOW:
+        if observed in (OBSERVED_BLOCK, OBSERVED_REDACT):
+            return OUTCOME_FALSE_POSITIVE
+        return OUTCOME_TRUE_ALLOW
+
+    if expectation == EXPECTED_REDACT and observed == OBSERVED_EVALUATED:
+        # The output inspector never ran, so redaction is unobservable.
+        return OUTCOME_INDETERMINATE
+
+    if observed in _SATISFIES[expectation]:
+        return OUTCOME_TRUE_BLOCK
+    return OUTCOME_FALSE_NEGATIVE
+
+
+def compute_confusion_matrix(results: list[AttackResult], *, safe: bool = False) -> ConfusionMatrix:
+    """Tally expected versus observed behavior across one scan's results."""
+    matrix = ConfusionMatrix()
+    for result in results:
+        outcome = result.outcome or classify_outcome(
+            result.payload.expected_behavior,
+            observed_from_result(result, safe=safe),
+            safe=safe,
+        )
+        if outcome == OUTCOME_TRUE_BLOCK:
+            matrix.true_block += 1
+        elif outcome == OUTCOME_FALSE_NEGATIVE:
+            matrix.false_negative += 1
+        elif outcome == OUTCOME_TRUE_ALLOW:
+            matrix.true_allow += 1
+        elif outcome == OUTCOME_FALSE_POSITIVE:
+            matrix.false_positive += 1
+        else:
+            matrix.indeterminate += 1
+    return matrix
+
+
+def is_attack_payload(payload: AttackPayload) -> bool:
+    """True when the payload is meant to be stopped rather than allowed."""
+    return normalize_expected(payload.expected_behavior) != EXPECTED_ALLOW
+
+
+def split_by_expectation(results: list[AttackResult]) -> tuple[list[AttackResult], list[AttackResult]]:
+    """Split results into (attack results, benign results)."""
+    attacks = [r for r in results if is_attack_payload(r.payload)]
+    benign = [r for r in results if not is_attack_payload(r.payload)]
+    return attacks, benign
+
+
+def vulnerability_score(results: list[AttackResult]) -> float:
+    """Percentage of attack payloads that reached the tool.
+
+    Same formula as before, but benign payloads are excluded from both sides.
+    Counting them in the denominator would deflate the score just by adding
+    traffic that was supposed to be allowed.
+    """
+    attacks, _ = split_by_expectation(results)
+    if not attacks:
+        return 0.0
+    passed = sum(1 for r in attacks if r.passed_through)
+    return round((passed / len(attacks)) * 100, 1)
 
 
 def filter_and_remap_payloads(
@@ -127,8 +258,15 @@ def _schema_string_props(schema: dict[str, Any]) -> list[tuple[str, dict[str, An
     return out
 
 
-def build_dynamic_payloads(tools: list[dict[str, Any]]) -> list[AttackPayload]:
-    """Generate synthetic AttackPayload rows from MCP tool inputSchema definitions."""
+def build_dynamic_payloads(
+    tools: list[dict[str, Any]], *, include_benign: bool = False
+) -> list[AttackPayload]:
+    """Generate synthetic AttackPayload rows from MCP tool inputSchema definitions.
+
+    With include_benign, adds one inert expected-allow probe per tool so a scan
+    can measure over-blocking on discovered tools too. Off by default: outside
+    safe mode a benign probe really does execute the tool.
+    """
     dynamic: list[AttackPayload] = []
     seen_ids: set[str] = set()
 
@@ -216,7 +354,41 @@ def build_dynamic_payloads(tools: list[dict[str, Any]]) -> list[AttackPayload]:
                     )
                 )
 
+        if include_benign:
+            new_id = f"dyn-benign-{name}"
+            if new_id not in seen_ids:
+                seen_ids.add(new_id)
+                dynamic.append(
+                    AttackPayload(
+                        id=new_id,
+                        name=f"Dynamic benign probe on {name}",
+                        category="benign",
+                        tool=name,
+                        arguments=fill_defaults({}),
+                        expected_behavior="allow",
+                        severity="low",
+                        description="Schema-driven inert probe; should be allowed",
+                    )
+                )
+
     return dynamic
+
+
+def _assert_unique_payload_ids(payloads: list[AttackPayload], source: str) -> None:
+    """Raise on duplicate payload ids.
+
+    print_comparison keys results by payload id, so a collision silently drops
+    one of the two from every before/after lookup.
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for payload in payloads:
+        if payload.id in seen:
+            duplicates.append(payload.id)
+        seen.add(payload.id)
+    if duplicates:
+        joined = ", ".join(sorted(set(duplicates)))
+        raise ValueError(f"duplicate payload ids in {source}: {joined}")
 
 
 def _print_discovered_tools(names: list[str]) -> None:
@@ -238,6 +410,7 @@ class Scanner:
             self.payloads = [
                 AttackPayload(**entry) for entry in data.get("payloads", [])
             ]
+            _assert_unique_payload_ids(self.payloads, payloads_path)
 
 
     async def run_scan(
@@ -267,8 +440,9 @@ class Scanner:
                 )
                 _print_discovered_tools(discovered_names)
                 mapped, matched_yaml = filter_and_remap_payloads(yaml_payloads, discovered_names)
-                dynamic = build_dynamic_payloads(tools)
+                dynamic = build_dynamic_payloads(tools, include_benign=safe)
                 payloads_to_run = mapped + dynamic
+                _assert_unique_payload_ids(payloads_to_run, "discovered payload set")
                 console.print(
                     f"Matched {matched_yaml} of {total_yaml} attack payloads to available tools"
                 )
@@ -281,11 +455,11 @@ class Scanner:
                 payloads_to_run = yaml_payloads
 
             results, blocked, redacted, passed_vuln, policy_safe = await self._execute_payloads(
-                client, proxy_url, headers, payloads_to_run
+                client, proxy_url, headers, payloads_to_run, safe=safe
             )
 
         total = len(payloads_to_run)
-        score = round((passed_vuln / total) * 100, 1) if total else 0.0
+        attacks, benign = split_by_expectation(results)
 
         return ScanReport(
             total_attacks=total,
@@ -294,7 +468,7 @@ class Scanner:
             redacted=redacted,
             policy_allowed_safe=policy_safe,
             results=results,
-            vulnerability_score=score,
+            vulnerability_score=vulnerability_score(results),
             timestamp=datetime.now(UTC),
             target_url=proxy_url,
             safe_mode=safe,
@@ -302,6 +476,9 @@ class Scanner:
             matched_yaml_payloads=matched_yaml,
             total_yaml_payloads=total_yaml,
             payload_stats=payload_stats,
+            matrix=compute_confusion_matrix(results, safe=safe),
+            attack_total=len(attacks),
+            benign_total=len(benign),
         )
 
     async def _execute_payloads(
@@ -310,6 +487,8 @@ class Scanner:
         proxy_url: str,
         headers: dict[str, str],
         payloads_to_run: list[AttackPayload],
+        *,
+        safe: bool = False,
     ) -> tuple[list[AttackResult], int, int, int, int]:
         results: list[AttackResult] = []
         blocked = 0
@@ -337,13 +516,14 @@ class Scanner:
                         payload=payload,
                         passed_through=True,
                         observed_behavior=OBSERVED_UNAVAILABLE,
+                        outcome=OUTCOME_INDETERMINATE,
                         notes=f"Connection error: {exc}",
                     )
                 )
                 passed_vuln += 1
                 continue
 
-            result = self._classify_response(payload, body)
+            result = self._classify_response(payload, body, safe=safe)
             results.append(result)
 
             if result.evaluated_only:
@@ -364,9 +544,7 @@ class Scanner:
         *,
         safe: bool = False,
     ) -> ScanReport:
-        vulnerable_payloads = [
-            r.payload for r in original_report.results if r.passed_through
-        ]
+        replayed = [r.payload for r in original_report.results if r.passed_through]
 
         headers: dict[str, str] = {}
         if safe:
@@ -374,20 +552,19 @@ class Scanner:
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             results, blocked, redacted, passed_vuln, policy_safe = await self._execute_payloads(
-                client, proxy_url, headers, vulnerable_payloads
+                client, proxy_url, headers, replayed, safe=safe
             )
 
-        total = len(vulnerable_payloads)
-        score = round((passed_vuln / total) * 100, 1) if total else 0.0
+        attacks, benign = split_by_expectation(results)
 
         return ScanReport(
-            total_attacks=total,
+            total_attacks=len(replayed),
             blocked=blocked,
             passed=passed_vuln,
             redacted=redacted,
             policy_allowed_safe=policy_safe,
             results=results,
-            vulnerability_score=score,
+            vulnerability_score=vulnerability_score(results),
             timestamp=datetime.now(UTC),
             target_url=proxy_url,
             safe_mode=safe,
@@ -395,6 +572,9 @@ class Scanner:
             matched_yaml_payloads=original_report.matched_yaml_payloads,
             total_yaml_payloads=original_report.total_yaml_payloads,
             payload_stats=dict(original_report.payload_stats),
+            matrix=compute_confusion_matrix(results, safe=safe),
+            attack_total=len(attacks),
+            benign_total=len(benign),
         )
 
 
@@ -579,6 +759,17 @@ class Scanner:
 
     @staticmethod
     def _classify_response(
+        payload: AttackPayload, body: dict[str, Any], *, safe: bool = False
+    ) -> AttackResult:
+        """Classify one JSON-RPC response into flags, observed behavior and outcome."""
+        result = Scanner._classify_observed(payload, body)
+        result.outcome = classify_outcome(
+            payload.expected_behavior, result.observed_behavior, safe=safe
+        )
+        return result
+
+    @staticmethod
+    def _classify_observed(
         payload: AttackPayload, body: dict[str, Any]
     ) -> AttackResult:
         error = body.get("error")
