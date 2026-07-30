@@ -293,8 +293,28 @@ class MetadataInspection(BaseModel):
     dropped_tools: list[str] = Field(default_factory=list)
 
 
+class AttackStep(BaseModel):
+    """One ``tools/call`` inside a multi-step attack payload.
+
+    ``arguments`` may carry ``{{stepN.path}}`` references, resolved against an
+    earlier step's response before the call goes out. See
+    :func:`src.scanner.substitute_step_refs` for the syntax.
+    """
+
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    name: str = ""
+    description: str = ""
+
+
 class AttackPayload(BaseModel):
-    """Defines one scanner attack payload and expected behavior."""
+    """Defines one scanner attack payload and expected behavior.
+
+    ``steps`` turns the payload into a sequence: the scanner runs each step in
+    order against the same target instead of issuing ``arguments`` as a single
+    call. Empty for a single-step payload, so every payload and every persisted
+    report written before sequences existed still validates.
+    """
 
     id: str
     name: str
@@ -304,6 +324,24 @@ class AttackPayload(BaseModel):
     expected_behavior: str = ""
     severity: str = "low"
     description: str = ""
+    steps: list[AttackStep] = Field(default_factory=list)
+
+
+class AttackStepResult(BaseModel):
+    """What the target did with one step of a sequence payload.
+
+    ``arguments`` are the substituted ones actually sent, so a report shows what
+    an earlier step fed forward. Empty on a step that never ran.
+    """
+
+    index: int
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    observed_behavior: str = ""
+    outcome: str = ""
+    executed: bool = False
+    notes: str = ""
+    error_code: int | None = None
 
 
 class AttackResult(BaseModel):
@@ -326,6 +364,7 @@ class AttackResult(BaseModel):
     observed_behavior: str = ""
     outcome: str = ""
     error_code: int | None = None
+    step_results: list[AttackStepResult] = Field(default_factory=list)
 
 
 class ConfusionMatrix(BaseModel):
@@ -496,6 +535,8 @@ __all__ = [
     "TOOLS_CALL_METHOD",
     "AttackPayload",
     "AttackResult",
+    "AttackStep",
+    "AttackStepResult",
     "AuditAction",
     "AuditArgsMode",
     "AuditDirection",
