@@ -49,6 +49,33 @@ _TEXT_FIELDS: tuple[str, ...] = (
 _PATH_FIELDS: tuple[str, ...] = ("path", "filepath", "filename", "file", "url")
 _COMMAND_FIELDS: tuple[str, ...] = ("command", "cmd", "shell", "script", *_PATH_FIELDS)
 
+_MAX_ESCAPED_VALUE = 200
+
+
+def _patterns_for_value(patterns: list[str], value: str) -> list[str]:
+    """Return `patterns`, or an escape of `value` when none of them can match it.
+
+    The keyword tables select a pattern by substring, so they happily pick one
+    the argument that produced the finding cannot contain: a `dyn-path-` probe
+    carrying `../../../etc/passwd` hits no _PE_PATTERNS keyword and takes the
+    `rm\\s+-rf\\s+/` fallback, which emits a plausible-looking rule that can
+    never fire. Escaping the observed value only blocks that exact payload, but
+    that beats a rule which blocks nothing. Generalising the literal is future
+    work.
+
+    PolicyEngine compiles rule patterns with re.IGNORECASE, so the check uses
+    the same flag; otherwise a pattern that will fire at runtime reads as dead.
+    """
+    if not value.strip():
+        return patterns
+    for pattern in patterns:
+        try:
+            if re.search(pattern, value, flags=re.IGNORECASE):
+                return patterns
+        except re.error:
+            continue
+    return [re.escape(value[:_MAX_ESCAPED_VALUE])]
+
 
 def _is_benign(result: AttackResult) -> bool:
     """True for payloads that were supposed to be allowed.
@@ -166,7 +193,13 @@ class RuleGenerator:
         field: str,
         patterns: list[str],
         description: str,
+        value: str,
     ) -> dict[str, Any]:
+        """Build a pattern_match rule, validating the patterns against `value`.
+
+        `value` is the argument the condition inspects, so every category gets
+        the same guarantee: the emitted rule matches the payload it came from.
+        """
         return {
             "name": f"autogen_{attack_id}",
             "tool": tool,
@@ -177,7 +210,7 @@ class RuleGenerator:
                 {
                     "type": "pattern_match",
                     "field": field,
-                    "patterns": patterns,
+                    "patterns": _patterns_for_value(patterns, value),
                 }
             ],
         }
@@ -204,7 +237,7 @@ class RuleGenerator:
                 pattern = re.escape(first_words)
 
         return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", field, [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc, body,
         )
 
     @staticmethod
@@ -222,7 +255,7 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", field, [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc, command,
         )
 
     @staticmethod
@@ -240,7 +273,7 @@ class RuleGenerator:
                 break
 
         return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", field, [pattern], desc,
+            attack_id, tool, "BLOCK", field, [pattern], desc, command,
         )
 
     @staticmethod
@@ -254,12 +287,12 @@ class RuleGenerator:
             pattern = re.escape(filename)
             return RuleGenerator._make_rule(
                 attack_id, tool, "BLOCK", field, [pattern],
-                f"blocks reads of {filename}",
+                f"blocks reads of {filename}", file_path,
             )
 
-        field, _ = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
+        field, body = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
         return RuleGenerator._make_rule(
             attack_id, tool, "BLOCK", field,
             [r"\d{3}-\d{2}-\d{4}", r"4\d{3}[-\s]?\d{4}"],
-            "blocks emails containing SSN or credit card numbers",
+            "blocks emails containing SSN or credit card numbers", body,
         )
