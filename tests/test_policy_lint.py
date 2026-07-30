@@ -20,9 +20,38 @@ COMMITTED_POLICY = REPO_ROOT / "config" / "default_policy.yaml"
 COMMITTED_PAYLOADS = REPO_ROOT / "attacks" / "payloads.yaml"
 
 
-def write_policy(tmp_path: Path, rules: list[dict[str, Any]]) -> Path:
+ZWSP = "\u200b"
+
+
+def write_policy(
+    tmp_path: Path,
+    rules: list[dict[str, Any]],
+    settings: dict[str, Any] | None = None,
+) -> Path:
     path = tmp_path / "policy.yaml"
-    path.write_text(yaml.safe_dump({"rules": rules, "settings": {}}), encoding="utf-8")
+    path.write_text(yaml.safe_dump({"rules": rules, "settings": settings or {}}), encoding="utf-8")
+    return path
+
+
+def write_benign(tmp_path: Path, arguments: dict[str, Any], *, tool: str = "shell_exec") -> Path:
+    path = tmp_path / "payloads.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "payloads": [
+                    {
+                        "id": "bn-x",
+                        "name": "ordinary traffic",
+                        "category": "benign",
+                        "tool": tool,
+                        "arguments": arguments,
+                        "expected_behavior": "allow",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -116,6 +145,48 @@ def test_corpus_free_run_still_flags_the_same_rules() -> None:
     assert report.high_rules == ["autogen_pi-003", "autogen_pi-004", "block_dangerous_shell"]
     assert report.corpus_confirmed_rules == []
     assert report.probe_only_rules == ["autogen_pi-003", "autogen_pi-004", "block_dangerous_shell"]
+
+
+def test_committed_policy_matches_the_original_and_canonical_views() -> None:
+    assert committed_report().views == ["original", "canonical"]
+
+
+def test_canonical_view_block_is_reported_with_its_view_and_span(tmp_path: Path) -> None:
+    command = f"rm{ZWSP} -rf notes"
+    policy = write_policy(tmp_path, [pattern_rule("r", [r"rm\s+-rf"])])
+    report = lint_policy(policy, write_benign(tmp_path, {"command": command}))
+
+    block = report.blocks[0]
+    assert block.view == "canonical"
+    assert block.pattern == r"rm\s+-rf"
+    assert block.matched_text == "rm -rf"
+    assert block.span is not None
+    assert command[block.span[0] : block.span[1]] == f"rm{ZWSP} -rf"
+
+
+def test_normalization_disabled_in_settings_is_honored(tmp_path: Path) -> None:
+    policy = write_policy(
+        tmp_path,
+        [pattern_rule("r", [r"rm\s+-rf"])],
+        settings={"normalization": {"enabled": False}},
+    )
+    report = lint_policy(policy, write_benign(tmp_path, {"command": f"rm{ZWSP} -rf notes"}))
+    assert report.blocks == []
+    assert report.views == ["original"]
+
+
+def test_decoded_views_are_flagged_as_widening(tmp_path: Path) -> None:
+    rule = pattern_rule("r", [r"rm\s+-rf"])
+    rule["normalize"] = {"decoded": True}
+    report = lint_rules(tmp_path, [rule])
+    finding = findings_for(report, "r", "decoded_view_widens_match")[0]
+    assert finding.severity == "medium"
+    assert report.views == ["original", "canonical", "decoded"]
+
+
+def test_decoded_views_are_not_flagged_by_default(tmp_path: Path) -> None:
+    report = lint_rules(tmp_path, [pattern_rule("r", [r"rm\s+-rf"])])
+    assert "decoded_view_widens_match" not in checks_for(report, "r")
 
 
 def test_low_floor_generic_class_is_high(tmp_path: Path) -> None:
@@ -289,6 +360,8 @@ def test_render_report_includes_spans_and_summary() -> None:
     text = render_report(committed_report())
     assert "over-block rate: 3/9 = 33.3%" in text
     assert "BLOCK  bn-007  shell_exec  block_dangerous_shell" in text
+    assert "matched 'sudo ' in the original view" in text
+    assert "matched views: original, canonical" in text
     assert "linter unconfirmed rate" in text
 
 
