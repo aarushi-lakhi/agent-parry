@@ -693,5 +693,27 @@ class TestDomainAllowlistIsNeverNormalized(unittest.TestCase):
             self.assertEqual((False, False), rule.conditions[0].normalize)
 
 
+class TestShippedPolicyAgainstPayloadCorpus(unittest.TestCase):
+    """Both directions for every narrowed rule: the attack blocked, its benign twin allowed."""
+
+    payloads: dict[str, dict]
+    engine: PolicyEngine
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cls.engine = PolicyEngine(policy_path=str(root / "config" / "default_policy.yaml"))
+        with (root / "attacks" / "payloads.yaml").open(encoding="utf-8") as handle:
+            cls.payloads = {p["id"]: p for p in yaml.safe_load(handle)["payloads"]}
+
+    def _action(self, payload_id: str) -> PolicyAction:
+        payload = self.payloads[payload_id]
+        return self.engine.evaluate(payload["tool"], payload["arguments"]).action
+
+    def test_base64_exfil_blocked_and_long_order_reference_allowed(self) -> None:
+        self.assertEqual(PolicyAction.BLOCK, self._action("pi-003"))
+        self.assertEqual(PolicyAction.ALLOW, self._action("bn-003"))
+
+
 if __name__ == "__main__":
     unittest.main()

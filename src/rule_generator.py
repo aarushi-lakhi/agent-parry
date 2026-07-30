@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from src.models import AttackResult, ScanReport
+from src.normalize import MIN_OPAQUE_BLOB, decode_base64_fragment, iter_base64_runs
 
 console = Console()
 
@@ -23,9 +24,10 @@ _PI_PATTERNS: list[tuple[str, str, str]] = [
     ("ignore.*instructions", "ignore.*instructions", "instruction override"),
     ("SYSTEM:", r"^SYSTEM:|\[SYSTEM\]", "fake SYSTEM prompt"),
     ("disregard", r"disregard.*rules|override.*safety", "safety override"),
+    ("/etc/passwd", r"/etc/(?:passwd|shadow|sudoers)", "credential file exfiltration"),
 ]
 
-_BASE64_PATTERN = r"[A-Za-z0-9+/=]{40,}"
+_DECODED_NORMALIZE = {"decoded": True}
 
 _DE_PATTERNS: list[tuple[str, str, str]] = [
     ("curl", r"curl.*-d", "curl POST exfiltration"),
@@ -81,6 +83,23 @@ def _patterns_for_value(patterns: list[str], value: str) -> list[str]:
         except re.error:
             continue
     return [re.escape(value[:_MAX_ESCAPED_VALUE])]
+
+
+def _decoded_blob_text(body: str) -> str | None:
+    """Plaintext behind the first long base64 run in `body`, or None when there is none."""
+    for match in iter_base64_runs(body, min_length=MIN_OPAQUE_BLOB):
+        decoded = decode_base64_fragment(match.group(0))
+        if decoded is not None:
+            return decoded
+    return None
+
+
+def _injection_pattern(text: str) -> tuple[str, str]:
+    """The keyword-table pattern `text` triggers, else an escape of its first four words."""
+    for keyword, pattern, label in _PI_PATTERNS:
+        if keyword.lower() in text.lower():
+            return pattern, label
+    return re.escape(" ".join(text.split()[:4])), "prompt injection"
 
 
 def _is_benign(result: AttackResult) -> bool:
@@ -376,26 +395,29 @@ class RuleGenerator:
     def _rule_prompt_injection(
         attack_id: str, tool: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        """Build a BLOCK rule for one injection payload, from the plaintext it carries.
+
+        When the argument hides its instruction inside base64, the pattern is
+        derived from the decoded text and the condition opts into decoded views,
+        so the rule matches what the payload says rather than the shape of the
+        blob that carried it. A length-based blob pattern blocks every ordinary
+        reference number of the same length, and `src.normalize` already exposes
+        the plaintext as a view.
+        """
         field, body = RuleGenerator._select_field(arguments, _TEXT_FIELDS, "body")
 
-        if re.search(_BASE64_PATTERN, body):
-            pattern = _BASE64_PATTERN
-            desc = "blocks base64-encoded prompt injection in email body"
-        else:
-            pattern = None
-            desc = "blocks prompt injection in email body"
-            for keyword, pat, label in _PI_PATTERNS:
-                if keyword.lower() in body.lower():
-                    pattern = pat
-                    desc = f"blocks {label} in email body"
-                    break
-            if pattern is None:
-                first_words = " ".join(body.split()[:4])
-                pattern = re.escape(first_words)
+        decoded = _decoded_blob_text(body)
+        source = body if decoded is None else decoded
+        pattern, label = _injection_pattern(source)
+        prefix = "" if decoded is None else "base64-encoded "
 
-        return RuleGenerator._make_rule(
-            attack_id, tool, "BLOCK", field, [pattern], desc, body,
+        rule = RuleGenerator._make_rule(
+            attack_id, tool, "BLOCK", field, [pattern],
+            f"blocks {prefix}{label} in email body", source,
         )
+        if decoded is not None:
+            rule["conditions"][0]["normalize"] = dict(_DECODED_NORMALIZE)
+        return rule
 
     @staticmethod
     def _rule_data_exfiltration(

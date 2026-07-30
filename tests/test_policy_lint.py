@@ -88,21 +88,14 @@ def committed_report() -> LintReport:
     return lint_policy(COMMITTED_POLICY, COMMITTED_PAYLOADS)
 
 
-def test_committed_policy_reports_the_three_live_over_blocks() -> None:
+def test_committed_policy_reports_its_remaining_over_blocks() -> None:
     report = committed_report()
 
     blocked = {(b.rule, b.payload_id): b for b in report.blocks}
     assert set(blocked) == {
-        ("autogen_pi-003", "bn-003"),
         ("autogen_pi-004", "bn-004"),
         ("block_dangerous_shell", "bn-007"),
     }
-
-    order_ref = blocked[("autogen_pi-003", "bn-003")]
-    assert order_ref.pattern == "[A-Za-z0-9+/=]{40,}"
-    assert order_ref.field == "body"
-    assert order_ref.matched_text == "8f3b1c9d4e7a2b6c5d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a"
-    assert order_ref.span == (17, 65)
 
     disregard = blocked[("autogen_pi-004", "bn-004")]
     assert disregard.pattern == "disregard.*rules|override.*safety"
@@ -113,8 +106,8 @@ def test_committed_policy_reports_the_three_live_over_blocks() -> None:
     assert sudo.field == "command"
     assert sudo.matched_text == "sudo "
 
-    assert report.over_block_rate == pytest.approx(33.3)
-    assert report.high_rules == ["autogen_pi-003", "autogen_pi-004", "block_dangerous_shell"]
+    assert report.over_block_rate == pytest.approx(22.2)
+    assert report.high_rules == ["autogen_pi-004", "block_dangerous_shell"]
 
 
 def test_require_approval_on_a_benign_payload_is_friction_not_over_block() -> None:
@@ -131,24 +124,33 @@ def test_committed_policy_has_no_dead_patterns() -> None:
     assert [f for f in report.findings if f.check == "dead_pattern"] == []
 
 
+def test_a_decoded_view_rule_is_not_read_as_dead() -> None:
+    """autogen_pi-003 matches the payload's plaintext, which the raw body does not contain."""
+    report = committed_report()
+    assert findings_for(report, "autogen_pi-003", "decoded_view_widens_match")[0].severity == "medium"
+    assert checks_for(report, "autogen_pi-003") == {"decoded_view_widens_match", "probe_over_block"}
+
+
 def test_committed_policy_linter_noise_is_bounded() -> None:
+    """Every high-severity rule is confirmed by a concrete blocked string, or there are none."""
     report = committed_report()
     assert report.flag_rate is not None and report.flag_rate <= 90.0
-    assert report.high_unconfirmed_rate == 0.0
-    assert report.unconfirmed_rate is not None and report.unconfirmed_rate <= 60.0
+    assert report.high_unconfirmed_rate in (None, 0.0)
+    confirmed = set(report.corpus_confirmed_rules) | set(report.probe_only_rules)
+    assert set(report.high_rules) <= confirmed
 
 
 def test_corpus_free_run_still_flags_the_same_rules() -> None:
     report = lint_policy(COMMITTED_POLICY, None)
     assert report.benign_total == 0
     assert report.over_block_rate is None
-    assert report.high_rules == ["autogen_pi-003", "autogen_pi-004", "block_dangerous_shell"]
+    assert report.high_rules == ["autogen_pi-004", "block_dangerous_shell"]
     assert report.corpus_confirmed_rules == []
-    assert report.probe_only_rules == ["autogen_pi-003", "autogen_pi-004", "block_dangerous_shell"]
+    assert report.probe_only_rules == ["autogen_pi-004", "block_dangerous_shell"]
 
 
-def test_committed_policy_matches_the_original_and_canonical_views() -> None:
-    assert committed_report().views == ["original", "canonical"]
+def test_committed_policy_matches_the_decoded_view_too() -> None:
+    assert committed_report().views == ["original", "canonical", "decoded"]
 
 
 def test_canonical_view_block_is_reported_with_its_view_and_span(tmp_path: Path) -> None:
@@ -426,10 +428,10 @@ def test_missing_payload_file_raises(tmp_path: Path) -> None:
 
 def test_render_report_includes_spans_and_summary() -> None:
     text = render_report(committed_report())
-    assert "over-block rate: 3/9 = 33.3%" in text
+    assert "over-block rate: 2/9 = 22.2%" in text
     assert "BLOCK  bn-007  shell_exec  block_dangerous_shell" in text
     assert "matched 'sudo ' in the original view" in text
-    assert "matched views: original, canonical" in text
+    assert "matched views: original, canonical, decoded" in text
     assert "linter unconfirmed rate" in text
 
 

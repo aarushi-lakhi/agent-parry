@@ -898,48 +898,47 @@ def _growth_estimate(pattern: str, filler: str) -> tuple[str, str]:
 
 
 def _dead_pattern_findings(
-    rule_name: str,
     rule: dict[str, Any],
     payloads: dict[str, dict[str, Any]],
+    engine: PolicyEngine,
 ) -> list[LintFinding]:
-    """Autogen rules whose patterns cannot match the payload they came from."""
+    """Autogen rules that do not fire on the payload they were generated from.
+
+    Decided by evaluating the rule alone through a real ``PolicyEngine`` rather
+    than by re-running each regex over the raw argument, so a rule that matches
+    only in a canonical or decoded view is not read as dead.
+    """
+    rule_name = str(rule.get("name") or "")
     if not rule_name.startswith("autogen_"):
         return []
     payload = payloads.get(rule_name[len("autogen_") :])
     if payload is None:
         return []
-    arguments = payload.get("arguments") or {}
-    findings: list[LintFinding] = []
-    for _index, condition in _pattern_conditions(rule):
-        field = condition.get("field")
-        value = arguments.get(field)
-        if not isinstance(value, str) or not value.strip():
-            continue
-        patterns = [str(p) for p in condition["patterns"]]
-        if any(_safe_search(p, value) for p in patterns):
-            continue
-        findings.append(
-            LintFinding(
-                rule=rule_name,
-                check="dead_pattern",
-                severity=SEV_HIGH,
-                pattern=patterns[0] if patterns else None,
-                field=field,
-                message=(
-                    f"no pattern matches the `{field}` of payload {payload.get('id')} that generated this rule, "
-                    "so the rule can never fire and the gap it claims to close is still open"
-                ),
-            )
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, dict) or not arguments:
+        return []
+    decision = engine.evaluate(str(payload.get("tool") or ""), arguments)
+    if decision.action != PolicyAction.ALLOW:
+        return []
+
+    conditions = _pattern_conditions(rule)
+    condition = conditions[0][1] if conditions else {}
+    patterns = [str(p) for p in condition.get("patterns") or []]
+    field = condition.get("field")
+    return [
+        LintFinding(
+            rule=rule_name,
+            check="dead_pattern",
+            severity=SEV_HIGH,
+            pattern=patterns[0] if patterns else None,
+            field=field if isinstance(field, str) else None,
+            message=(
+                f"nothing in this rule matches payload {payload.get('id')}, the payload that generated it, "
+                "in any view the rule is matched against, so the rule can never fire and the gap it claims "
+                "to close is still open"
+            ),
         )
-    return findings
-
-
-def _safe_search(pattern: str, value: str) -> bool:
-    """`re.search` with IGNORECASE, treating an invalid pattern as no match."""
-    try:
-        return re.search(pattern, value, flags=re.IGNORECASE) is not None
-    except re.error:
-        return False
+    ]
 
 
 def _probe_findings(rule_name: str, rule: dict[str, Any]) -> list[LintFinding]:
@@ -997,34 +996,45 @@ def _is_benign(payload: dict[str, Any]) -> bool:
     return expected == "allow" or payload.get("category") == "benign"
 
 
-def _evaluate_benign(
+def _one_rule_engines(
     rules: list[dict[str, Any]],
-    benign: list[dict[str, Any]],
     settings: dict[str, Any],
-) -> tuple[list[BenignOutcome], list[BenignOutcome]]:
-    """Run every rule alone against every benign payload through a real PolicyEngine.
+    directory: Path,
+) -> list[tuple[dict[str, Any], PolicyEngine]]:
+    """A real PolicyEngine per rule, each loading that rule alone.
 
-    Each one-rule policy carries the real ``settings`` block, so normalization is
+    One rule at a time, because ``evaluate`` is first-match-wins and would
+    otherwise attribute a payload to whichever rule happens to be first. Each
+    one-rule policy carries the real ``settings`` block, so normalization is
     resolved exactly as the deployed policy resolves it. With ``settings: {}`` a
     policy that turned normalization off would still be linted with the canonical
     view on, and the lint would report blocks enforcement does not make.
     """
+    engines: list[tuple[dict[str, Any], PolicyEngine]] = []
+    for index, rule in enumerate(rules):
+        path = directory / f"rule_{index}.yaml"
+        path.write_text(yaml.safe_dump({"rules": [rule], "settings": settings}), encoding="utf-8")
+        engines.append((rule, PolicyEngine(policy_path=str(path))))
+    return engines
+
+
+def _evaluate_benign(
+    engines: list[tuple[dict[str, Any], PolicyEngine]],
+    benign: list[dict[str, Any]],
+) -> tuple[list[BenignOutcome], list[BenignOutcome]]:
+    """Run every rule alone against every benign payload through a real PolicyEngine."""
     blocks: list[BenignOutcome] = []
     approvals: list[BenignOutcome] = []
-    with tempfile.TemporaryDirectory(prefix="agentparry-lint-") as tmp:
-        for index, rule in enumerate(rules):
-            path = Path(tmp) / f"rule_{index}.yaml"
-            path.write_text(yaml.safe_dump({"rules": [rule], "settings": settings}), encoding="utf-8")
-            engine = PolicyEngine(policy_path=str(path))
-            for payload in benign:
-                decision = engine.evaluate(str(payload.get("tool") or ""), payload.get("arguments") or {})
-                if decision.action == PolicyAction.ALLOW:
-                    continue
-                outcome = _outcome(rule, payload, decision.action.value, decision.findings)
-                if decision.action == PolicyAction.BLOCK:
-                    blocks.append(outcome)
-                else:
-                    approvals.append(outcome)
+    for rule, engine in engines:
+        for payload in benign:
+            decision = engine.evaluate(str(payload.get("tool") or ""), payload.get("arguments") or {})
+            if decision.action == PolicyAction.ALLOW:
+                continue
+            outcome = _outcome(rule, payload, decision.action.value, decision.findings)
+            if decision.action == PolicyAction.BLOCK:
+                blocks.append(outcome)
+            else:
+                approvals.append(outcome)
     return blocks, approvals
 
 
@@ -1084,7 +1094,6 @@ def lint_policy(
     pattern_count = 0
     for rule in rules:
         name = str(rule.get("name") or "")
-        findings.extend(_dead_pattern_findings(name, rule, by_id))
         findings.extend(_allowlist_findings(name, rule))
         for index, condition in _pattern_conditions(rule):
             field = condition.get("field")
@@ -1101,7 +1110,11 @@ def lint_policy(
         if probes:
             findings.extend(_probe_findings(name, rule))
 
-    blocks, approvals = _evaluate_benign(rules, benign, settings)
+    with tempfile.TemporaryDirectory(prefix="agentparry-lint-") as tmp:
+        engines = _one_rule_engines(rules, settings, Path(tmp))
+        for rule, engine in engines:
+            findings.extend(_dead_pattern_findings(rule, by_id, engine))
+        blocks, approvals = _evaluate_benign(engines, benign)
     findings.extend(
         LintFinding(
             rule=block.rule,
