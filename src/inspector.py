@@ -1,9 +1,12 @@
 """Inspectors for prompt injection and PII, on both traffic directions.
 
 ``InputInspector`` looks for injected instructions in tool arguments,
-``OutputInspector`` redacts PII from tool results, and ``ResultInspector`` looks
-for injected instructions in tool results, which is the indirect case: a fetched
-page, a file, or an issue comment carrying instructions aimed at the model.
+``OutputInspector`` redacts PII from tool results, ``ResultInspector`` looks for
+injected instructions in tool results, which is the indirect case: a fetched
+page, a file, or an issue comment carrying instructions aimed at the model, and
+``MetadataInspector`` looks for them in the tool catalogue itself, which is the
+discovery case: a poisoned description or schema the client hands to the model
+before any tool is ever called.
 
 Every inspector matches against normalized views of every string rather than the
 raw value, so a zero-width space, a fullwidth spelling, a Cyrillic homoglyph or a
@@ -22,11 +25,12 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from src.models import Finding, ResultInspection
+from src.models import Finding, MetadataInspection, ResultInspection
 from src.normalize import (
     Normalizer,
     TextView,
     detection_normalizer,
+    find_invisible,
     is_opaque_blob,
     iter_base64_runs,
     view_priority,
@@ -100,6 +104,71 @@ INJECTION_PATTERNS: tuple[InjectionPattern, ...] = (
 )
 
 
+StringLeaf = tuple[str, Any, Any, str]
+"""One string leaf as ``(path, container, key, text)``.
+
+``container[key] = replacement`` rewrites it in place, so one walker serves both
+detect-only callers and callers that rewrite what they find. A dict *key* name is
+yielded with ``container`` and ``key`` set to ``None``, because a poisoned key
+cannot be rewritten without changing the shape of the object.
+"""
+
+_KEY_MARKER = "#key"
+
+
+def iter_string_leaves(
+    value: Any,
+    path: str = "arguments",
+    *,
+    include_keys: bool = False,
+    skip_keys: frozenset[str] = frozenset(),
+) -> Iterator[StringLeaf]:
+    """Yield every string leaf under a JSON-like value, at any depth.
+
+    With ``include_keys`` the dict key names are yielded too, at a path ending in
+    ``#key``. Metadata scanning needs them because a property name is text the
+    model reads; argument scanning does not, since the client chose those names.
+    """
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key in skip_keys:
+                continue
+            child_path = f"{path}.{key}"
+            if include_keys and isinstance(key, str):
+                yield (f"{child_path}{_KEY_MARKER}", None, None, key)
+            if isinstance(nested, str):
+                yield (child_path, value, key, nested)
+            else:
+                yield from iter_string_leaves(
+                    nested, child_path, include_keys=include_keys, skip_keys=skip_keys
+                )
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            child_path = f"{path}[{index}]"
+            if isinstance(nested, str):
+                yield (child_path, value, index, nested)
+            else:
+                yield from iter_string_leaves(
+                    nested, child_path, include_keys=include_keys, skip_keys=skip_keys
+                )
+
+
+def dedupe_findings(candidates: list[Finding]) -> list[Finding]:
+    """Keep one finding per (field, pattern, severity), best view wins.
+
+    Load-bearing, not cosmetic. Without it a single obfuscated payload that
+    matches in the original, the canonical view and a decoded view reports three
+    times, tripling ProxyStats counters and every scan report line.
+    """
+    best: dict[tuple[str | None, str | None, str], Finding] = {}
+    for finding in candidates:
+        key = (finding.field, finding.matched_pattern, finding.severity)
+        current = best.get(key)
+        if current is None or view_priority(finding.view) < view_priority(current.view):
+            best[key] = finding
+    return list(best.values())
+
+
 class InputInspector:
     """Detect suspicious prompt-injection strings in tool arguments."""
 
@@ -167,37 +236,11 @@ class InputInspector:
 
     @staticmethod
     def _dedupe(candidates: list[Finding]) -> list[Finding]:
-        """Keep one finding per (field, pattern, severity), best view wins.
-
-        Load-bearing, not cosmetic. Without it a single obfuscated payload that
-        matches in the original, the canonical view and a decoded view reports
-        three times, tripling ProxyStats counters and every scan report line.
-        """
-        best: dict[tuple[str | None, str | None, str], Finding] = {}
-        for finding in candidates:
-            key = (finding.field, finding.matched_pattern, finding.severity)
-            current = best.get(key)
-            if current is None or view_priority(finding.view) < view_priority(current.view):
-                best[key] = finding
-        return list(best.values())
+        return dedupe_findings(candidates)
 
     @classmethod
     def _iter_strings(cls, value: Any, path: str = "arguments") -> list[tuple[str, str]]:
-        if isinstance(value, dict):
-            items: list[tuple[str, str]] = []
-            for key, nested in value.items():
-                next_path = f"{path}.{key}"
-                items.extend(cls._iter_strings(nested, next_path))
-            return items
-        if isinstance(value, list):
-            items = []
-            for idx, nested in enumerate(value):
-                next_path = f"{path}[{idx}]"
-                items.extend(cls._iter_strings(nested, next_path))
-            return items
-        if isinstance(value, str):
-            return [(path, value)]
-        return []
+        return [(leaf_path, text) for leaf_path, _container, _key, text in iter_string_leaves(value, path)]
 
 
 class OutputInspector:
@@ -737,24 +780,495 @@ class ResultInspector:
         return list(_walk_strings(result, "result"))
 
 
+MAX_METADATA_LEAF_CHARS = 20_000
+"""Longest metadata string a scan will look at.
+
+Far below the result-side limit on purpose: a tool description is prose written
+for a model, so anything past this is already the oversize signal below, and a
+``tools/list`` walk runs on the critical path of the client handshake.
+"""
+
+MAX_DESCRIPTION_CHARS = 2_000
+"""Longest description that is not itself suspicious.
+
+Real descriptions run long, but a wall of text is how a poisoned tool buries an
+instruction where a human reviewer scrolling a tool list will never reach it.
+"""
+
+METADATA_METHODS = frozenset({"initialize", "tools/list"})
+"""The two methods that hand server-authored text straight to the model."""
+
+METADATA_REDACTION = (
+    "[AgentParry removed this text: it failed a metadata injection scan. "
+    "The schema around it is unchanged, so the tool is still callable.]"
+)
+INSTRUCTIONS_REDACTION = (
+    "[AgentParry removed the server instructions for this session: they failed a "
+    "metadata injection scan.]"
+)
+
+METADATA_PATTERNS: tuple[InjectionPattern, ...] = (
+    InjectionPattern(
+        re.compile(
+            r"<\s*/?\s*(?:important|critical|urgent|system|admin|root|secret|confidential"
+            r"|hidden|instructions?|directive|note[-_\s]?to[-_\s]?(?:ai|assistant|model|llm))"
+            r"[^<>]{0,64}>",
+            re.IGNORECASE,
+        ),
+        "critical",
+        "Hidden-instruction pseudo-tag",
+    ),
+    InjectionPattern(
+        re.compile(
+            r"\b(?:do\s+not|do\s*n[o']t|never)\s+(?:ever\s+)?"
+            r"(?:tell|mention|inform|notify|reveal|disclose|show|display|report|log)\b",
+            re.IGNORECASE,
+        ),
+        "critical",
+        "Instruction to conceal activity from the user",
+    ),
+    InjectionPattern(
+        re.compile(
+            r"without\s+(?:ever\s+)?(?:informing|telling|notifying|alerting|asking|mentioning\s+(?:it\s+)?to)"
+            r"\s+(?:the\s+)?(?:user|human|operator|owner)",
+            re.IGNORECASE,
+        ),
+        "critical",
+        "Instruction to act without informing the user",
+    ),
+    InjectionPattern(
+        re.compile(
+            r"keep\s+(?:this|it|that|the\s+\w+)\s+(?:a\s+)?(?:secret|confidential|hidden|private)",
+            re.IGNORECASE,
+        ),
+        "critical",
+        "Instruction to keep tool behavior secret",
+    ),
+    InjectionPattern(
+        re.compile(r"\bbefore\s+(?:using|calling|invoking|running)\s+(?:this|the)\s+tool\b", re.IGNORECASE),
+        "high",
+        "Tool-use precondition instruction",
+    ),
+    InjectionPattern(
+        re.compile(r"\bfirst,?\s+(?:you\s+)?must\b", re.IGNORECASE),
+        "high",
+        "Mandatory-first-step instruction",
+    ),
+    InjectionPattern(
+        re.compile(r"\balways\s+(?:call|invoke|run|use|read)\s+[^\s.]{1,64}\s+first\b", re.IGNORECASE),
+        "high",
+        "Instruction to always call another tool first",
+    ),
+    InjectionPattern(
+        re.compile(
+            r"(?:~/\.ssh|~/\.aws|~/\.gnupg|\bid_rsa\b|\bid_ed25519\b|\bmcp\.json\b"
+            r"|claude_desktop_config\.json|\.npmrc\b|\.netrc\b)",
+            re.IGNORECASE,
+        ),
+        "high",
+        "Sensitive path referenced in metadata prose",
+    ),
+    InjectionPattern(
+        re.compile(r"(?:[^\S\r\n]{40,}|(?:\r?\n[^\S\r\n]*){10,})"),
+        "medium",
+        "Long whitespace run hiding metadata content",
+    ),
+)
+
+_PROSE_KEYS = frozenset(
+    {
+        "description",
+        "title",
+        "instructions",
+        "summary",
+        "detail",
+        "details",
+        "notes",
+        "usage",
+        "hint",
+        "$comment",
+    }
+)
+"""Keys whose value is prose for the model, so it can be replaced with a marker.
+
+Everything else is treated as load-bearing. A finding in ``enum``, ``default``,
+``const``, ``pattern``, ``format``, ``required`` or a property key name cannot be
+rewritten without risking client-side schema validation, so it escalates to
+dropping the tool instead.
+"""
+
+_BLOB_EXEMPT_KEYS = frozenset({"pattern", "format", "$schema"})
+"""Keys where the opaque-blob signal is suppressed.
+
+A JSON Schema regex or a format URI is long, mixed-case, punctuation-heavy and
+does not decode to text, which is exactly the shape the blob rule looks for.
+"""
+
+
+def leaf_key(path: str) -> str:
+    """Return the final object key of a leaf path, ignoring list indices."""
+    tail = path.removesuffix(_KEY_MARKER).rsplit(".", 1)[-1]
+    return tail.split("[", 1)[0]
+
+
+def is_prose_leaf(path: str) -> bool:
+    """Report whether a leaf is prose that can be replaced with a marker."""
+    if path.endswith(_KEY_MARKER):
+        return False
+    return leaf_key(path) in _PROSE_KEYS
+
+
+class MetadataInspectorSettings(BaseModel):
+    """What to do about injected instructions found in tool metadata."""
+
+    enabled: bool = True
+    action: Literal["off", "annotate", "redact", "drop", "block"] = "redact"
+    severity_threshold: Literal["medium", "high", "critical"] = "critical"
+    exempt_tools: list[str] = Field(default_factory=list)
+    max_leaf_chars: int = Field(default=MAX_METADATA_LEAF_CHARS, gt=0)
+    max_description_chars: int = Field(default=MAX_DESCRIPTION_CHARS, gt=0)
+
+
+@dataclass(slots=True)
+class _MetadataLeaf:
+    """One scanned metadata leaf and the findings on it."""
+
+    path: str
+    container: Any
+    key: Any
+    findings: list[Finding]
+
+
+class MetadataInspector:
+    """Detect poisoned tool metadata in ``tools/list`` and ``initialize`` results.
+
+    Tool-description poisoning is the attack that never appears in a
+    ``tools/call``: the instruction lives in the description, the schema or the
+    server's ``instructions`` string, and the client splices it into the model's
+    context during discovery. :class:`InputInspector` and :class:`ResultInspector`
+    both run too late to see it.
+
+    The whole tool object is walked generically rather than through an allowlist
+    of keys, so ``title``, ``annotations``, ``outputSchema`` and anything else the
+    spec grows are covered without a code change. That reaches the name,
+    descriptions at any depth, enum members, defaults, ``const``, examples and the
+    property key names.
+
+    Residual risk, and it is the real one: legitimate tool descriptions contain
+    imperative prose, so redaction on a false positive silently degrades a working
+    tool. The critical-only threshold and the ``annotate`` action exist for that,
+    and the pattern set wants tuning against a corpus of real servers before
+    anyone trusts ``redact`` in production.
+    """
+
+    def __init__(
+        self,
+        settings: MetadataInspectorSettings | None = None,
+        normalizer: Normalizer | None = None,
+        patterns: Sequence[InjectionPattern] | None = None,
+    ) -> None:
+        """Build an inspector over the shared and metadata-specific pattern tables."""
+        self._settings = settings or MetadataInspectorSettings()
+        self._normalizer = normalizer or detection_normalizer()
+        if patterns is not None:
+            self._patterns = tuple(patterns)
+        else:
+            self._patterns = INJECTION_PATTERNS + METADATA_PATTERNS
+        self._exempt = frozenset(self._settings.exempt_tools)
+
+    @classmethod
+    def from_policy_settings(cls, settings: Any, **kwargs: Any) -> MetadataInspector:
+        """Build from the ``settings.metadata_inspection`` block of a policy file."""
+        raw = settings.get("metadata_inspection") if isinstance(settings, dict) else None
+        if not isinstance(raw, dict):
+            return cls(**kwargs)
+        overrides = {key: value for key, value in raw.items() if key in MetadataInspectorSettings.model_fields}
+        try:
+            parsed = MetadataInspectorSettings(**overrides)
+        except ValidationError:
+            logger.exception("Invalid settings.metadata_inspection block, using defaults")
+            parsed = MetadataInspectorSettings()
+        return cls(settings=parsed, **kwargs)
+
+    @property
+    def settings(self) -> MetadataInspectorSettings:
+        """Return the settings this inspector was built with."""
+        return self._settings
+
+    def inspect(self, method: str, result: dict[str, Any]) -> MetadataInspection:
+        """Dispatch on the JSON-RPC method that produced this result.
+
+        Both transports call this, so neither can drift into inspecting a
+        different set of methods than the other.
+        """
+        if method == "tools/list":
+            return self.inspect_tools_list(result)
+        if method == "initialize":
+            return self.inspect_initialize(result)
+        return MetadataInspection(result=result)
+
+    def inspect_tools_list(self, result: dict[str, Any]) -> MetadataInspection:
+        """Scan every advertised tool and apply the configured action."""
+        tools = result.get("tools")
+        if not self._active() or not isinstance(tools, list):
+            return MetadataInspection(result=result)
+
+        payload = copy.deepcopy(result)
+        scanned: list[Any] = payload.get("tools", [])
+        findings: list[Finding] = []
+        kept: list[Any] = []
+        redacted_tools: list[str] = []
+        dropped_tools: list[str] = []
+        applied: set[str] = set()
+        blocked = False
+
+        for tool in scanned:
+            name = tool.get("name") if isinstance(tool, dict) else None
+            if not isinstance(tool, dict) or not isinstance(name, str) or not name:
+                logger.info("Skipping tools/list entry with no usable name")
+                kept.append(tool)
+                continue
+            if name in self._exempt:
+                kept.append(tool)
+                continue
+
+            leaves = self._scan_tool_leaves(tool, subject=f"tool {name}")
+            tool_findings = [finding for leaf in leaves for finding in leaf.findings]
+            if not tool_findings:
+                kept.append(tool)
+                continue
+            findings.extend(tool_findings)
+
+            actionable = [leaf for leaf in leaves if self._actionable(leaf.findings)]
+            if not actionable:
+                applied.add("annotate")
+                kept.append(tool)
+                continue
+
+            action = self._settings.action
+            if action == "annotate":
+                applied.add("annotate")
+                kept.append(tool)
+                continue
+            if action == "block":
+                blocked = True
+                applied.add("block")
+                kept.append(tool)
+                continue
+            if action == "drop" or any(not is_prose_leaf(leaf.path) for leaf in actionable):
+                logger.warning("Dropping poisoned tool from tools/list tool=%s", name)
+                dropped_tools.append(name)
+                applied.add("drop")
+                continue
+
+            for leaf in actionable:
+                leaf.container[leaf.key] = METADATA_REDACTION
+            redacted_tools.append(name)
+            applied.add("redact")
+            kept.append(tool)
+
+        payload["tools"] = kept
+        if blocked:
+            return MetadataInspection(
+                result=payload,
+                findings=findings,
+                action="block",
+                blocked=True,
+                block_message="Blocked: poisoned tool metadata detected in tools/list",
+            )
+        action = next((name for name in ("drop", "redact", "annotate") if name in applied), "none")
+        if findings:
+            self._annotate(payload, action, findings, redacted_tools, dropped_tools)
+        return MetadataInspection(
+            result=payload,
+            findings=findings,
+            action=action,
+            redacted_tools=redacted_tools,
+            dropped_tools=dropped_tools,
+        )
+
+    def inspect_initialize(self, result: dict[str, Any]) -> MetadataInspection:
+        """Scan ``result.instructions``, which clients splice into the system prompt."""
+        instructions = result.get("instructions")
+        if not self._active() or not isinstance(instructions, str) or not instructions:
+            return MetadataInspection(result=result)
+
+        findings = self.scan_instructions(instructions)
+        if not findings:
+            return MetadataInspection(result=result)
+
+        payload = copy.deepcopy(result)
+        if not self._actionable(findings) or self._settings.action == "annotate":
+            self._annotate(payload, "annotate", findings, [], [])
+            return MetadataInspection(result=payload, findings=findings, action="annotate")
+        if self._settings.action == "block":
+            return MetadataInspection(
+                result=payload,
+                findings=findings,
+                action="block",
+                blocked=True,
+                block_message="Blocked: poisoned server instructions detected in initialize",
+            )
+        if self._settings.action == "drop":
+            payload.pop("instructions", None)
+            action = "drop"
+        else:
+            payload["instructions"] = INSTRUCTIONS_REDACTION
+            action = "redact"
+        self._annotate(payload, action, findings, [], [])
+        return MetadataInspection(result=payload, findings=findings, action=action)
+
+    def scan_tool(self, tool: dict[str, Any]) -> list[Finding]:
+        """Return every finding in one tool object, without acting on it.
+
+        The scanner's ground truth: it re-runs this over whatever came back, so a
+        proxy that annotates a clean sheet it did not produce cannot fake one.
+        """
+        if not isinstance(tool, dict):
+            return []
+        name = tool.get("name")
+        subject = f"tool {name}" if isinstance(name, str) and name else "unnamed tool"
+        return [finding for leaf in self._scan_tool_leaves(tool, subject=subject) for finding in leaf.findings]
+
+    def scan_instructions(self, instructions: str) -> list[Finding]:
+        """Return every finding in an ``initialize`` instructions string."""
+        return self._scan_leaf("result.instructions", instructions, subject="initialize instructions")
+
+    def _active(self) -> bool:
+        return self._settings.enabled and self._settings.action != "off"
+
+    def _actionable(self, findings: Sequence[Finding]) -> bool:
+        threshold = _SEVERITY_RANK[self._settings.severity_threshold]
+        return any(_SEVERITY_RANK[finding.severity] >= threshold for finding in findings)
+
+    def _scan_tool_leaves(self, tool: dict[str, Any], *, subject: str) -> list[_MetadataLeaf]:
+        leaves: list[_MetadataLeaf] = []
+        for path, container, key, text in list(iter_string_leaves(tool, "tool", include_keys=True)):
+            findings = self._scan_leaf(path, text, subject=subject)
+            if findings:
+                leaves.append(_MetadataLeaf(path=path, container=container, key=key, findings=findings))
+        return leaves
+
+    def _scan_leaf(self, path: str, text: str, *, subject: str) -> list[Finding]:
+        if len(text) > self._settings.max_leaf_chars:
+            logger.info(
+                "Skipping oversized metadata leaf field=%s chars=%s limit=%s",
+                path,
+                len(text),
+                self._settings.max_leaf_chars,
+            )
+            return []
+
+        candidates: list[Finding] = []
+        for view in self._normalizer.views(text):
+            for entry in self._patterns:
+                match = entry.pattern.search(view.text)
+                if match is None:
+                    continue
+                candidates.append(
+                    Finding(
+                        severity=entry.severity,
+                        description=f"{entry.description} in {subject}",
+                        field=path,
+                        matched_pattern=entry.pattern.pattern,
+                        view=view.name,
+                        matched_text=match.group(0),
+                        span=view.map_span(*match.span()),
+                    )
+                )
+        candidates.extend(self._invisible_findings(path, text, subject))
+        candidates.extend(self._oversize_findings(path, text, subject))
+        if leaf_key(path) not in _BLOB_EXEMPT_KEYS:
+            candidates.extend(self._blob_findings(path, text, subject))
+        return dedupe_findings(candidates)
+
+    @staticmethod
+    def _invisible_findings(path: str, text: str, subject: str) -> list[Finding]:
+        """Flag any invisible character at all in metadata.
+
+        Stricter than the argument and result sides, which only use invisibles to
+        build a normalized view. Nothing legitimate hides a zero-width joiner in a
+        tool description, so presence alone is the finding.
+        """
+        matches = find_invisible(text)
+        if not matches:
+            return []
+        first = matches[0]
+        return [
+            Finding(
+                severity="critical",
+                description=f"Invisible characters in {subject} ({len(matches)} found)",
+                field=path,
+                matched_pattern="invisible characters",
+                matched_text=f"U+{ord(first.group(0)):04X}",
+                span=first.span(),
+            )
+        ]
+
+    def _oversize_findings(self, path: str, text: str, subject: str) -> list[Finding]:
+        if not is_prose_leaf(path) or len(text) <= self._settings.max_description_chars:
+            return []
+        return [
+            Finding(
+                severity="medium",
+                description=f"Oversized metadata prose in {subject} ({len(text)} chars)",
+                field=path,
+                matched_pattern="oversized metadata",
+            )
+        ]
+
+    @staticmethod
+    def _blob_findings(path: str, text: str, subject: str) -> list[Finding]:
+        findings: list[Finding] = []
+        for match in iter_base64_runs(text, min_length=40):
+            fragment = match.group(0)
+            if not is_opaque_blob(fragment):
+                continue
+            findings.append(
+                Finding(
+                    severity="medium",
+                    description=f"Suspicious {_OPAQUE_BLOB_SIGNAL} in {subject}",
+                    field=path,
+                    matched_pattern=_OPAQUE_BLOB_SIGNAL,
+                    matched_text=fragment,
+                    span=match.span(),
+                )
+            )
+        return findings
+
+    @staticmethod
+    def _annotate(
+        payload: dict[str, Any],
+        action: str,
+        findings: list[Finding],
+        redacted_tools: list[str],
+        dropped_tools: list[str],
+    ) -> None:
+        """Record what was found under our own key, merging with what is there.
+
+        Carries no matched text, so annotating cannot smuggle the payload it just
+        removed back into the model's context.
+        """
+        existing = payload.get(AGENTPARRY_KEY)
+        meta = dict(existing) if isinstance(existing, dict) else {}
+        meta["metadata_injection"] = {
+            "action": action,
+            "redacted_tools": list(redacted_tools),
+            "dropped_tools": list(dropped_tools),
+            "findings": [
+                {"severity": finding.severity, "field": finding.field, "description": finding.description}
+                for finding in findings
+            ],
+        }
+        payload[AGENTPARRY_KEY] = meta
+
+
 def _walk_strings(value: Any, path: str) -> Iterator[Leaf]:
     """Yield every string leaf under a JSON-like value, skipping our own key."""
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key == AGENTPARRY_KEY:
-                continue
-            child_path = f"{path}.{key}"
-            if isinstance(nested, str):
-                yield (child_path, value, key)
-            else:
-                yield from _walk_strings(nested, child_path)
-    elif isinstance(value, list):
-        for index, nested in enumerate(value):
-            child_path = f"{path}[{index}]"
-            if isinstance(nested, str):
-                yield (child_path, value, index)
-            else:
-                yield from _walk_strings(nested, child_path)
+    for leaf_path, container, key, _text in iter_string_leaves(
+        value, path, skip_keys=frozenset({AGENTPARRY_KEY})
+    ):
+        yield (leaf_path, container, key)
 
 
 def _inside_any(span: tuple[int, int], regions: list[tuple[int, int]]) -> bool:
