@@ -89,3 +89,8 @@ settings:
     action: neutralize
     severity_threshold: high
     exempt_tools: []
+  metadata_inspection:
+    enabled: true
+    action: redact
+    severity_threshold: critical
+    exempt_tools: []

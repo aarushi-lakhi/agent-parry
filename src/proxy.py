@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -22,9 +23,16 @@ from rich.console import Console
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
-from src.inspector import InputInspector, OutputInspector, ResultInspector
+from src.inspector import (
+    METADATA_METHODS,
+    InputInspector,
+    MetadataInspector,
+    OutputInspector,
+    ResultInspector,
+)
 from src.models import (
     INJECTION_BLOCK_ERROR_CODE,
+    METADATA_BLOCK_ERROR_CODE,
     MOCK_SERVER_URL,
     RESULT_INJECTION_ERROR_CODE,
     JsonRpcRequest,
@@ -34,12 +42,15 @@ from src.models import (
 )
 from src.policy import PolicyEngine
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="AgentParry Proxy", version="1.0")
 console = Console()
 policy_engine = PolicyEngine()
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
 result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
 stats = ProxyStats()
 _bypass_all: bool = False
 
@@ -205,6 +216,11 @@ def _log_result_inject(tool_name: str, action: str, count: int) -> None:
     _print_log_line(f"[RESULT]  {tool_name:<10} {action}: {count} injection finding(s) in tool result")
 
 
+def _log_metadata_inject(method: str, action: str, count: int, affected: list[str]) -> None:
+    suffix = f" tools={','.join(affected)}" if affected else ""
+    _print_log_line(f"[META]    {method:<10} {action}: {count} poisoned metadata finding(s){suffix}")
+
+
 def _get_tool_payload(request: JsonRpcRequest) -> tuple[str | None, dict[str, Any] | None]:
     params = request.params or {}
     tool_name = params.get("name")
@@ -243,10 +259,45 @@ def _safe_scan_truthy(value: str | None) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
-    if request.method in {"initialize", "tools/list"}:
-        upstream_payload = _forward_to_upstream(request.model_dump())
+def _inspect_metadata(request: JsonRpcRequest, upstream_payload: dict[str, Any]) -> JsonRpcResponse:
+    """Scan a discovery result for poisoned metadata, failing open on error.
+
+    Fail-open matches the rest of the proxy: an inspector bug must not make a
+    client unable to list tools.
+    """
+    result_payload = upstream_payload.get("result")
+    if not isinstance(result_payload, dict):
         return JsonRpcResponse.model_validate(upstream_payload)
+
+    try:
+        inspection = metadata_inspector.inspect(request.method, result_payload)
+    except Exception:
+        logger.exception("Metadata inspection failed for %s; forwarding raw (fail-open)", request.method)
+        return JsonRpcResponse.model_validate(upstream_payload)
+
+    if inspection.findings:
+        affected = inspection.dropped_tools + inspection.redacted_tools
+        stats.increment(
+            metadata_injections=1,
+            metadata_tools_dropped=len(inspection.dropped_tools),
+        )
+        _log_metadata_inject(request.method, inspection.action, len(inspection.findings), affected)
+    if inspection.blocked:
+        stats.increment(blocked=1)
+        return _jsonrpc_error(
+            request_id=request.id,
+            code=METADATA_BLOCK_ERROR_CODE,
+            message=inspection.block_message,
+        )
+
+    upstream_payload["result"] = inspection.result
+    return JsonRpcResponse.model_validate(upstream_payload)
+
+
+def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
+    if request.method in METADATA_METHODS:
+        upstream_payload = _forward_to_upstream(request.model_dump())
+        return _inspect_metadata(request, upstream_payload)
 
     if request.method != "tools/call":
         return _jsonrpc_error(
@@ -378,9 +429,10 @@ def enable_policy() -> dict[str, str]:
 
 @app.post("/policy/reload")
 def reload_policy() -> dict[str, Any]:
-    global result_inspector
+    global result_inspector, metadata_inspector
     policy_engine.reload()
     result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+    metadata_inspector = MetadataInspector.from_policy_settings(policy_engine.get_settings())
     return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
 
 
