@@ -1,8 +1,8 @@
 """Shared pytest fixtures.
 
-The audit isolation fixture is autouse so a test that never mentions auditing
-still cannot write to the real ~/.agentparry. Autouse fixtures do apply to
-unittest.TestCase methods, which most of this suite uses.
+The isolation fixtures are autouse so a test that never mentions auditing or
+pinning still cannot write to the real ~/.agentparry. Autouse fixtures do apply
+to unittest.TestCase methods, which most of this suite uses.
 """
 
 from __future__ import annotations
@@ -28,3 +28,9 @@ def isolate_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     audit.reset_writer()
     yield
     audit.reset_writer()
+
+
+@pytest.fixture(autouse=True)
+def isolate_pins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point the tool-list pin store at tmp_path, subprocesses included."""
+    monkeypatch.setenv("AGENTPARRY_PINS_PATH", str(tmp_path / "pins" / "pins.json"))
