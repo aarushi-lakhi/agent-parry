@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import io
 import json
@@ -10,8 +11,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from src import audit as audit_module
@@ -27,17 +31,21 @@ from src.inspector import (
 from src.models import AuditAction, AuditArgsMode, AuditTransport, PolicyAction, PolicyDecision
 from src.policy import PolicyEngine
 from src.stdio_proxy import (
+    PolicyFileWatcher,
+    PolicyReloadError,
     StdioMcpProxy,
     _default_log_path,
     _error_response,
     _get_tool_payload,
     _json_dumps_line,
+    _load_policy_document,
     _parse_child_command,
     _parse_wrap_argv,
     _read_one_json_message_async,
     _read_one_json_message_from_buffer,
     _resolve_policy_path,
     _run_proxy,
+    build_policy_bundle,
 )
 
 
@@ -690,6 +698,15 @@ class TestRunProxyHelp(unittest.TestCase):
         code = asyncio.run(_run_proxy(["--help"]))
         self.assertEqual(code, 0)
 
+    def test_help_lists_the_reload_flags(self) -> None:
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            self.assertEqual(0, asyncio.run(_run_proxy(["--help"])))
+        text = stream.getvalue()
+        self.assertIn("--reload-on-change", text)
+        self.assertIn("--no-reload-on-change", text)
+        self.assertIn("--reload-interval", text)
+
 
 class TestStdioProxySubprocess(unittest.TestCase):
     @classmethod
@@ -1003,6 +1020,397 @@ class TestStdioProxyResultInjectionSubprocess(unittest.TestCase):
         names = [tool["name"] for tool in parsed[0]["result"]["tools"]]
         self.assertEqual(["safe_tool", "poisoned_tool"], names)
         self.assertIn("IMPORTANT", json.dumps(parsed[0]["result"]["tools"]))
+
+
+POLICY_ONE_RULE = """rules:
+- name: block_unused_tool
+  tool: unused_tool
+  action: BLOCK
+  message: not the tool under test
+  conditions:
+  - type: always
+settings: {}
+"""
+
+POLICY_BLOCKS_SHELL = """rules:
+- name: block_shell_exec
+  tool: shell_exec
+  action: BLOCK
+  message: blocked by the reloaded policy
+  conditions:
+  - type: always
+settings: {}
+"""
+
+POLICY_RESULT_BLOCK = """rules:
+- name: block_unused_tool
+  tool: unused_tool
+  action: BLOCK
+  message: not the tool under test
+  conditions:
+  - type: always
+settings:
+  result_inspection:
+    action: block
+"""
+
+POLICY_METADATA_BLOCK = """rules:
+- name: block_unused_tool
+  tool: unused_tool
+  action: BLOCK
+  message: not the tool under test
+  conditions:
+  - type: always
+settings:
+  metadata_inspection:
+    action: block
+"""
+
+
+class TestPolicyDocumentLoading(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "policy.yaml"
+
+    def test_valid_document_builds_a_bundle(self) -> None:
+        self.path.write_text(POLICY_BLOCKS_SHELL, encoding="utf-8")
+        bundle = build_policy_bundle(self.path)
+        self.assertEqual(1, bundle.rule_count)
+        self.assertEqual("neutralize", bundle.result_inspector.settings.action)
+
+    def test_settings_block_reaches_the_inspectors(self) -> None:
+        self.path.write_text(POLICY_METADATA_BLOCK, encoding="utf-8")
+        bundle = build_policy_bundle(self.path)
+        self.assertEqual("block", bundle.metadata_inspector.settings.action)
+
+    def test_yaml_syntax_error_raises(self) -> None:
+        self.path.write_text("rules: [\n  - name: broken\n", encoding="utf-8")
+        with self.assertRaises(PolicyReloadError):
+            _load_policy_document(self.path)
+
+    def test_empty_rule_list_raises(self) -> None:
+        self.path.write_text("rules: []\nsettings: {}\n", encoding="utf-8")
+        with self.assertRaises(PolicyReloadError):
+            _load_policy_document(self.path)
+
+    def test_missing_rules_key_raises(self) -> None:
+        self.path.write_text("settings: {}\n", encoding="utf-8")
+        with self.assertRaises(PolicyReloadError):
+            _load_policy_document(self.path)
+
+    def test_non_mapping_root_raises(self) -> None:
+        self.path.write_text("- just\n- a list\n", encoding="utf-8")
+        with self.assertRaises(PolicyReloadError):
+            _load_policy_document(self.path)
+
+    def test_settings_not_a_mapping_raises(self) -> None:
+        self.path.write_text(POLICY_ONE_RULE.replace("settings: {}", "settings: nope"), encoding="utf-8")
+        with self.assertRaises(PolicyReloadError):
+            _load_policy_document(self.path)
+
+    def test_missing_file_raises(self) -> None:
+        with self.assertRaises(PolicyReloadError):
+            _load_policy_document(self.path)
+
+    def test_truncated_file_that_still_parses_is_rejected(self) -> None:
+        """A half-written file can be valid YAML whose rules no longer compile."""
+        self.path.write_text(POLICY_BLOCKS_SHELL[:28], encoding="utf-8")
+        self.assertEqual([{"name": "block_shell_e"}], _load_policy_document(self.path)["rules"])
+        with self.assertRaises(PolicyReloadError):
+            build_policy_bundle(self.path)
+
+
+class TestPolicyFileWatcher(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.audit_path = Path(os.environ["AGENTPARRY_AUDIT_PATH"])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.policy_path = Path(tmp.name) / "policy.yaml"
+        self._mtime_bump = 0
+        self.write_policy(POLICY_ONE_RULE)
+
+    def write_policy(self, text: str) -> None:
+        """Write policy text and force a fresh stat stamp, so no test needs a sleep."""
+        self.policy_path.write_text(text, encoding="utf-8")
+        self._mtime_bump += 1
+        stamp = self.policy_path.stat().st_mtime_ns + self._mtime_bump * 1_000_000_000
+        os.utime(self.policy_path, ns=(stamp, stamp))
+
+    def audit_records(self) -> list[dict[str, object]]:
+        if not self.audit_path.exists():
+            return []
+        lines = [ln for ln in self.audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        return [json.loads(ln) for ln in lines]
+
+    def reload_records(self) -> list[dict[str, object]]:
+        return [r for r in self.audit_records() if r["action"] == AuditAction.POLICY_RELOAD.value]
+
+    async def _watched(
+        self, *, interval: float = 0.01
+    ) -> tuple[StdioMcpProxy, list[dict[str, object]], PolicyFileWatcher]:
+        bundle = build_policy_bundle(self.policy_path)
+        writer = audit_module.AuditWriter(transport=AuditTransport.STDIO)
+        self.addCleanup(writer.close)
+        captured: list[dict[str, object]] = []
+        proxy = StdioMcpProxy(
+            policy_engine=bundle.engine,
+            input_inspector=InputInspector(),
+            output_inspector=OutputInspector(),
+            result_inspector=bundle.result_inspector,
+            metadata_inspector=bundle.metadata_inspector,
+            stdout_lock=asyncio.Lock(),
+            audit=writer,
+        )
+
+        async def capture(obj: dict[str, object]) -> None:
+            captured.append(obj)
+
+        proxy.write_stdout = capture  # type: ignore[method-assign]
+        return proxy, captured, PolicyFileWatcher(proxy, self.policy_path, interval=interval)
+
+    @staticmethod
+    async def _shell_call(proxy: StdioMcpProxy, req_id: int) -> dict[str, Any] | None:
+        return await proxy.handle_client_message(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": "shell_exec", "arguments": {"command": "ls"}},
+            }
+        )
+
+    async def test_reload_picks_up_a_new_rule_mid_session(self) -> None:
+        proxy, captured, watcher = await self._watched()
+        self.assertIsNotNone(await self._shell_call(proxy, 1))
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        self.assertTrue(await watcher.poll_once())
+        self.assertIsNone(await self._shell_call(proxy, 2))
+        self.assertEqual(-32001, captured[-1]["error"]["code"])
+        self.assertEqual("blocked by the reloaded policy", captured[-1]["error"]["message"])
+
+    async def test_unchanged_file_does_not_reload(self) -> None:
+        proxy, _captured, watcher = await self._watched()
+        engine = proxy._policy
+        self.assertFalse(await watcher.poll_once())
+        self.assertIs(engine, proxy._policy)
+        self.assertEqual([], self.reload_records())
+
+    async def test_syntax_error_keeps_the_previous_rules_in_force(self) -> None:
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        proxy, captured, watcher = await self._watched()
+        self.write_policy("rules: [\n  - name: broken\n")
+        with self.assertLogs("src.stdio_proxy", level="WARNING") as logs:
+            self.assertFalse(await watcher.poll_once())
+        self.assertTrue(any("Policy reload rejected" in line for line in logs.output))
+        self.assertEqual(1, proxy.rule_count)
+        self.assertIsNone(await self._shell_call(proxy, 3))
+        self.assertEqual(-32001, captured[-1]["error"]["code"])
+
+    async def test_truncated_write_keeps_the_previous_rules_in_force(self) -> None:
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        proxy, captured, watcher = await self._watched()
+        self.write_policy(POLICY_BLOCKS_SHELL[:28])
+        self.assertFalse(await watcher.poll_once())
+        self.assertEqual(1, proxy.rule_count)
+        self.assertIsNone(await self._shell_call(proxy, 4))
+        self.assertEqual(-32001, captured[-1]["error"]["code"])
+
+    async def test_empty_rule_list_is_refused(self) -> None:
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        proxy, captured, watcher = await self._watched()
+        self.write_policy("rules: []\nsettings: {}\n")
+        self.assertFalse(await watcher.poll_once())
+        self.assertIsNone(await self._shell_call(proxy, 5))
+        self.assertEqual(-32001, captured[-1]["error"]["code"])
+
+    async def test_deleted_file_keeps_the_previous_rules_in_force(self) -> None:
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        proxy, captured, watcher = await self._watched()
+        self.policy_path.unlink()
+        self.assertFalse(await watcher.poll_once())
+        self.assertIsNone(await self._shell_call(proxy, 6))
+        self.assertEqual(-32001, captured[-1]["error"]["code"])
+
+    async def test_successful_reload_is_audited(self) -> None:
+        _proxy, _captured, watcher = await self._watched()
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        self.assertTrue(await watcher.poll_once())
+        records = self.reload_records()
+        self.assertEqual(1, len(records), msg=f"reload records: {records!r}")
+        self.assertEqual("stdio", records[0]["transport"])
+        self.assertEqual("policy reload ok; rules_loaded=1", records[0]["detail"])
+
+    async def test_rejected_reload_is_audited_with_the_rules_still_in_force(self) -> None:
+        _proxy, _captured, watcher = await self._watched()
+        self.write_policy("rules: []\nsettings: {}\n")
+        self.assertFalse(await watcher.poll_once())
+        records = self.reload_records()
+        self.assertEqual(1, len(records), msg=f"reload records: {records!r}")
+        detail = str(records[0]["detail"])
+        self.assertIn("policy reload rejected", detail)
+        self.assertIn("rules_in_force=1", detail)
+        self.assertIn("zero rules", detail)
+
+    async def test_reload_writes_nothing_to_stdout(self) -> None:
+        _proxy, captured, watcher = await self._watched()
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="utf-8")
+        with patch.object(sys, "stdout", stream):
+            self.assertTrue(await watcher.poll_once())
+            self.write_policy("rules: [\n")
+            self.assertFalse(await watcher.poll_once())
+        stream.flush()
+        self.assertEqual(b"", raw.getvalue())
+        self.assertEqual([], captured)
+
+    async def test_reload_rebuilds_the_result_inspector(self) -> None:
+        proxy, _captured, watcher = await self._watched()
+        self.write_policy(POLICY_RESULT_BLOCK)
+        self.assertTrue(await watcher.poll_once())
+        self.assertEqual("block", proxy._result_inspector.settings.action)
+
+        await proxy.handle_client_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {"name": "notes_read", "arguments": {}},
+            }
+        )
+        out = await proxy.handle_server_message(
+            {"jsonrpc": "2.0", "id": 10, "result": {"content": [{"type": "text", "text": INJECTED}]}}
+        )
+        self.assertNotIn("result", out)
+        self.assertEqual(-32002, out["error"]["code"])
+
+    async def test_reload_rebuilds_the_metadata_inspector(self) -> None:
+        proxy, _captured, watcher = await self._watched()
+        self.write_policy(POLICY_METADATA_BLOCK)
+        self.assertTrue(await watcher.poll_once())
+        self.assertEqual("block", proxy._metadata_inspector.settings.action)
+
+        await proxy.handle_client_message({"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}})
+        out = await proxy.handle_server_message(
+            {"jsonrpc": "2.0", "id": 11, "result": {"tools": [copy.deepcopy(POISONED_TOOL)]}}
+        )
+        self.assertNotIn("result", out)
+        self.assertEqual(-32003, out["error"]["code"])
+
+    async def test_run_loop_reloads_until_cancelled(self) -> None:
+        proxy, _captured, watcher = await self._watched(interval=0.01)
+        task = asyncio.create_task(watcher.run())
+        self.write_policy(POLICY_BLOCKS_SHELL)
+        try:
+            for _ in range(500):
+                if await self._shell_call(proxy, 12) is None:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("watcher never installed the new policy")
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+class TestPolicyReloadSubprocess(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._repo_root = Path(__file__).resolve().parents[1]
+        cls._stub = cls._repo_root / "tests" / "fixtures" / "mcp_stdio_stub.py"
+
+    def _spawn(self, policy_path: Path, log_path: Path, extra: list[str]) -> subprocess.Popen[str]:
+        cmd = [
+            sys.executable,
+            "-m",
+            "src.stdio_proxy",
+            "--policy",
+            str(policy_path),
+            "--log",
+            str(log_path),
+            *extra,
+            "--wrap",
+            sys.executable,
+            "--",
+            str(self._stub),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(self._repo_root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        self.addCleanup(proc.kill)
+        return proc
+
+    def _call(self, proc: subprocess.Popen[str], req_id: int) -> dict[str, Any]:
+        assert proc.stdin is not None and proc.stdout is not None
+        request = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "tools/call",
+            "params": {"name": "shell_exec", "arguments": {"command": "ls"}},
+        }
+        proc.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+        frames: list[str] = []
+        reader = threading.Thread(target=lambda: frames.append(proc.stdout.readline()), daemon=True)
+        reader.start()
+        reader.join(30.0)
+        self.assertTrue(frames, msg=f"no response frame for id={req_id}")
+        return json.loads(frames[0])
+
+    @staticmethod
+    def _wait_for_reload(log_path: Path, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if log_path.exists() and "Policy reloaded" in log_path.read_text(encoding="utf-8"):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_policy_rewritten_between_two_calls_blocks_the_second(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            policy_path = tmp / "policy.yaml"
+            log_path = tmp / "proxy.log"
+            policy_path.write_text(POLICY_ONE_RULE, encoding="utf-8")
+            proc = self._spawn(policy_path, log_path, ["--reload-interval", "0.05"])
+
+            first = self._call(proc, 1)
+            self.assertEqual({"ok": True}, first["result"])
+
+            policy_path.write_text(POLICY_BLOCKS_SHELL, encoding="utf-8")
+            self.assertTrue(self._wait_for_reload(log_path), msg="proxy never logged a reload")
+
+            second = self._call(proc, 2)
+            self.assertEqual(-32001, second["error"]["code"])
+            self.assertEqual("blocked by the reloaded policy", second["error"]["message"])
+
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.close()
+            proc.wait(timeout=30)
+            rest = proc.stdout.read()
+            self.assertEqual([], [ln for ln in rest.splitlines() if ln.strip()])
+
+    def test_no_reload_on_change_keeps_the_startup_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            policy_path = tmp / "policy.yaml"
+            log_path = tmp / "proxy.log"
+            policy_path.write_text(POLICY_ONE_RULE, encoding="utf-8")
+            proc = self._spawn(policy_path, log_path, ["--reload-interval", "0.05", "--no-reload-on-change"])
+
+            self.assertEqual({"ok": True}, self._call(proc, 1)["result"])
+            policy_path.write_text(POLICY_BLOCKS_SHELL, encoding="utf-8")
+            time.sleep(0.5)
+            self.assertEqual({"ok": True}, self._call(proc, 2)["result"])
+            self.assertFalse(self._wait_for_reload(log_path, timeout=0.1))
 
 
 class TestDefaultLogPath(unittest.TestCase):

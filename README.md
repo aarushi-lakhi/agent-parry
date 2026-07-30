@@ -26,6 +26,8 @@ Put AgentParry flags **before** `--wrap`. After `--wrap`, the first token is the
 | `--log PATH` | Log file (default: `~/.agentparry/proxy.log`) |
 | `--audit PATH` | JSONL audit log (default: `~/.agentparry/audit.jsonl`, or `AGENTPARRY_AUDIT_PATH`) |
 | `--no-audit` | Disable the audit log |
+| `--reload-on-change` / `--no-reload-on-change` | Reload the policy file when it changes on disk (default: on) |
+| `--reload-interval SECONDS` | Poll interval for that watch (default: 2) |
 | `--verbose` | Extra logging to stderr and the log file |
 | `--wrap CMD` | Command to spawn the real MCP server |
 
@@ -86,7 +88,9 @@ Before writing, `harden` backs the policy up to a `.bak` sibling, prints a unifi
 
 Without `--full` both commands use `Scanner.run_rescan`, which replays only the payloads that previously got through. It therefore cannot see a payload that used to behave correctly and now does not, nor over-blocking among payloads it never replays, so both commands print how many previously correct payloads were skipped. Both also report false positives the new rules introduced: closing four holes while breaking three legitimate calls is not a clean run.
 
-**Writing rules only helps if something reloads them.** `harden` attempts `POST /policy/reload` on the host derived from `--target`, sending `AGENTPARRY_ADMIN_TOKEN` as a bearer token when it is set, and treats any failure as a warning since the file on disk is already updated. The stdio proxy is worse off: it builds its `PolicyEngine` once at startup and has no reload path at all, so a hardening run can never take effect in a live `agentparry wrap` session. `harden` prints a line saying the MCP client has to be restarted.
+**Writing rules only helps if something reloads them.** `harden` attempts `POST /policy/reload` on the host derived from `--target`, sending `AGENTPARRY_ADMIN_TOKEN` as a bearer token when it is set, and treats any failure as a warning since the file on disk is already updated. The stdio proxy watches its policy file and reloads on change, so a hardening run reaches a live `agentparry wrap` session within `--reload-interval` seconds (default 2). `--no-reload-on-change` turns the watch off, and then the MCP client has to be restarted.
+
+A reload rebuilds the engine, the result inspector and the metadata inspector together, so a `settings` edit lands with the rules. It refuses any document that would weaken enforcement: unreadable file, YAML syntax error, non-mapping root, and any policy whose rules do not compile to at least one usable rule, which is what a file caught mid-write usually looks like. Every attempt is audited as `POLICY_RELOAD` with the outcome and the rule count; a rejected one leaves the previously loaded policy in force and logs to `~/.agentparry/proxy.log`.
 
 Exit codes, since both are meant for CI:
 
