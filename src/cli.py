@@ -40,6 +40,14 @@ from src.replay import (
     read_log,
     render_text,
 )
+from src.resources import (
+    PAYLOADS_DEFAULT_HELP,
+    POLICY_DEFAULT_HELP,
+    copy_out_policy,
+    resolve_payloads,
+    resolve_policy,
+    user_policy_path,
+)
 from src.rule_generator import (
     AutogenMergePlan,
     RuleGenerator,
@@ -81,62 +89,91 @@ def _split_command(command: str) -> tuple[str, list[str]]:
     return parts[0], parts[1:]
 
 
+ENTRY_COMMAND = "agentparry"
+"""The console script an installed entry invokes, so no interpreter path is recorded."""
+
 _STDIO_PROXY_ARGS_PREFIX = ["-m", "src.stdio_proxy"]
+_WRAP_ARGS_PREFIX = ["wrap"]
 
 
-def _wrap_stdio_args(policy_abs: str, cmd: str, child_args: list[str]) -> list[str]:
-    wrap_tail = ["--wrap", cmd]
+def _wrap_stdio_args(policy_abs: str | None, cmd: str, child_args: list[str]) -> list[str]:
+    """Args for `python -m src.stdio_proxy`, the shape `--python` installs."""
+    args = list(_STDIO_PROXY_ARGS_PREFIX)
+    if policy_abs:
+        args.extend(["--policy", policy_abs])
+    args.extend(["--wrap", cmd])
     if child_args:
-        wrap_tail.extend(["--", *child_args])
-    return [
-        *_STDIO_PROXY_ARGS_PREFIX,
-        "--policy",
-        policy_abs,
-        *wrap_tail,
-    ]
+        args.extend(["--", *child_args])
+    return args
+
+
+def _wrap_cli_args(policy_abs: str | None, cmd: str, child_args: list[str]) -> list[str]:
+    """Args for the installed `agentparry` console script.
+
+    Omitting `--policy` is deliberate when the caller did not ask for one: the
+    wrapped proxy then resolves the default itself at run time, which is what
+    makes a committed entry work in someone else's checkout.
+    """
+    args = list(_WRAP_ARGS_PREFIX)
+    if policy_abs:
+        args.extend(["--policy", policy_abs])
+    args.extend(["--command", shlex.join([cmd, *child_args])])
+    return args
 
 
 def _is_wrapped_stdio_args(args: Any) -> bool:
     """Report whether an arg list already launches the AgentParry stdio proxy.
 
-    Matches on the arg shape rather than on the entry's ``command``, because the
-    interpreter path recorded at install time varies by machine and virtualenv.
+    Matches on the arg shape rather than on the entry's ``command``, because both
+    the console script and the interpreter path recorded by older installs vary
+    by machine and virtualenv.
 
     Args:
         args: Candidate ``args`` value from an MCP server entry, any type.
 
     Returns:
-        True when the args invoke ``-m src.stdio_proxy``.
+        True for either ``agentparry wrap --command ...`` or ``-m src.stdio_proxy``.
     """
-    return isinstance(args, list) and args[:2] == _STDIO_PROXY_ARGS_PREFIX
+    if not isinstance(args, list):
+        return False
+    if args[:2] == _STDIO_PROXY_ARGS_PREFIX:
+        return True
+    return args[:1] == _WRAP_ARGS_PREFIX and "--command" in args
 
 
-def _repolicy_stdio_args(policy_abs: str, args: list[str]) -> list[str]:
-    """Point an already-wrapped arg list at a different policy file.
+def _wrapped_child_command(args: list[str]) -> tuple[str, list[str]]:
+    """Recover the wrapped server command from an already-wrapped arg list.
 
-    Only the proxy's own options are scanned; the search stops at ``--wrap`` or
-    ``--`` so a ``--policy`` flag belonging to the wrapped child is left alone.
+    Only the proxy's own options are scanned, so a ``--policy`` or ``--command``
+    flag belonging to the wrapped child is left inside the child command.
 
     Args:
-        policy_abs: Absolute path to the policy file to install.
         args: Args of an entry for which `_is_wrapped_stdio_args` is True.
 
     Returns:
-        A new arg list wrapping the same child command with the new policy.
+        The child command and its arguments.
     """
-    out = list(args)
-    i = len(_STDIO_PROXY_ARGS_PREFIX)
-    while i < len(out) and out[i] not in ("--wrap", "--"):
-        if out[i] == "--policy" and i + 1 < len(out):
-            out[i + 1] = policy_abs
-            return out
-        i += 1
-    out[len(_STDIO_PROXY_ARGS_PREFIX) : len(_STDIO_PROXY_ARGS_PREFIX)] = ["--policy", policy_abs]
-    return out
+    if args[:2] == _STDIO_PROXY_ARGS_PREFIX:
+        i = len(_STDIO_PROXY_ARGS_PREFIX)
+        while i < len(args):
+            if args[i] == "--wrap":
+                tail = args[i + 1 :]
+                if not tail:
+                    raise SystemExit("error: existing wrapped entry has no server command after --wrap")
+                rest = tail[1:]
+                if rest[:1] == ["--"]:
+                    rest = rest[1:]
+                return tail[0], rest
+            i += 1
+        raise SystemExit("error: existing wrapped entry has no --wrap")
+    for i, value in enumerate(args):
+        if value == "--command" and i + 1 < len(args):
+            return _split_command(args[i + 1])
+    raise SystemExit("error: existing wrapped entry has no --command")
 
 
 def cmd_wrap(args: argparse.Namespace) -> int:
-    policy = args.policy
+    policy = str(resolve_policy(args.policy).path)
     parts = shlex.split(args.command, posix=os.name != "nt")
     if not parts:
         raise SystemExit("error: --command produced no tokens")
@@ -164,7 +201,7 @@ def cmd_wrap(args: argparse.Namespace) -> int:
 
 
 async def _cmd_scan_live(args: argparse.Namespace) -> int:
-    scanner = Scanner(payloads_path=args.payloads)
+    scanner = Scanner(payloads_path=resolve_payloads(args.payloads).path)
     report = await scanner.run_scan(
         proxy_url=args.target,
         discover=args.discover,
@@ -382,7 +419,7 @@ def _print_analysis(analysis: RescanAnalysis, *, full: bool, max_vulns: int) -> 
         )
 
 
-def _lint_merge(plan: AutogenMergePlan, policy_path: str, payloads_path: str) -> list[LintFinding]:
+def _lint_merge(plan: AutogenMergePlan, policy_path: str | Path, payloads_path: str | Path) -> list[LintFinding]:
     """High-severity findings the merge would add to the policy.
 
     The candidate text is linted from a tempfile rather than the policy path,
@@ -421,8 +458,22 @@ async def _run_after_scan(
     )
 
 
+COPY_ON_WRITE_NOTE = (
+    "The default policy ships inside the package and is not yours to edit, so the merged rules go "
+    "to {destination}. Every agentparry command prefers that copy from now on; delete it to go "
+    "back to the shipped rules."
+)
+
+
+def _harden_destination(args: argparse.Namespace) -> Path:
+    """Where `harden` writes: the resolved policy, or a user copy of a packaged one."""
+    if args.policy_packaged:
+        return user_policy_path()
+    return Path(args.policy)
+
+
 async def _cmd_harden_live(args: argparse.Namespace) -> int:
-    scanner = Scanner(payloads_path=args.payloads)
+    scanner = Scanner(payloads_path=resolve_payloads(args.payloads).path)
     await _probe_target(args.target, safe=args.safe)
 
     before = await scanner.run_scan(
@@ -452,7 +503,7 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
 
     introduced: list[LintFinding] = []
     if plan.changed and not args.no_lint:
-        introduced = _lint_merge(plan, args.policy, args.payloads)
+        introduced = _lint_merge(plan, args.policy, resolve_payloads(args.payloads).path)
     if introduced:
         print()
         print(f"Policy lint: {len(introduced)} high-severity finding(s) introduced by these rules")
@@ -475,14 +526,20 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
     if introduced:
         print("Writing anyway: --force.")
 
-    if not args.yes and not _confirm(f"Write these {len(rules)} rules to {args.policy}? [y/N] "):
+    destination = _harden_destination(args)
+    if args.policy_packaged:
+        print(COPY_ON_WRITE_NOTE.format(destination=destination))
+
+    if not args.yes and not _confirm(f"Write these {len(rules)} rules to {destination}? [y/N] "):
         print("Aborted; policy left unchanged.")
         return EXIT_ABORTED
 
-    backup = write_policy_text(plan.after_text, args.policy)
+    if args.policy_packaged:
+        copy_out_policy(Path(args.policy))
+    backup = write_policy_text(plan.after_text, destination)
     if backup:
         print(f"Backup: {backup}")
-    print(f"Policy updated: {args.policy}")
+    print(f"Policy updated: {destination}")
 
     if args.no_reload:
         print("Skipped policy reload (--no-reload); reload the proxy yourself for this to take effect.")
@@ -508,12 +565,19 @@ async def _cmd_harden_live(args: argparse.Namespace) -> int:
 
 
 def cmd_harden(args: argparse.Namespace) -> int:
-    """Scan, generate rules, merge them into the policy, then re-scan."""
+    """Scan, generate rules, merge them into the policy, then re-scan.
+
+    A packaged default is merged from but never written to; see
+    `COPY_ON_WRITE_NOTE`.
+    """
     if args.target is None:
         args.target = PROXY_URL
     _guard_live_target(args.target, safe=args.safe, allow_remote=args.allow_remote)
 
-    if not Path(args.policy).is_file():
+    resolved = resolve_policy(args.policy)
+    args.policy = str(resolved.path)
+    args.policy_packaged = resolved.packaged
+    if not resolved.path.is_file():
         raise SystemExit(f"error: policy file not found: {args.policy}")
 
     if not args.yes and not args.dry_run and not _stdin_is_tty():
@@ -531,7 +595,7 @@ def cmd_harden(args: argparse.Namespace) -> int:
 
 
 async def _cmd_verify_live(args: argparse.Namespace, before: ScanReport) -> int:
-    scanner = Scanner(payloads_path=args.payloads)
+    scanner = Scanner(payloads_path=resolve_payloads(args.payloads).path)
     await _probe_target(args.target, safe=args.safe)
 
     after = await _run_after_scan(
@@ -642,9 +706,9 @@ def lint_exit_code(report: LintReport, fail_on: str) -> int:
 
 def cmd_lint_policy(args: argparse.Namespace) -> int:
     """Analyze a policy file for over-blocking, statically and against the benign corpus."""
-    payloads = None if args.no_corpus else args.payloads
+    payloads = None if args.no_corpus else resolve_payloads(args.payloads).path
     try:
-        report = lint_policy(args.policy, payloads, probes=not args.no_probes)
+        report = lint_policy(resolve_policy(args.policy).path, payloads, probes=not args.no_probes)
     except FileNotFoundError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
@@ -862,13 +926,36 @@ def _load_claude_config(path: Path) -> dict[str, Any]:
     return data
 
 
-def _stdio_entry_from_command(policy_abs: str, command: str) -> dict[str, Any]:
-    cmd, child_args = _split_command(command)
+def _stdio_entry(
+    policy_abs: str | None,
+    cmd: str,
+    child_args: list[str],
+    *,
+    python: str | None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build an MCP server entry that runs the wrapped server through AgentParry."""
+    new_env = dict(env or {})
+    if policy_abs:
+        new_env["AGENTPARRY_POLICY"] = policy_abs
+    else:
+        new_env.pop("AGENTPARRY_POLICY", None)
+    if python:
+        return {
+            "command": python,
+            "args": _wrap_stdio_args(policy_abs, cmd, child_args),
+            "env": new_env,
+        }
     return {
-        "command": sys.executable,
-        "args": _wrap_stdio_args(policy_abs, cmd, child_args),
-        "env": {"AGENTPARRY_POLICY": policy_abs},
+        "command": ENTRY_COMMAND,
+        "args": _wrap_cli_args(policy_abs, cmd, child_args),
+        "env": new_env,
     }
+
+
+def _stdio_entry_from_command(policy_abs: str | None, command: str, *, python: str | None = None) -> dict[str, Any]:
+    cmd, child_args = _split_command(command)
+    return _stdio_entry(policy_abs, cmd, child_args, python=python)
 
 
 _REGENERATED_ENTRY_KEYS = frozenset(
@@ -883,7 +970,9 @@ _REGENERATED_ENTRY_KEYS = frozenset(
 )
 
 
-def _stdio_entry_from_existing(policy_abs: str, entry: dict[str, Any]) -> dict[str, Any]:
+def _stdio_entry_from_existing(
+    policy_abs: str | None, entry: dict[str, Any], *, python: str | None = None
+) -> dict[str, Any]:
     if entry.get("url") is not None and not entry.get("command"):
         raise SystemExit(
             "error: this server entry is URL-based; AgentParry stdio wrap only supports command-based MCP servers"
@@ -903,27 +992,39 @@ def _stdio_entry_from_existing(policy_abs: str, entry: dict[str, Any]) -> dict[s
         env = dict(orig_env)
     else:
         raise SystemExit("error: existing server env must be an object of string keys and string values")
-    env["AGENTPARRY_POLICY"] = policy_abs
 
     if _is_wrapped_stdio_args(orig_args):
-        args = _repolicy_stdio_args(policy_abs, orig_args)
+        cmd, child_args = _wrapped_child_command(orig_args)
     else:
-        args = _wrap_stdio_args(policy_abs, orig_cmd, orig_args)
+        cmd, child_args = orig_cmd, orig_args
 
-    new_entry: dict[str, Any] = {
-        "command": sys.executable,
-        "args": args,
-        "env": env,
-    }
+    new_entry = _stdio_entry(policy_abs, cmd, child_args, python=python, env=env)
     for key, value in entry.items():
         if key not in _REGENERATED_ENTRY_KEYS:
             new_entry[key] = value
     return new_entry
 
 
+def _entry_policy(explicit: str | None) -> str | None:
+    """Absolute policy path to record in an entry, or None to resolve at run time."""
+    if not explicit:
+        return None
+    return str(Path(explicit).expanduser().resolve())
+
+
+def _print_entry_policy(policy_abs: str | None) -> None:
+    if policy_abs:
+        print(f"Policy: {policy_abs}")
+        return
+    print(
+        f"Policy: resolved when the server starts ({POLICY_DEFAULT_HELP}), so the entry stays "
+        "portable. Pass --policy to record one path instead."
+    )
+
+
 def cmd_install_claude(args: argparse.Namespace) -> int:
     path = _claude_config_path()
-    policy_abs = str(Path(args.policy).expanduser().resolve())
+    policy_abs = _entry_policy(args.policy)
 
     data = _load_claude_config(path)
     servers: dict[str, Any] = data["mcpServers"]
@@ -935,11 +1036,11 @@ def cmd_install_claude(args: argparse.Namespace) -> int:
         if not isinstance(entry, dict):
             raise SystemExit(f"error: mcpServers[{name!r}] must be an object")
         already_wrapped = _is_wrapped_stdio_args(entry.get("args"))
-        new_entry = _stdio_entry_from_existing(policy_abs, entry)
+        new_entry = _stdio_entry_from_existing(policy_abs, entry, python=args.python)
     else:
         if not args.command:
             raise SystemExit("error: --command is required when adding a new server")
-        new_entry = _stdio_entry_from_command(policy_abs, args.command)
+        new_entry = _stdio_entry_from_command(policy_abs, args.command, python=args.python)
 
     backup = path.with_suffix(path.suffix + ".bak")
     if path.exists():
@@ -952,7 +1053,8 @@ def cmd_install_claude(args: argparse.Namespace) -> int:
         f.write("\n")
 
     if already_wrapped:
-        print(f"{name!r} was already wrapped by AgentParry; kept the same child command and set policy to {policy_abs}")
+        print(f"{name!r} was already wrapped by AgentParry; kept the same child command")
+    _print_entry_policy(policy_abs)
     print("Restart Claude Desktop to activate AgentParry protection")
     return 0
 
@@ -1019,7 +1121,7 @@ def _claude_code_entry(entry: dict[str, Any]) -> dict[str, Any]:
 def cmd_install_claude_code(args: argparse.Namespace) -> int:
     scope = args.scope
     path = _claude_code_config_path(scope, args.project_dir)
-    policy_abs = str(Path(args.policy).expanduser().resolve())
+    policy_abs = _entry_policy(args.policy)
 
     data = _load_claude_code_config(path)
     servers = _claude_code_servers(data, scope, args.project_dir)
@@ -1031,14 +1133,11 @@ def cmd_install_claude_code(args: argparse.Namespace) -> int:
         if not isinstance(entry, dict):
             raise SystemExit(f"error: mcpServers[{name!r}] must be an object")
         already_wrapped = _is_wrapped_stdio_args(entry.get("args"))
-        new_entry = _stdio_entry_from_existing(policy_abs, entry)
+        new_entry = _stdio_entry_from_existing(policy_abs, entry, python=args.python)
     else:
         if not args.command:
             raise SystemExit("error: --command is required when adding a new server")
-        new_entry = _stdio_entry_from_command(policy_abs, args.command)
-
-    if args.python:
-        new_entry["command"] = args.python
+        new_entry = _stdio_entry_from_command(policy_abs, args.command, python=args.python)
 
     backup = path.with_suffix(path.suffix + ".bak")
     if path.exists():
@@ -1051,12 +1150,12 @@ def cmd_install_claude_code(args: argparse.Namespace) -> int:
         f.write("\n")
 
     if already_wrapped:
-        print(f"{name!r} was already wrapped by AgentParry; kept the same child command and set policy to {policy_abs}")
-    if scope == "project":
+        print(f"{name!r} was already wrapped by AgentParry; kept the same child command")
+    _print_entry_policy(policy_abs)
+    if scope == "project" and (policy_abs or args.python):
         print(
-            f"warning: {path} is usually committed, and this entry hardcodes "
-            f"{new_entry['command']} and an absolute policy path, so it will not "
-            "work in another checkout"
+            f"warning: {path} is usually committed, and this entry hardcodes an absolute path, "
+            "so it will not work in another checkout"
         )
     print("Restart Claude Code (or run /mcp) to activate AgentParry protection")
     return 0
@@ -1078,7 +1177,7 @@ def _load_openclaw(path: Path) -> dict[str, Any]:
 
 def cmd_install_openclaw(args: argparse.Namespace) -> int:
     path = _openclaw_path()
-    policy_abs = str(Path(args.policy).expanduser().resolve())
+    policy_abs = _entry_policy(args.policy)
 
     data = _load_openclaw(path)
     mcp = data.setdefault("mcp", {})
@@ -1091,7 +1190,7 @@ def cmd_install_openclaw(args: argparse.Namespace) -> int:
     if args.stdio:
         if not args.command:
             raise SystemExit("error: --command is required with --stdio")
-        servers["agentparry"] = _stdio_entry_from_command(policy_abs, args.command)
+        servers["agentparry"] = _stdio_entry_from_command(policy_abs, args.command, python=args.python)
     else:
         servers["agentparry"] = {
             "url": args.url,
@@ -1105,6 +1204,16 @@ def cmd_install_openclaw(args: argparse.Namespace) -> int:
 
     print("Restart your OpenClaw gateway to activate")
     return 0
+
+
+def _add_python_arg(parser: argparse.ArgumentParser) -> None:
+    """The escape hatch for a machine with no installed `agentparry` on PATH."""
+    parser.add_argument(
+        "--python",
+        default=None,
+        metavar="PATH",
+        help=f"Record this interpreter running -m src.stdio_proxy instead of `{ENTRY_COMMAND} wrap`",
+    )
 
 
 def _add_known_gap_arg(parser: argparse.ArgumentParser) -> None:
@@ -1125,7 +1234,11 @@ def _add_scan_target_args(parser: argparse.ArgumentParser, *, target_default: st
         metavar="URL",
         help=f"Proxy JSON-RPC URL (default: {target_default})",
     )
-    parser.add_argument("--payloads", default="attacks/payloads.yaml", help="Attack payloads YAML")
+    parser.add_argument(
+        "--payloads",
+        default=None,
+        help=f"Attack payloads YAML (default: {PAYLOADS_DEFAULT_HELP})",
+    )
     parser.add_argument(
         "--discover",
         action="store_true",
@@ -1176,14 +1289,14 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
-            '  agentparry wrap --command "npx some-mcp-server" --policy config/default_policy.yaml\n'
+            '  agentparry wrap --command "npx some-mcp-server"\n'
         ),
     )
     p_wrap.add_argument("--command", required=True, help="Shell command line for the real MCP server")
     p_wrap.add_argument(
         "--policy",
-        default="config/default_policy.yaml",
-        help="Policy YAML (default: config/default_policy.yaml)",
+        default=None,
+        help=f"Policy YAML (default: {POLICY_DEFAULT_HELP})",
     )
     p_wrap.add_argument("--log", metavar="PATH", help="Log file (default: ~/.agentparry/proxy.log)")
     p_wrap.add_argument(
@@ -1239,7 +1352,11 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="report_only",
         help="Load a saved scan JSON and print the report (no network)",
     )
-    p_scan.add_argument("--payloads", default="attacks/payloads.yaml", help="Attack payloads YAML")
+    p_scan.add_argument(
+        "--payloads",
+        default=None,
+        help=f"Attack payloads YAML (default: {PAYLOADS_DEFAULT_HELP})",
+    )
     p_scan.add_argument(
         "--output",
         default="reports/",
@@ -1286,8 +1403,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_scan_target_args(p_harden, target_default=PROXY_URL)
     p_harden.add_argument(
         "--policy",
-        default="config/default_policy.yaml",
-        help="Policy YAML to merge rules into (default: config/default_policy.yaml)",
+        default=None,
+        help=f"Policy YAML to merge rules into (default: {POLICY_DEFAULT_HELP})",
     )
     p_harden.add_argument(
         "--dry-run",
@@ -1378,8 +1495,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Exit codes: 0 clean, 1 error, 2 usage, 3 a gated finding was exceeded.\n"
             "Examples:\n"
             "  agentparry replay\n"
-            "  agentparry replay --log /tmp/audit.jsonl --policy config/default_policy.yaml\n"
-            "  agentparry replay --policy config/default_policy.yaml --against /tmp/candidate.yaml\n"
+            "  agentparry replay --log /tmp/audit.jsonl --policy ~/.agentparry/policy.yaml\n"
+            "  agentparry replay --policy ~/.agentparry/policy.yaml --against /tmp/candidate.yaml\n"
             "  agentparry replay --format json --fail-on-fail-open\n"
         ),
     )
@@ -1461,16 +1578,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "Exit codes: 0 clean, 1 error, 2 usage, 3 findings at or above --fail-on.\n"
             "Examples:\n"
             "  agentparry lint-policy\n"
-            "  agentparry lint-policy --policy config/default_policy.yaml --format json\n"
+            "  agentparry lint-policy --policy ~/.agentparry/policy.yaml --format json\n"
             "  agentparry lint-policy --fail-on medium\n"
         ),
     )
     p_lint.add_argument(
         "--policy",
-        default="config/default_policy.yaml",
-        help="Policy YAML to lint (default: config/default_policy.yaml)",
+        default=None,
+        help=f"Policy YAML to lint (default: {POLICY_DEFAULT_HELP})",
     )
-    p_lint.add_argument("--payloads", default="attacks/payloads.yaml", help="Payload YAML holding the benign corpus")
+    p_lint.add_argument(
+        "--payloads",
+        default=None,
+        help=f"Payload YAML holding the benign corpus (default: {PAYLOADS_DEFAULT_HELP})",
+    )
     p_lint.add_argument(
         "--no-corpus",
         action="store_true",
@@ -1563,6 +1684,8 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Resolves claude_desktop_config.json per OS, backs up to .bak, and rewrites or adds mcpServers entry.\n"
+            f"The entry runs `{ENTRY_COMMAND} wrap`, so it records no interpreter path. Without\n"
+            "--policy it records no policy path either and resolves one at run time.\n"
             "Command-based servers only (not URL-only entries).\n"
             "Example:\n"
             '  agentparry install-claude --server-name my-server --command "npx some-mcp-server"\n'
@@ -1576,9 +1699,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_claude.add_argument(
         "--policy",
-        default="config/default_policy.yaml",
-        help="Policy YAML path stored as absolute in config (default: config/default_policy.yaml)",
+        default=None,
+        help=f"Policy YAML recorded in the entry (default: {POLICY_DEFAULT_HELP})",
     )
+    _add_python_arg(p_claude)
     p_claude.set_defaults(handler=cmd_install_claude)
 
     p_code = sub.add_parser(
@@ -1588,8 +1712,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Scopes: project writes ./.mcp.json, local writes projects[cwd].mcpServers in\n"
             "~/.claude.json, user writes top-level mcpServers in ~/.claude.json.\n"
-            "Project scope is normally committed, and the entry hardcodes an interpreter\n"
-            "path and an absolute policy path, so it will not work in another checkout.\n"
+            f"The entry runs `{ENTRY_COMMAND} wrap`, so a committed project-scope file carries no\n"
+            "interpreter path. --policy and --python both put an absolute path back in it.\n"
             "Project-scope servers also need in-app approval on first load.\n"
             "Command-based servers only (not URL-only entries).\n"
             "Example:\n"
@@ -1604,8 +1728,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_code.add_argument(
         "--policy",
-        default="config/default_policy.yaml",
-        help="Policy YAML path stored as absolute in config (default: config/default_policy.yaml)",
+        default=None,
+        help=f"Policy YAML recorded in the entry (default: {POLICY_DEFAULT_HELP})",
     )
     p_code.add_argument(
         "--scope",
@@ -1618,12 +1742,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Project directory for project and local scope (default: cwd)",
     )
-    p_code.add_argument(
-        "--python",
-        default=None,
-        metavar="PATH",
-        help=f"Interpreter recorded as the entry command (default: {sys.executable})",
-    )
+    _add_python_arg(p_code)
     p_code.set_defaults(handler=cmd_install_claude_code)
 
     p_open = sub.add_parser(
@@ -1653,9 +1772,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_open.add_argument(
         "--policy",
-        default="config/default_policy.yaml",
-        help="Policy YAML for --stdio (default: config/default_policy.yaml)",
+        default=None,
+        help=f"Policy YAML for --stdio (default: {POLICY_DEFAULT_HELP})",
     )
+    _add_python_arg(p_open)
     p_open.set_defaults(handler=cmd_install_openclaw)
 
     return parser
