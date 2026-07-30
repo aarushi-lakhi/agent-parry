@@ -25,9 +25,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 from src import audit
-from src.inspector import InputInspector, OutputInspector
+from src.inspector import InputInspector, OutputInspector, ResultInspector
 from src.models import (
+    INJECTION_BLOCK_ERROR_CODE,
     MOCK_SERVER_URL,
+    RESULT_INJECTION_ERROR_CODE,
     AuditAction,
     AuditDirection,
     AuditRecord,
@@ -54,6 +56,7 @@ console = Console()
 policy_engine = PolicyEngine(policy_path=_policy_path())
 input_inspector = InputInspector()
 output_inspector = OutputInspector()
+result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
 stats = ProxyStats()
 
 _stdio_server: subprocess.Popen[bytes] | None = None
@@ -382,7 +385,7 @@ def _handle_mcp_rpc(
         )
         return _jsonrpc_error(
             request_id=request.id,
-            code=-32001,
+            code=INJECTION_BLOCK_ERROR_CODE,
             message="Blocked: critical prompt injection pattern detected",
         )
 
@@ -400,7 +403,7 @@ def _handle_mcp_rpc(
         )
         return _jsonrpc_error(
             request_id=request.id,
-            code=-32001,
+            code=INJECTION_BLOCK_ERROR_CODE,
             message=decision.message or "Blocked by policy",
         )
 
@@ -450,8 +453,30 @@ def _handle_mcp_rpc(
             detail="PII redacted from tool result",
             **audit_ctx,
         )
-        upstream_payload["result"] = sanitized_result
 
+    # PII first, so the injection scan sees the text the model will actually see.
+    inspection = result_inspector.inspect(tool_name, sanitized_result)
+    if inspection.findings:
+        stats.increment(result_injections=1)
+        if inspection.action in ("neutralize", "redact"):
+            stats.increment(neutralized=1)
+        _record(
+            AuditAction.BLOCK_RESULT_INJECTION if inspection.blocked else AuditAction.NEUTRALIZE_RESULT,
+            direction=AuditDirection.SERVER_TO_CLIENT,
+            tool=tool_name,
+            findings=inspection.findings,
+            detail=f"{inspection.action}: {len(inspection.findings)} injection finding(s) in tool result",
+            **audit_ctx,
+        )
+    if inspection.blocked:
+        stats.increment(blocked=1)
+        return _jsonrpc_error(
+            request_id=request.id,
+            code=RESULT_INJECTION_ERROR_CODE,
+            message=inspection.block_message,
+        )
+
+    upstream_payload["result"] = inspection.result
     return _validated_response(request.id, upstream_payload)
 
 
@@ -482,6 +507,12 @@ def get_stats() -> dict[str, int]:
     return stats.model_dump()
 
 
+def _rebuild_inspectors() -> None:
+    """Rebuild the settings-derived inspectors after a policy load."""
+    global result_inspector
+    result_inspector = ResultInspector.from_policy_settings(policy_engine.get_settings())
+
+
 def set_policy_path(path: str) -> None:
     """Repoint the live policy engine and reload it.
 
@@ -491,11 +522,13 @@ def set_policy_path(path: str) -> None:
     os.environ["AGENTPARRY_POLICY"] = path
     policy_engine.policy_path = Path(path)
     policy_engine.reload()
+    _rebuild_inspectors()
 
 
 @app.post("/policy/reload", dependencies=[Depends(require_admin)])
 def reload_policy() -> dict[str, Any]:
     policy_engine.reload()
+    _rebuild_inspectors()
     return {"status": "ok", "rules_loaded": len(policy_engine.get_rules())}
 
 
