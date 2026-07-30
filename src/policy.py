@@ -12,13 +12,22 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import yaml
+from pydantic import ValidationError
 
 from src.models import Finding, PolicyAction, PolicyDecision
+from src.normalize import VIEW_ORIGINAL, Normalizer, NormalizerSettings, TextView
 
 logger = logging.getLogger(__name__)
 
 _SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
 _TOKEN_SPLIT_RE = re.compile(r"[,;\s]+")
+
+_NORMALIZABLE_TYPES = frozenset({"pattern_match", "pii_detection"})
+
+ViewFlags = tuple[bool, bool]
+"""Resolved (canonical, decoded) view switches for one condition."""
+
+_NO_VIEWS: ViewFlags = (False, False)
 
 
 @dataclass(slots=True)
@@ -32,6 +41,7 @@ class Condition:
     include_subdomains: bool = False
     subdomain_domains: set[str] = dc_field(default_factory=set)
     compiled_patterns: list[re.Pattern[str]] = dc_field(default_factory=list)
+    normalize: ViewFlags = _NO_VIEWS
 
 
 @dataclass(slots=True)
@@ -53,18 +63,46 @@ class PolicyEngine:
         self._raw_policy: dict[str, Any] = {"rules": [], "settings": {}}
         self._raw_rules: list[dict[str, Any]] = []
         self._rules: list[Rule] = []
+        self._default_views: ViewFlags = (True, False)
+        self._base_settings = NormalizerSettings()
+        self._normalizers: dict[ViewFlags, Normalizer] = {}
         self.reload()
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PolicyDecision:
         """Evaluate one tool call against loaded rules in-memory."""
+        view_cache: dict[tuple[bool, bool, str], list[TextView]] = {}
         for rule in self._rules:
             if not self._tool_matches(rule.tool, tool_name):
                 continue
             findings: list[Finding] = []
-            if self._rule_matches(rule, arguments, findings):
+            if self._rule_matches(rule, arguments, findings, view_cache):
                 self._log_rule_match(rule=rule, tool_name=tool_name, findings=findings)
                 return PolicyDecision(action=rule.action, rule_name=rule.name, message=rule.message)
         return PolicyDecision(action=PolicyAction.ALLOW)
+
+    def _views(
+        self,
+        condition: Condition,
+        text: str,
+        view_cache: dict[tuple[bool, bool, str], list[TextView]],
+    ) -> list[TextView]:
+        if condition.normalize == _NO_VIEWS:
+            return [TextView(name=VIEW_ORIGINAL, text=text, original_length=len(text))]
+        key = (condition.normalize[0], condition.normalize[1], text)
+        cached = view_cache.get(key)
+        if cached is None:
+            cached = self._normalizer_for(condition.normalize).views(text)
+            view_cache[key] = cached
+        return cached
+
+    def _normalizer_for(self, flags: ViewFlags) -> Normalizer:
+        normalizer = self._normalizers.get(flags)
+        if normalizer is None:
+            normalizer = Normalizer(
+                self._base_settings.model_copy(update={"canonical": flags[0], "decoded": flags[1]})
+            )
+            self._normalizers[flags] = normalizer
+        return normalizer
 
     def add_rule(self, rule: dict[str, Any]) -> None:
         """Append a rule and persist policy YAML."""
@@ -89,7 +127,53 @@ class PolicyEngine:
         loaded = self._load_policy()
         self._raw_policy = loaded
         self._raw_rules = list(loaded.get("rules") or [])
+        self._load_normalization_settings(loaded.get("settings") or {})
         self._rebuild_compiled_rules()
+
+    def _load_normalization_settings(self, settings: Any) -> None:
+        """Read the ``settings.normalization`` block.
+
+        Canonical views default ON: they only ever make a rule match text a human
+        reads as identical to what they typed, and the surprise direction is more
+        blocking, which is the fail-safe direction.
+
+        Decoded views default OFF. Matching an ``rm -rf /`` rule against the
+        plaintext inside an opaque base64 string is a semantic leap the rule
+        author did not ask for, and BLOCK cannot be recovered from over stdio.
+        Turn them on per rule once you have decided that is what you want.
+        """
+        self._normalizers.clear()
+        raw = settings.get("normalization") if isinstance(settings, dict) else None
+        if not isinstance(raw, dict):
+            self._base_settings = NormalizerSettings()
+            self._default_views = (True, False)
+            return
+
+        overrides = {key: value for key, value in raw.items() if key in NormalizerSettings.model_fields}
+        try:
+            self._base_settings = NormalizerSettings(**overrides)
+        except ValidationError:
+            logger.exception("Invalid settings.normalization block, using defaults")
+            self._base_settings = NormalizerSettings()
+
+        enabled = raw.get("enabled", True)
+        if not enabled:
+            self._default_views = _NO_VIEWS
+            return
+        self._default_views = (self._base_settings.canonical, self._base_settings.decoded)
+
+    def _resolve_normalize(self, raw: Any, rule_name: str, inherited: ViewFlags) -> ViewFlags:
+        """Resolve a ``normalize:`` override against the value it inherits."""
+        if raw is None:
+            return inherited
+        if isinstance(raw, bool):
+            return (True, inherited[1]) if raw else _NO_VIEWS
+        if isinstance(raw, dict):
+            canonical = raw.get("canonical", inherited[0])
+            decoded = raw.get("decoded", inherited[1])
+            return (bool(canonical), bool(decoded))
+        logger.warning("Ignoring unusable normalize override rule=%s value=%r", rule_name, raw)
+        return inherited
 
     def get_rules(self) -> list[dict[str, Any]]:
         """Return current raw rule definitions."""
@@ -147,9 +231,11 @@ class PolicyEngine:
             logger.warning("Skipping rule with invalid conditions name=%s", name)
             return None
 
+        rule_views = self._resolve_normalize(raw_rule.get("normalize"), name, self._default_views)
+
         conditions: list[Condition] = []
         for cond_index, raw_condition in enumerate(raw_conditions):
-            parsed_condition = self._parse_condition(raw_condition, name, cond_index)
+            parsed_condition = self._parse_condition(raw_condition, name, cond_index, rule_views)
             if parsed_condition is None:
                 logger.warning("Skipping malformed rule name=%s", name)
                 return None
@@ -176,6 +262,7 @@ class PolicyEngine:
         raw_condition: Any,
         rule_name: str,
         cond_index: int,
+        rule_views: ViewFlags,
     ) -> Condition | None:
         if not isinstance(raw_condition, dict):
             logger.warning("Condition is not a dict rule=%s condition=%s", rule_name, cond_index)
@@ -184,6 +271,10 @@ class PolicyEngine:
         if cond_type == "":
             logger.warning("Condition missing type rule=%s condition=%s", rule_name, cond_index)
             return None
+
+        views = self._resolve_normalize(raw_condition.get("normalize"), rule_name, rule_views)
+        if cond_type not in _NORMALIZABLE_TYPES:
+            views = _NO_VIEWS
 
         if cond_type == "always":
             return Condition(type=cond_type)
@@ -201,9 +292,11 @@ class PolicyEngine:
                 field=field_name,
                 patterns=[str(pattern) for pattern in raw_patterns],
                 compiled_patterns=compiled,
+                normalize=views,
             )
 
         if cond_type == "domain_allowlist":
+            # Deliberately never normalized, see _condition_matches.
             field_name = raw_condition.get("field")
             raw_domains = raw_condition.get("allowed_domains")
             if not isinstance(field_name, str) or not isinstance(raw_domains, list):
@@ -252,6 +345,7 @@ class PolicyEngine:
                 type=cond_type,
                 patterns=[str(pattern) for pattern in raw_patterns],
                 compiled_patterns=compiled,
+                normalize=views,
             )
 
         logger.warning(
@@ -292,9 +386,10 @@ class PolicyEngine:
         rule: Rule,
         arguments: dict[str, Any],
         findings: list[Finding],
+        view_cache: dict[tuple[bool, bool, str], list[TextView]],
     ) -> bool:
         return all(
-            self._condition_matches(condition, arguments, findings)
+            self._condition_matches(condition, arguments, findings, view_cache)
             for condition in rule.conditions
         )
 
@@ -303,6 +398,7 @@ class PolicyEngine:
         condition: Condition,
         arguments: dict[str, Any],
         findings: list[Finding],
+        view_cache: dict[tuple[bool, bool, str], list[TextView]],
     ) -> bool:
         if condition.type == "always":
             findings.append(Finding(severity="low", description="Always condition matched"))
@@ -312,13 +408,19 @@ class PolicyEngine:
             value = arguments.get(condition.field or "")
             candidate = "" if value is None else str(value)
             for idx, compiled in enumerate(condition.compiled_patterns):
-                if compiled.search(candidate):
+                for view in self._views(condition, candidate, view_cache):
+                    match = compiled.search(view.text)
+                    if match is None:
+                        continue
                     findings.append(
                         Finding(
                             severity="high",
                             description=f"Pattern matched in {condition.field}",
                             field=condition.field,
                             matched_pattern=condition.patterns[idx] if idx < len(condition.patterns) else None,
+                            view=view.name,
+                            matched_text=match.group(0),
+                            span=view.map_span(*match.span()),
                         )
                     )
                     return True
@@ -352,12 +454,18 @@ class PolicyEngine:
             flattened_values = self._flatten_values(arguments)
             for candidate in flattened_values:
                 for idx, compiled in enumerate(condition.compiled_patterns):
-                    if compiled.search(candidate):
+                    for view in self._views(condition, candidate, view_cache):
+                        match = compiled.search(view.text)
+                        if match is None:
+                            continue
                         findings.append(
                             Finding(
                                 severity="high",
                                 description="PII pattern matched in arguments",
                                 matched_pattern=condition.patterns[idx] if idx < len(condition.patterns) else None,
+                                view=view.name,
+                                matched_text=match.group(0),
+                                span=view.map_span(*match.span()),
                             )
                         )
                         return True
@@ -499,6 +607,8 @@ class PolicyEngine:
                 "field": finding.field,
                 "pattern": finding.matched_pattern,
                 "description": finding.description,
+                "view": finding.view,
+                "span": finding.span,
             }
             for finding in findings
         ]
