@@ -18,7 +18,9 @@ from urllib.parse import urlparse
 import httpx
 import json5
 
-from src.models import PROXY_URL, ScanReport
+from src import audit
+from src.models import PROXY_URL, AuditAction, AuditTransport, ScanReport, ServerPin
+from src.pins import PinStore, accept_pending, forget
 from src.rule_generator import RuleGenerator, plan_autogen_merge, write_policy_text
 from src.scanner import (
     OUTCOME_FALSE_NEGATIVE,
@@ -509,6 +511,187 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return EXIT_INTERRUPTED
 
 
+def _pin_store(args: argparse.Namespace) -> PinStore:
+    return PinStore(args.pins)
+
+
+def _resolve_pin_key(store: PinStore, selector: str) -> str:
+    """Resolve a user-supplied selector to exactly one pin key.
+
+    Exact key first, then a unique substring of a key or a target. An ambiguous
+    selector is an error rather than a guess, because the next thing the operator
+    does with it is transfer trust.
+    """
+    servers = store.load().servers
+    if selector in servers:
+        return selector
+    matches = sorted(
+        key for key, pin in servers.items() if selector in key or (pin.target and selector in pin.target)
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"error: no pinned server matches {selector!r} in {store.path}")
+    listed = "\n  ".join(matches)
+    raise SystemExit(f"error: {selector!r} matches {len(matches)} pinned servers:\n  {listed}")
+
+
+def _pin_status(pin: ServerPin) -> str:
+    if pin.pending is not None:
+        return "CHANGED"
+    if not pin.trusted:
+        return "UNTRUSTED"
+    return "ok"
+
+
+def _print_pin_diff(pin: ServerPin) -> None:
+    """Print what changed for one pin, or say that nothing has."""
+    print(f"{pin.key}")
+    print(f"  target:  {pin.target or '-'}  ({pin.transport.value})")
+    if not pin.trusted:
+        print(f"  not accepted yet: {pin.untrusted_reason}")
+    if pin.pending is None:
+        print("  no pending change")
+        return
+    diff = pin.pending.diff
+    print(f"  observed: {pin.pending.observed_at}")
+    for name in diff.changed:
+        print(f"  changed:  {name}")
+    for name in diff.added:
+        print(f"  added:    {name}")
+    for name in diff.removed:
+        print(f"  removed:  {name}")
+    if diff.server_info_changed:
+        print("  changed:  serverInfo")
+    if diff.instructions_changed:
+        print("  changed:  initialize instructions")
+    for finding in diff.escalated:
+        print(f"  [{finding.severity}] {finding.field}: {finding.description}")
+
+
+def _record_acceptance(pin: ServerPin, detail: str) -> None:
+    writer = audit.AuditWriter(transport=AuditTransport.CLI)
+    try:
+        writer.write(writer.build(action=AuditAction.PIN_ACCEPTED, tool=pin.key, detail=detail))
+    finally:
+        writer.close()
+
+
+def cmd_pins_list(args: argparse.Namespace) -> int:
+    store = _pin_store(args)
+    servers = store.load().servers
+    if not servers:
+        print(f"No pinned servers in {store.path}")
+        return EXIT_OK
+    print(f"{store.path}")
+    for key, pin in sorted(servers.items()):
+        print(
+            f"  {_pin_status(pin):<9} tools={len(pin.tools):<3} last_seen={pin.last_seen or '-':<25} {key}"
+        )
+    return EXIT_OK
+
+
+def cmd_pins_show(args: argparse.Namespace) -> int:
+    store = _pin_store(args)
+    key = _resolve_pin_key(store, args.server)
+    pin = store.get(key)
+    if pin is None:
+        raise SystemExit(f"error: no pinned server {key!r}")
+    print(pin.model_dump_json(indent=2))
+    return EXIT_OK
+
+
+def cmd_pins_diff(args: argparse.Namespace) -> int:
+    """Print pending changes. Exits 3 when any pin is unaccepted, for CI."""
+    store = _pin_store(args)
+    servers = store.load().servers
+    if args.server is not None:
+        key = _resolve_pin_key(store, args.server)
+        servers = {key: servers[key]}
+    if not servers:
+        print(f"No pinned servers in {store.path}")
+        return EXIT_OK
+    outstanding = 0
+    for _key, pin in sorted(servers.items()):
+        if pin.pending is None and pin.trusted:
+            continue
+        outstanding += 1
+        _print_pin_diff(pin)
+    if not outstanding:
+        print("Every pinned server matches its pin.")
+        return EXIT_OK
+    print(f"{outstanding} pinned server(s) need review. Accept with: agentparry pins accept <server>")
+    return EXIT_VULNERABLE
+
+
+def cmd_pins_accept(args: argparse.Namespace) -> int:
+    """Promote observed metadata into the pin, after showing what changes."""
+    store = _pin_store(args)
+    servers = store.load().servers
+    if args.all:
+        if not args.yes:
+            raise SystemExit(
+                "error: accepting every pending change transfers trust to whatever those servers now "
+                "advertise. Review it with `agentparry pins diff`, then re-run with --yes."
+            )
+        keys = sorted(key for key, pin in servers.items() if pin.pending is not None or not pin.trusted)
+    else:
+        if args.server is None:
+            raise SystemExit("error: name a server, or pass --all --yes")
+        keys = [_resolve_pin_key(store, args.server)]
+
+    if not keys:
+        print("Nothing to accept.")
+        return EXIT_OK
+
+    for key in keys:
+        pin = servers.get(key)
+        if pin is not None:
+            _print_pin_diff(pin)
+
+    if not args.yes and not _confirm(f"Accept the metadata above for {len(keys)} server(s)? [y/N] "):
+        print("Aborted; pins left unchanged.")
+        return EXIT_ABORTED
+
+    accepted = 0
+    for key in keys:
+        pin = accept_pending(store, key)
+        if pin is None:
+            print(f"Nothing to accept for {key}")
+            continue
+        accepted += 1
+        _record_acceptance(pin, f"pin accepted: {len(pin.tools)} tool(s) now trusted")
+        print(f"Accepted {key}")
+    return EXIT_OK
+
+
+def cmd_pins_forget(args: argparse.Namespace) -> int:
+    """Delete pins. The next discovery re-pins whatever the server says then."""
+    store = _pin_store(args)
+    servers = store.load().servers
+    if args.all:
+        if not args.yes:
+            raise SystemExit("error: --all deletes every pin. Re-run with --yes.")
+        keys = sorted(servers)
+    else:
+        if args.server is None:
+            raise SystemExit("error: name a server, or pass --all --yes")
+        keys = [_resolve_pin_key(store, args.server)]
+
+    if not keys:
+        print("Nothing to forget.")
+        return EXIT_OK
+    if not args.yes and not _confirm(f"Forget {len(keys)} pin(s)? The next run re-pins whatever it sees. [y/N] "):
+        print("Aborted; pins left unchanged.")
+        return EXIT_ABORTED
+    for key in keys:
+        if forget(store, key):
+            print(f"Forgot {key}")
+        else:
+            print(f"No pin for {key}")
+    return EXIT_OK
+
+
 def _claude_config_path() -> Path:
     home = Path.home()
     if sys.platform == "darwin":
@@ -994,6 +1177,65 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_verify_scope_args(p_verify)
     p_verify.set_defaults(handler=cmd_verify)
+
+    p_pins = sub.add_parser(
+        "pins",
+        help="Inspect and accept the pinned tool metadata of wrapped MCP servers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "A pin records what a server advertised the first time it was seen, so a description\n"
+            "rewritten later is reported instead of silently reaching the model. It does not\n"
+            "protect against a server that is malicious on day one; that is what metadata\n"
+            "inspection is for.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 a pin needs review, 4 aborted at the prompt.\n"
+            "Examples:\n"
+            "  agentparry pins list\n"
+            "  agentparry pins diff\n"
+            "  agentparry pins accept 'npx some-mcp-server'\n"
+            "  agentparry pins accept --all --yes\n"
+        ),
+    )
+    pins_sub = p_pins.add_subparsers(dest="pins_command", required=True)
+
+    def _add_pins_file_arg(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--pins",
+            default=None,
+            metavar="PATH",
+            help="Pin store (default: ~/.agentparry/pins.json or AGENTPARRY_PINS_PATH)",
+        )
+
+    p_pins_list = pins_sub.add_parser("list", help="List every pinned server and its status")
+    _add_pins_file_arg(p_pins_list)
+    p_pins_list.set_defaults(handler=cmd_pins_list)
+
+    p_pins_show = pins_sub.add_parser("show", help="Print one pin as JSON")
+    p_pins_show.add_argument("server", help="Pin key, or a unique part of it or of the command")
+    _add_pins_file_arg(p_pins_show)
+    p_pins_show.set_defaults(handler=cmd_pins_show)
+
+    p_pins_diff = pins_sub.add_parser("diff", help="Show pending metadata changes; exits 3 when any remain")
+    p_pins_diff.add_argument("server", nargs="?", default=None, help="Limit to one server")
+    _add_pins_file_arg(p_pins_diff)
+    p_pins_diff.set_defaults(handler=cmd_pins_diff)
+
+    p_pins_accept = pins_sub.add_parser(
+        "accept",
+        help="Trust what a server now advertises and clear its pending change",
+        epilog="--all requires --yes: accepting transfers trust, so the diff has to be seen first.",
+    )
+    p_pins_accept.add_argument("server", nargs="?", default=None, help="Pin key, or a unique part of it")
+    p_pins_accept.add_argument("--all", action="store_true", help="Accept every pending change (needs --yes)")
+    p_pins_accept.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    _add_pins_file_arg(p_pins_accept)
+    p_pins_accept.set_defaults(handler=cmd_pins_accept)
+
+    p_pins_forget = pins_sub.add_parser("forget", help="Delete a pin so the next run records a fresh one")
+    p_pins_forget.add_argument("server", nargs="?", default=None, help="Pin key, or a unique part of it")
+    p_pins_forget.add_argument("--all", action="store_true", help="Delete every pin (needs --yes)")
+    p_pins_forget.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    _add_pins_file_arg(p_pins_forget)
+    p_pins_forget.set_defaults(handler=cmd_pins_forget)
 
     p_claude = sub.add_parser(
         "install-claude",
