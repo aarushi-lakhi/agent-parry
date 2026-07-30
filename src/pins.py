@@ -468,6 +468,11 @@ class ToolPinner:
         """Return the pin store this pinner writes to."""
         return self._store
 
+    @property
+    def identity_key(self) -> str:
+        """Return the pin key this pinner defaults to, or ``-`` when it has none."""
+        return self._identity.key if self._identity is not None else "-"
+
     def observe(
         self,
         method: str,
