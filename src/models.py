@@ -7,12 +7,31 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PROXY_PORT = 9090
 MOCK_SERVER_PORT = 8080
 PROXY_URL = "http://127.0.0.1:9090/mcp"
 MOCK_SERVER_URL = "http://127.0.0.1:8080/mcp"
+
+MATCHED_TEXT_LIMIT = 120
+
+INJECTION_BLOCK_ERROR_CODE = -32001
+"""Input-side block: the proxy refused to forward a tool call."""
+
+RESULT_INJECTION_ERROR_CODE = -32002
+"""Output-side block: the tool ran, and its result was refused.
+
+Deliberately distinct from -32001 so an operator reading a log, and the scanner
+reading a response, can tell which direction the block came from.
+"""
+
+METADATA_BLOCK_ERROR_CODE = -32003
+"""Discovery-side block: a ``tools/list`` or ``initialize`` result was refused.
+
+Its own code rather than -32002 because nothing was called: the poison is in the
+tool catalogue, so an operator seeing this knows discovery failed, not a tool.
+"""
 
 TOOLS_CALL_METHOD = "tools/call"
 
@@ -101,12 +120,28 @@ class PolicyDecision(BaseModel):
 
 
 class Finding(BaseModel):
-    """Represents an individual security finding from policy checks."""
+    """Represents an individual security finding from policy checks.
+
+    ``view``, ``matched_text`` and ``span`` describe where a match was found once
+    normalization is in play. All three are defaulted so persisted scan-report
+    JSON written before they existed still validates.
+    """
 
     severity: Literal["low", "medium", "high", "critical"] = "low"
     description: str = ""
     field: str | None = None
     matched_pattern: str | None = None
+    view: str = "original"
+    matched_text: str | None = None
+    span: tuple[int, int] | None = None
+
+    @field_validator("matched_text")
+    @classmethod
+    def _truncate_matched_text(cls, value: str | None) -> str | None:
+        """Cap quoted input so a finding cannot carry a whole payload into logs."""
+        if value is None or len(value) <= MATCHED_TEXT_LIMIT:
+            return value
+        return value[:MATCHED_TEXT_LIMIT]
 
 
 AUDIT_SCHEMA_VERSION = 1
@@ -133,6 +168,10 @@ class AuditAction(str, Enum):
     ALLOW = "ALLOW"
     BLOCK_POLICY = "BLOCK_POLICY"
     BLOCK_INJECTION = "BLOCK_INJECTION"
+    BLOCK_RESULT_INJECTION = "BLOCK_RESULT_INJECTION"
+    BLOCK_METADATA = "BLOCK_METADATA"
+    NEUTRALIZE_RESULT = "NEUTRALIZE_RESULT"
+    REDACT_METADATA = "REDACT_METADATA"
     REQUIRE_APPROVAL = "REQUIRE_APPROVAL"
     REDACT_OUTPUT = "REDACT_OUTPUT"
     INVALID_PARAMS = "INVALID_PARAMS"
@@ -218,6 +257,40 @@ class AuditRecord(BaseModel):
     max_severity: str | None = None
     pii_redactions: int | None = None
     detail: str = ""
+
+
+class ResultInspection(BaseModel):
+    """Outcome of scanning one tool result for indirect prompt injection.
+
+    ``action`` is what was actually done, not what was configured: block mode
+    degrades to ``neutralize`` below critical severity, and any leaf whose
+    severity is only medium is recorded and annotated without being rewritten.
+    """
+
+    result: dict[str, Any] = Field(default_factory=dict)
+    findings: list[Finding] = Field(default_factory=list)
+    action: Literal["none", "annotate", "neutralize", "redact", "block"] = "none"
+    blocked: bool = False
+    block_message: str = ""
+
+
+class MetadataInspection(BaseModel):
+    """Outcome of scanning a ``tools/list`` or ``initialize`` result for poisoning.
+
+    ``action`` is what was actually done, not what was configured: ``redact``
+    escalates to ``drop`` for a finding in a structurally load-bearing value, and
+    findings below the configured threshold are recorded without rewriting
+    anything. ``dropped_tools`` and ``redacted_tools`` name the tools affected so
+    an operator can tell which capability the agent just lost.
+    """
+
+    result: dict[str, Any] = Field(default_factory=dict)
+    findings: list[Finding] = Field(default_factory=list)
+    action: Literal["none", "annotate", "redact", "drop", "block"] = "none"
+    blocked: bool = False
+    block_message: str = ""
+    redacted_tools: list[str] = Field(default_factory=list)
+    dropped_tools: list[str] = Field(default_factory=list)
 
 
 class AttackPayload(BaseModel):
@@ -332,6 +405,10 @@ class ProxyStats(BaseModel):
     approved: int = 0
     redacted: int = 0
     flagged_for_approval: int = 0
+    result_injections: int = 0
+    neutralized: int = 0
+    metadata_injections: int = 0
+    metadata_tools_dropped: int = 0
 
     def increment(
         self,
@@ -341,6 +418,10 @@ class ProxyStats(BaseModel):
         approved: int = 0,
         redacted: int = 0,
         flagged_for_approval: int = 0,
+        result_injections: int = 0,
+        neutralized: int = 0,
+        metadata_injections: int = 0,
+        metadata_tools_dropped: int = 0,
     ) -> None:
         """Increment one or more counters by non-negative deltas."""
 
@@ -350,6 +431,10 @@ class ProxyStats(BaseModel):
             "approved": approved,
             "redacted": redacted,
             "flagged_for_approval": flagged_for_approval,
+            "result_injections": result_injections,
+            "neutralized": neutralized,
+            "metadata_injections": metadata_injections,
+            "metadata_tools_dropped": metadata_tools_dropped,
         }
 
         for name, delta in deltas.items():
@@ -361,6 +446,10 @@ class ProxyStats(BaseModel):
         self.approved += approved
         self.redacted += redacted
         self.flagged_for_approval += flagged_for_approval
+        self.result_injections += result_injections
+        self.neutralized += neutralized
+        self.metadata_injections += metadata_injections
+        self.metadata_tools_dropped += metadata_tools_dropped
 
     def reset(self) -> None:
         """Reset all counters to zero."""
@@ -370,17 +459,25 @@ class ProxyStats(BaseModel):
         self.approved = 0
         self.redacted = 0
         self.flagged_for_approval = 0
+        self.result_injections = 0
+        self.neutralized = 0
+        self.metadata_injections = 0
+        self.metadata_tools_dropped = 0
 
 
 __all__ = [
     "AUDIT_SCHEMA_VERSION",
     "AUDIT_SEVERITY_ORDER",
+    "INJECTION_BLOCK_ERROR_CODE",
+    "MATCHED_TEXT_LIMIT",
     "MCP_EXACT_METHODS",
     "MCP_PASSTHROUGH_PREFIXES",
+    "METADATA_BLOCK_ERROR_CODE",
     "MOCK_SERVER_PORT",
     "MOCK_SERVER_URL",
     "PROXY_PORT",
     "PROXY_URL",
+    "RESULT_INJECTION_ERROR_CODE",
     "TOOLS_CALL_METHOD",
     "AttackPayload",
     "AttackResult",
@@ -395,9 +492,11 @@ __all__ = [
     "JsonRpcError",
     "JsonRpcRequest",
     "JsonRpcResponse",
+    "MetadataInspection",
     "PolicyAction",
     "PolicyDecision",
     "ProxyStats",
+    "ResultInspection",
     "ScanReport",
     "is_known_mcp_method",
     "is_tools_call",

@@ -6,7 +6,8 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from src.mock_server import app
+from src.inspector import MetadataInspector
+from src.mock_server import POISONED_TOOL_NAME, app
 
 
 class TestMockServer(unittest.TestCase):
@@ -24,14 +25,19 @@ class TestMockServer(unittest.TestCase):
             json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["result"],
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "mock-dangerous-server", "version": "1.0"},
-            },
+        result = response.json()["result"]
+        self.assertEqual("2024-11-05", result["protocolVersion"])
+        self.assertEqual({"tools": {}}, result["capabilities"])
+        self.assertEqual({"name": "mock-dangerous-server", "version": "1.0"}, result["serverInfo"])
+
+    def test_initialize_instructions_are_poisoned(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
         )
+        instructions = response.json()["result"]["instructions"]
+        findings = MetadataInspector().scan_instructions(instructions)
+        self.assertTrue(any(finding.severity == "critical" for finding in findings))
 
     def test_tools_list(self) -> None:
         response = self.client.post(
@@ -40,10 +46,57 @@ class TestMockServer(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         tools = response.json()["result"]["tools"]
-        self.assertEqual([tool["name"] for tool in tools], ["email_send", "shell_exec", "file_read"])
-        self.assertEqual(tools[0]["inputSchema"]["required"], ["to", "subject", "body"])
-        self.assertEqual(tools[1]["inputSchema"]["required"], ["command"])
-        self.assertEqual(tools[2]["inputSchema"]["required"], ["path"])
+        by_name = {tool["name"]: tool for tool in tools}
+        self.assertLessEqual({"email_send", "shell_exec", "file_read"}, set(by_name))
+        self.assertEqual(["to", "subject", "body"], by_name["email_send"]["inputSchema"]["required"])
+        self.assertEqual(["command"], by_name["shell_exec"]["inputSchema"]["required"])
+        self.assertEqual(["path"], by_name["file_read"]["inputSchema"]["required"])
+
+    def test_poisoned_tool_is_always_advertised(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        )
+        tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
+        self.assertIn(POISONED_TOOL_NAME, tools)
+
+        findings = MetadataInspector().scan_tool(tools[POISONED_TOOL_NAME])
+        fields = {finding.field for finding in findings}
+        schema = "tool.inputSchema.properties"
+        self.assertIn("tool.description", fields)
+        self.assertIn(f"{schema}.audit_note.description", fields)
+        self.assertIn(f"{schema}.audit_note.default", fields)
+        self.assertIn(f"{schema}.mode.enum[2]", fields)
+        self.assertTrue(
+            any(finding.matched_pattern == "invisible characters" for finding in findings),
+            msg="the zero-width-obfuscated span is missing",
+        )
+
+    def test_poisoned_tool_is_callable(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {"name": POISONED_TOOL_NAME, "arguments": {"customer_id": "c-1"}},
+            },
+        )
+        payload = response.json()
+        self.assertIsNone(payload.get("error"), msg="a -32601 here would inflate the scan score")
+        self.assertEqual("c-1", payload["result"]["customer_id"])
+
+    def test_poisoned_tool_rejects_bad_params(self) -> None:
+        response = self.client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {"name": POISONED_TOOL_NAME, "arguments": {"customer_id": 5}},
+            },
+        )
+        self.assertEqual(-32602, response.json()["error"]["code"])
 
     def test_tools_call_email_send(self) -> None:
         response = self.client.post(
