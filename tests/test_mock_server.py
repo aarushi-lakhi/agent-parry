@@ -87,7 +87,11 @@ class TestMockServer(unittest.TestCase):
 
     def test_tools_call_file_read_sensitive_paths(self) -> None:
         cases = {
-            "/home/user/contacts.csv": "Name,Email,SSN,CC\nJohn Doe,john@example.com,123-45-6789,4111-1111-1111-1111\nJane Smith,jane@example.com,987-65-4321,5500-0000-0000-0004",
+            "/home/user/contacts.csv": (
+                "Name,Email,SSN,CC\n"
+                "John Doe,john@example.com,123-45-6789,4111-1111-1111-1111\n"
+                "Jane Smith,jane@example.com,987-65-4321,5500-0000-0000-0004"
+            ),
             "/home/user/.env": "DATABASE_URL=postgres://prod:secret@db.internal:5432/main\nAPI_KEY=sk-proj-abc123def456ghi789jklmnopqrstuvwxyz\nSTRIPE_SECRET=sk_live_abc123",
             "/etc/passwd": "root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000::/home/user:/bin/bash",
         }

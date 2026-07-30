@@ -24,8 +24,23 @@ agentparry-proxy = "src.proxy:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "ruff==0.15.17",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
+ignore = [
+    # Suggested ternary is over 100 chars; the if/else block reads better.
+    "SIM108",
+    # PolicyAction is str+Enum. StrEnum is safe here but changing the core
+    # policy enum belongs in its own PR, not a lint-setup one.
+    "UP042",
+]

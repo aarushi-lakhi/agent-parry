@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any
 
@@ -259,10 +260,10 @@ class PolicyEngine:
         arguments: dict[str, Any],
         findings: list[Finding],
     ) -> bool:
-        for condition in rule.conditions:
-            if not self._condition_matches(condition, arguments, findings):
-                return False
-        return True
+        return all(
+            self._condition_matches(condition, arguments, findings)
+            for condition in rule.conditions
+        )
 
     def _condition_matches(
         self,

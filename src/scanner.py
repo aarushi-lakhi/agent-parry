@@ -5,7 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +95,7 @@ async def discover_tools(client: httpx.AsyncClient, proxy_url: str, headers: dic
     resp = await client.post(proxy_url, json=rpc, headers=headers)
     resp.raise_for_status()
     body = resp.json()
-    if "error" in body and body["error"]:
+    if body.get("error"):
         raise RuntimeError(f"tools/list error: {body['error']}")
     result = body.get("result") or {}
     tools = result.get("tools")
@@ -135,8 +135,8 @@ def build_dynamic_payloads(tools: list[dict[str, Any]]) -> list[AttackPayload]:
         props = _schema_string_props(schema)
 
         def fill_defaults(args: dict[str, Any]) -> dict[str, Any]:
-            for pname, _pspec in props:
-                if pname not in args and pname in req_set:
+            for pname, _pspec in props:  # noqa: B023
+                if pname not in args and pname in req_set:  # noqa: B023
                     args[pname] = "test"
             return args
 
@@ -230,9 +230,6 @@ class Scanner:
                 AttackPayload(**entry) for entry in data.get("payloads", [])
             ]
 
-    # ------------------------------------------------------------------
-    # Scan execution
-    # ------------------------------------------------------------------
 
     async def run_scan(
         self,
@@ -289,7 +286,7 @@ class Scanner:
             policy_allowed_safe=policy_safe,
             results=results,
             vulnerability_score=score,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             target_url=proxy_url,
             safe_mode=safe,
             discovered_tools=discovered_names,
@@ -420,7 +417,7 @@ class Scanner:
             policy_allowed_safe=policy_safe,
             results=results,
             vulnerability_score=score,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             target_url=proxy_url,
             safe_mode=safe,
             discovered_tools=list(original_report.discovered_tools),
@@ -429,9 +426,6 @@ class Scanner:
             payload_stats=dict(original_report.payload_stats),
         )
 
-    # ------------------------------------------------------------------
-    # Reporting
-    # ------------------------------------------------------------------
 
     def print_report(self, report: ScanReport) -> None:
         summary = (
@@ -568,8 +562,8 @@ class Scanner:
                 "",
                 "## Summary",
                 "",
-                f"| Metric | Value |",
-                f"| --- | --- |",
+                "| Metric | Value |",
+                "| --- | --- |",
                 f"| Total attacks | {report.total_attacks} |",
                 f"| Blocked | {report.blocked} |",
                 f"| Redacted | {report.redacted} |",
@@ -584,7 +578,14 @@ class Scanner:
             ]
         )
         for r in sorted(report.results, key=lambda x: (not x.passed_through, x.payload.name)):
-            st = "BLOCKED" if r.was_blocked else "REDACTED" if r.was_redacted else "SAFE_OK" if r.evaluated_only else "VULNERABLE"
+            if r.was_blocked:
+                st = "BLOCKED"
+            elif r.was_redacted:
+                st = "REDACTED"
+            elif r.evaluated_only:
+                st = "SAFE_OK"
+            else:
+                st = "VULNERABLE"
             notes = _md_cell(r.notes)
             lines.append(
                 f"| {st} | {_md_cell(r.payload.severity)} | {_md_cell(r.payload.category)} | "
@@ -604,9 +605,6 @@ class Scanner:
         p.write_text(text, encoding="utf-8")
         return str(p)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _classify_response(

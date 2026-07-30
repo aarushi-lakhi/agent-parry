@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -240,7 +239,7 @@ def _print_results(results: list[CheckResult]) -> bool:
 def main() -> int:
     try:
         results = _run_checks()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         Console().print(f"[bold red]Failed to run wall checks:[/bold red] {exc}")
         return 1
     return 0 if _print_results(results) else 1

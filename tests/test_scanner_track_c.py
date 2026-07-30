@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src.models import AttackPayload, AttackResult, ScanReport
@@ -81,7 +81,7 @@ def test_save_markdown_report_contains_sections(tmp_path: Path) -> None:
             )
         ],
         vulnerability_score=0.0,
-        timestamp=datetime(2026, 4, 12, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 4, 12, tzinfo=UTC),
         target_url="http://localhost:9090/mcp",
         safe_mode=False,
         discovered_tools=["email_send"],
@@ -102,7 +102,7 @@ def test_save_scan_outputs_both_writes_two_files(tmp_path: Path) -> None:
         blocked=0,
         passed=0,
         redacted=0,
-        timestamp=datetime(2026, 4, 12, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 4, 12, tzinfo=UTC),
         target_url="http://x/mcp",
     )
     scanner = Scanner(payloads_path=None)
