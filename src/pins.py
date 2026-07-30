@@ -29,6 +29,7 @@ a 0700 directory is hygiene, not a defense.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import logging
 import os
@@ -347,22 +348,25 @@ class PinStore:
             os.close(fd)
 
     def _write(self, data: PinFile) -> None:
+        """Replace the pin file atomically, leaving no temp file behind on failure."""
         path = self.path
         path.parent.mkdir(parents=True, exist_ok=True)
         _chmod(path.parent, 0o700)
-        payload = data.model_dump_json(indent=2) + "\n"
+        payload = (data.model_dump_json(indent=2) + "\n").encode("utf-8", errors="replace")
         fd, raw_tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
         tmp = Path(raw_tmp)
         try:
-            if os.name != "nt":
-                with contextlib.suppress(OSError):
-                    os.fchmod(fd, 0o600)
-            os.write(fd, payload.encode("utf-8", errors="replace"))
-        finally:
-            os.close(fd)
-        try:
+            try:
+                if os.name != "nt":
+                    with contextlib.suppress(OSError):
+                        os.fchmod(fd, 0o600)
+                written = os.write(fd, payload)
+                if written != len(payload):
+                    raise OSError(errno.ENOSPC, f"wrote {written} of {len(payload)} bytes")
+            finally:
+                os.close(fd)
             os.replace(tmp, path)
-        except OSError:
+        except BaseException:
             with contextlib.suppress(OSError):
                 tmp.unlink()
             raise
