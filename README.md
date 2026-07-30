@@ -31,6 +31,29 @@ When the client closes stdin, the proxy closes the wrapped server’s stdin (EOF
 
 See `python -m src.stdio_proxy --help` for examples.
 
+## Scanning
+
+`src/scanner.py` replays `attacks/payloads.yaml` through a running proxy and scores each payload on three axes: what the payload **expected** (`block`, `redact` or `allow`), what was **observed** in the response, and the **outcome** of comparing the two.
+
+```bash
+agentparry scan --target http://localhost:9090/mcp --format both
+agentparry scan --target http://localhost:9090/mcp --safe --format md
+```
+
+Outcomes roll up into a confusion matrix, so a scan reports a pair of numbers instead of one:
+
+| Outcome | Meaning |
+|---|---|
+| `true_block` | attack payload stopped (a stricter response satisfies a weaker expectation, so a block satisfies `redact`) |
+| `false_negative` | attack payload reached the tool |
+| `true_allow` | benign payload allowed |
+| `false_positive` | benign payload blocked, which is over-blocking |
+| `indeterminate` | not measurable: upstream rejected the call (`-32601` / `-32602`), or safe mode meant the output inspector never ran |
+
+`vulnerability_score` counts attack payloads only, so adding benign payloads cannot deflate it. `detection_rate`, `false_positive_rate` and `balanced_score` return `n/a` when their denominator is empty, because "no benign payloads" is not "zero over-blocking". The payload set ships nine `expected_behavior: allow` payloads and the default policy over-blocks three of them; the scan report's "False positives" section names the rule at fault.
+
+Only error code `-32001` counts as a proxy block. `-32601` and `-32602` mean the call never reached policy evaluation and score as indeterminate.
+
 ## HTTP proxy
 
 Run the FastAPI app (for example with uvicorn) and point your client at the proxy’s `/mcp` route; configure upstream URL in `src/models.py` (`MOCK_SERVER_URL`) or your deployment.
