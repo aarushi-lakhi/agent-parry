@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from src.inspector import METADATA_METHODS, MetadataInspector
+from src.inspector import AGENTPARRY_KEY, METADATA_METHODS, MetadataInspector
 from src.models import (
     METADATA_BLOCK_ERROR_CODE,
     PROXY_URL,
@@ -36,14 +37,18 @@ UPSTREAM_REJECTED_CODES = frozenset({-32601, -32602})
 
 OBSERVED_BLOCK = "block"
 OBSERVED_REDACT = "redact"
+OBSERVED_NEUTRALIZE = "neutralize"
 OBSERVED_ALLOW = "allow"
 OBSERVED_EVALUATED = "evaluated"
 OBSERVED_UNAVAILABLE = "unavailable"
 
 EXPECTED_BLOCK = "block"
 EXPECTED_REDACT = "redact"
+EXPECTED_NEUTRALIZE = "neutralize"
 EXPECTED_ALLOW = "allow"
-VALID_EXPECTATIONS = frozenset({EXPECTED_BLOCK, EXPECTED_REDACT, EXPECTED_ALLOW})
+VALID_EXPECTATIONS = frozenset(
+    {EXPECTED_BLOCK, EXPECTED_REDACT, EXPECTED_NEUTRALIZE, EXPECTED_ALLOW}
+)
 
 OUTCOME_TRUE_BLOCK = "true_block"
 OUTCOME_FALSE_NEGATIVE = "false_negative"
@@ -61,9 +66,31 @@ _OUTCOME_ORDER: dict[str, int] = {
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
+_OUTPUT_SIDE_ACTIONS = frozenset({OBSERVED_NEUTRALIZE, OBSERVED_REDACT, OBSERVED_BLOCK})
+"""Observations that count as acting on a tool result.
+
+Strictness runs allow < neutralize < redact < block, measured by how much of the
+result the proxy took away from the model: a fence keeps everything and warns,
+redaction removes the matched span, a block delivers nothing.
+"""
+
+_OUTPUT_SIDE_EXPECTATIONS = frozenset({EXPECTED_REDACT, EXPECTED_NEUTRALIZE})
+"""Expectations only an executed call can satisfy, so safe mode cannot judge them."""
+
+_RESULT_INJECTION_OBSERVED: dict[str, str] = {
+    "neutralize": OBSERVED_NEUTRALIZE,
+    "redact": OBSERVED_REDACT,
+}
+"""ResultInspection.action to observed behavior, for the actions that rewrite a leaf.
+
+`block` is absent because a blocked result arrives as error -32002 and never
+carries a result body to annotate.
+"""
+
 _SATISFIES: dict[str, frozenset[str]] = {
     EXPECTED_BLOCK: frozenset({OBSERVED_BLOCK}),
-    EXPECTED_REDACT: frozenset({OBSERVED_REDACT, OBSERVED_BLOCK}),
+    EXPECTED_REDACT: _OUTPUT_SIDE_ACTIONS,
+    EXPECTED_NEUTRALIZE: _OUTPUT_SIDE_ACTIONS,
 }
 
 METADATA_CATEGORY = "tool_poisoning"
@@ -127,16 +154,38 @@ def map_yaml_tool_to_server(yaml_tool: str, server_tool_names: list[str]) -> str
 
 
 def normalize_expected(expected: str) -> str:
-    """Normalize a payload's expected_behavior to one of block / redact / allow.
+    """Normalize expected_behavior to block / redact / neutralize / allow.
 
     Payloads written before expected behavior was scored carry "", and reports
     persisted then still do, so "" means "block". Anything unrecognized is also
     read as "block", the conservative reading.
+
+    `neutralize` is for an output-side payload whose injected result the proxy is
+    only expected to fence. Written as `redact` it would score the same today,
+    but it says what the payload actually asserts.
     """
     value = (expected or "").strip().lower()
     if value in VALID_EXPECTATIONS:
         return value
     return EXPECTED_BLOCK
+
+
+def result_injection_observed(result_value: dict[str, Any]) -> str | None:
+    """Read what ResultInspector did to a tool result, from its own marker.
+
+    The fence prose is not searchable the way the redaction marker is, and a
+    fence is not a redaction, so the `_agentparry.result_injection` annotation is
+    the only reliable hook. `annotate` and `none` return None: findings were
+    recorded but the text the model reads was not touched, which is a
+    pass-through.
+    """
+    marker = result_value.get(AGENTPARRY_KEY)
+    if not isinstance(marker, dict):
+        return None
+    injection = marker.get("result_injection")
+    if not isinstance(injection, dict):
+        return None
+    return _RESULT_INJECTION_OBSERVED.get(str(injection.get("action") or ""))
 
 
 def observed_from_result(result: AttackResult, *, safe: bool) -> str:
@@ -162,6 +211,8 @@ def observed_from_result(result: AttackResult, *, safe: bool) -> str:
         return OBSERVED_BLOCK
     if result.was_redacted:
         return OBSERVED_REDACT
+    if result.was_neutralized:
+        return OBSERVED_NEUTRALIZE
     if safe:
         return OBSERVED_EVALUATED
     return OBSERVED_ALLOW
@@ -172,6 +223,13 @@ def classify_outcome(expected: str, observed: str, *, safe: bool) -> str:
 
     `safe` is accepted so callers can pass the scan mode uniformly; safe mode is
     already implied by an `evaluated` observation.
+
+    An observed neutralize satisfies `expected: redact` and does not satisfy
+    `expected: block`. Fencing alters the result the model reads without stopping
+    the call, and the fence is advisory, so scoring it as a block would inflate
+    detection_rate for the payloads the proxy handles least well. It still counts
+    against a benign payload, since the proxy acted on traffic that should have
+    been left alone.
     """
     expectation = normalize_expected(expected)
 
@@ -179,12 +237,12 @@ def classify_outcome(expected: str, observed: str, *, safe: bool) -> str:
         return OUTCOME_INDETERMINATE
 
     if expectation == EXPECTED_ALLOW:
-        if observed in (OBSERVED_BLOCK, OBSERVED_REDACT):
+        if observed in _OUTPUT_SIDE_ACTIONS:
             return OUTCOME_FALSE_POSITIVE
         return OUTCOME_TRUE_ALLOW
 
-    if expectation == EXPECTED_REDACT and observed == OBSERVED_EVALUATED:
-        # The output inspector never ran, so redaction is unobservable.
+    if expectation in _OUTPUT_SIDE_EXPECTATIONS and observed == OBSERVED_EVALUATED:
+        # The output inspector never ran, so an output-side action is unobservable.
         return OUTCOME_INDETERMINATE
 
     if observed in _SATISFIES[expectation]:
@@ -196,11 +254,12 @@ def compute_confusion_matrix(results: list[AttackResult], *, safe: bool = False)
     """Tally expected versus observed behavior across one scan's results."""
     matrix = ConfusionMatrix()
     for result in results:
+        observed = observed_from_result(result, safe=safe)
         outcome = result.outcome or classify_outcome(
-            result.payload.expected_behavior,
-            observed_from_result(result, safe=safe),
-            safe=safe,
+            result.payload.expected_behavior, observed, safe=safe
         )
+        if observed == OBSERVED_NEUTRALIZE:
+            matrix.neutralized += 1
         if outcome == OUTCOME_TRUE_BLOCK:
             matrix.true_block += 1
         elif outcome == OUTCOME_FALSE_NEGATIVE:
@@ -225,6 +284,34 @@ def result_outcome(result: AttackResult, *, safe: bool) -> str:
     )
 
 
+@dataclass(slots=True)
+class _Tallies:
+    """The legacy per-scan counters, which predate the confusion matrix.
+
+    Neutralized results get their own counter instead of landing in `passed_vuln`:
+    the proxy acted, so calling them vulnerable was the bug this replaces.
+    """
+
+    blocked: int = 0
+    redacted: int = 0
+    neutralized: int = 0
+    passed_vuln: int = 0
+    policy_safe: int = 0
+
+    def record(self, result: AttackResult) -> None:
+        """Fold one result into the counters, most decisive flag first."""
+        if result.evaluated_only:
+            self.policy_safe += 1
+        elif result.was_blocked:
+            self.blocked += 1
+        elif result.was_redacted:
+            self.redacted += 1
+        elif result.was_neutralized:
+            self.neutralized += 1
+        else:
+            self.passed_vuln += 1
+
+
 def _format_rate(value: float | None) -> str:
     """Render a rate, or "n/a" when its denominator was empty."""
     return "n/a" if value is None else f"{value}%"
@@ -240,6 +327,8 @@ def _matrix_line(matrix: ConfusionMatrix) -> str:
     )
     if matrix.indeterminate:
         line += f" | {matrix.indeterminate} indeterminate"
+    if matrix.neutralized:
+        line += f" | {matrix.neutralized} neutralized"
     return line
 
 
@@ -608,22 +697,21 @@ class Scanner:
             else:
                 payloads_to_run = yaml_payloads
 
-            results, blocked, redacted, passed_vuln, policy_safe = await self._execute_payloads(
+            results, tallies = await self._execute_payloads(
                 client, proxy_url, headers, payloads_to_run, safe=safe
             )
 
-        results, blocked, redacted, passed_vuln, policy_safe = _merge_metadata_results(
-            metadata_results, results, blocked, redacted, passed_vuln, policy_safe
-        )
+        results, tallies = _merge_metadata_results(metadata_results, results, tallies)
         total = len(results)
         attacks, benign = split_by_expectation(results)
 
         return ScanReport(
             total_attacks=total,
-            blocked=blocked,
-            passed=passed_vuln,
-            redacted=redacted,
-            policy_allowed_safe=policy_safe,
+            blocked=tallies.blocked,
+            passed=tallies.passed_vuln,
+            redacted=tallies.redacted,
+            neutralized=tallies.neutralized,
+            policy_allowed_safe=tallies.policy_safe,
             results=results,
             vulnerability_score=vulnerability_score(results),
             timestamp=datetime.now(UTC),
@@ -727,12 +815,9 @@ class Scanner:
         payloads_to_run: list[AttackPayload],
         *,
         safe: bool = False,
-    ) -> tuple[list[AttackResult], int, int, int, int]:
+    ) -> tuple[list[AttackResult], _Tallies]:
         results: list[AttackResult] = []
-        blocked = 0
-        redacted = 0
-        passed_vuln = 0
-        policy_safe = 0
+        tallies = _Tallies()
 
         for idx, payload in enumerate(payloads_to_run, start=1):
             rpc_request: dict[str, Any] = {
@@ -749,31 +834,22 @@ class Scanner:
                 resp = await client.post(proxy_url, json=rpc_request, headers=headers)
                 body = resp.json()
             except httpx.HTTPError as exc:
-                results.append(
-                    AttackResult(
-                        payload=payload,
-                        passed_through=True,
-                        observed_behavior=OBSERVED_UNAVAILABLE,
-                        outcome=OUTCOME_INDETERMINATE,
-                        notes=f"Connection error: {exc}",
-                    )
+                unreachable = AttackResult(
+                    payload=payload,
+                    passed_through=True,
+                    observed_behavior=OBSERVED_UNAVAILABLE,
+                    outcome=OUTCOME_INDETERMINATE,
+                    notes=f"Connection error: {exc}",
                 )
-                passed_vuln += 1
+                results.append(unreachable)
+                tallies.record(unreachable)
                 continue
 
             result = self._classify_response(payload, body, safe=safe)
             results.append(result)
+            tallies.record(result)
 
-            if result.evaluated_only:
-                policy_safe += 1
-            elif result.was_blocked:
-                blocked += 1
-            elif result.was_redacted:
-                redacted += 1
-            else:
-                passed_vuln += 1
-
-        return results, blocked, redacted, passed_vuln, policy_safe
+        return results, tallies
 
     async def run_rescan(
         self,
@@ -797,21 +873,20 @@ class Scanner:
                 rescanned, _tools = await self._scan_metadata(client, proxy_url, headers, safe=safe)
                 metadata_results = [r for r in rescanned if r.payload.id in metadata_ids]
 
-            results, blocked, redacted, passed_vuln, policy_safe = await self._execute_payloads(
+            results, tallies = await self._execute_payloads(
                 client, proxy_url, headers, replayed, safe=safe
             )
 
-        results, blocked, redacted, passed_vuln, policy_safe = _merge_metadata_results(
-            metadata_results, results, blocked, redacted, passed_vuln, policy_safe
-        )
+        results, tallies = _merge_metadata_results(metadata_results, results, tallies)
         attacks, benign = split_by_expectation(results)
 
         return ScanReport(
             total_attacks=len(results),
-            blocked=blocked,
-            passed=passed_vuln,
-            redacted=redacted,
-            policy_allowed_safe=policy_safe,
+            blocked=tallies.blocked,
+            passed=tallies.passed_vuln,
+            redacted=tallies.redacted,
+            neutralized=tallies.neutralized,
+            policy_allowed_safe=tallies.policy_safe,
             results=results,
             vulnerability_score=vulnerability_score(results),
             timestamp=datetime.now(UTC),
@@ -836,6 +911,8 @@ class Scanner:
             f"{report.redacted} redacted | "
             f"{report.passed} PASSED THROUGH"
         )
+        if report.neutralized:
+            summary += f" | {report.neutralized} neutralized"
         if report.policy_allowed_safe:
             summary += f" | {report.policy_allowed_safe} policy-allowed (safe, not executed)"
 
@@ -1023,6 +1100,7 @@ class Scanner:
                 f"| Benign payloads | {benign_total} |",
                 f"| Blocked | {report.blocked} |",
                 f"| Redacted | {report.redacted} |",
+                f"| Neutralized | {report.neutralized} |",
                 f"| Passed through (vulnerable) | {report.passed} |",
                 f"| Policy allowed (safe, not executed) | {report.policy_allowed_safe} |",
                 f"| Vulnerability score (attack payloads only) | {report.vulnerability_score}% |",
@@ -1042,6 +1120,8 @@ class Scanner:
                 st = "BLOCKED"
             elif r.was_redacted:
                 st = "REDACTED"
+            elif r.was_neutralized:
+                st = "NEUTRALIZED"
             elif r.evaluated_only:
                 st = "SAFE_OK"
             else:
@@ -1171,6 +1251,23 @@ class Scanner:
                     observed_behavior=OBSERVED_EVALUATED,
                     notes="Safe scan: policy allowed; upstream not executed",
                 )
+            observed = result_injection_observed(result_value)
+            if observed == OBSERVED_NEUTRALIZE:
+                return AttackResult(
+                    payload=payload,
+                    was_neutralized=True,
+                    proxy_response=body,
+                    observed_behavior=OBSERVED_NEUTRALIZE,
+                    notes="Injected result neutralized by proxy",
+                )
+            if observed == OBSERVED_REDACT:
+                return AttackResult(
+                    payload=payload,
+                    was_redacted=True,
+                    proxy_response=body,
+                    observed_behavior=OBSERVED_REDACT,
+                    notes="Injected result redacted by proxy",
+                )
 
         if isinstance(result_value, str) and "[REDACTED" in result_value:
             return AttackResult(
@@ -1216,6 +1313,8 @@ class Scanner:
         observed = result.observed_behavior or observed_from_result(result, safe=safe)
 
         if outcome == OUTCOME_FALSE_NEGATIVE:
+            if observed == OBSERVED_NEUTRALIZE:
+                return Text("[!] NEUTRALIZED ONLY", style="bold yellow")
             return Text("[!] MISSED", style="bold red")
         if outcome == OUTCOME_FALSE_POSITIVE:
             return Text("[x] OVER-BLOCKED", style="bold magenta")
@@ -1227,6 +1326,8 @@ class Scanner:
             return Text("[.] ALLOWED", style="green")
         if observed == OBSERVED_REDACT:
             return Text("[~] REDACTED", style="blue")
+        if observed == OBSERVED_NEUTRALIZE:
+            return Text("[~] NEUTRALIZED", style="blue")
         return Text("[+] BLOCKED", style="green")
 
     @staticmethod
@@ -1247,17 +1348,16 @@ class Scanner:
             return Text("[+] BLOCKED", style="green")
         if result.was_redacted:
             return Text("[~] REDACTED", style="blue")
+        if result.was_neutralized:
+            return Text("[~] NEUTRALIZED", style="blue")
         return Text("[!] VULNERABLE", style="red")
 
 
 def _merge_metadata_results(
     metadata_results: list[AttackResult],
     results: list[AttackResult],
-    blocked: int,
-    redacted: int,
-    passed_vuln: int,
-    policy_safe: int,
-) -> tuple[list[AttackResult], int, int, int, int]:
+    tallies: _Tallies,
+) -> tuple[list[AttackResult], _Tallies]:
     """Fold the discovery rows into the payload tallies.
 
     Metadata rows count in the totals, which moves ``vulnerability_score``: an
@@ -1266,15 +1366,8 @@ def _merge_metadata_results(
     """
     merged = metadata_results + results
     for result in metadata_results:
-        if result.evaluated_only:
-            policy_safe += 1
-        elif result.was_blocked:
-            blocked += 1
-        elif result.was_redacted:
-            redacted += 1
-        else:
-            passed_vuln += 1
-    return merged, blocked, redacted, passed_vuln, policy_safe
+        tallies.record(result)
+    return merged, tallies
 
 
 def _md_cell(s: str) -> str:

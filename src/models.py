@@ -307,11 +307,18 @@ class AttackPayload(BaseModel):
 
 
 class AttackResult(BaseModel):
-    """Captures the observed result for a single attack payload."""
+    """Captures the observed result for a single attack payload.
+
+    ``was_neutralized`` is its own flag rather than a second meaning for
+    ``was_redacted``: an untrusted-content fence keeps the offending text and
+    warns the model, while redaction removes it. Defaulted, so a report
+    persisted before the flag existed still validates.
+    """
 
     payload: AttackPayload
     was_blocked: bool = False
     was_redacted: bool = False
+    was_neutralized: bool = False
     passed_through: bool = False
     evaluated_only: bool = False
     proxy_response: dict[str, Any] | None = None
@@ -322,13 +329,20 @@ class AttackResult(BaseModel):
 
 
 class ConfusionMatrix(BaseModel):
-    """Counts expected-versus-observed outcomes across one scan."""
+    """Counts expected-versus-observed outcomes across one scan.
+
+    ``neutralized`` cuts across the other five: it counts results the proxy
+    fenced instead of blocking or redacting, whatever they scored. Without it a
+    neutralize against an ``expected_behavior: block`` payload is a bare
+    false_negative, indistinguishable from a payload nothing touched.
+    """
 
     true_block: int = 0
     false_negative: int = 0
     true_allow: int = 0
     false_positive: int = 0
     indeterminate: int = 0
+    neutralized: int = 0
 
     @property
     def attack_total(self) -> int:
@@ -382,6 +396,7 @@ class ScanReport(BaseModel):
     blocked: int = 0
     passed: int = 0
     redacted: int = 0
+    neutralized: int = 0
     policy_allowed_safe: int = 0
     results: list[AttackResult] = Field(default_factory=list)
     vulnerability_score: float = 0.0
