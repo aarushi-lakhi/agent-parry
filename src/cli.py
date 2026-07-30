@@ -19,6 +19,7 @@ import httpx
 import json5
 
 from src.models import PROXY_URL, ScanReport
+from src.policy_lint import LintReport, lint_policy, render_report
 from src.rule_generator import RuleGenerator, plan_autogen_merge, write_policy_text
 from src.scanner import (
     OUTCOME_FALSE_NEGATIVE,
@@ -509,6 +510,39 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return EXIT_INTERRUPTED
 
 
+LINT_FAIL_LEVELS = ("high", "medium", "low", "never")
+_LINT_SEVERITY_ORDER = {"high": 1, "medium": 2, "low": 3}
+
+
+def lint_exit_code(report: LintReport, fail_on: str) -> int:
+    """Map a lint report onto an exit code, so CI can gate on over-blocking.
+
+    Shares `EXIT_VULNERABLE` with the scan path: a rule that blocks legitimate
+    traffic is a policy defect the same way a passed-through attack is.
+    """
+    if fail_on == "never":
+        return EXIT_OK
+    limit = _LINT_SEVERITY_ORDER[fail_on]
+    if any(_LINT_SEVERITY_ORDER.get(f.severity, 9) <= limit for f in report.findings):
+        return EXIT_VULNERABLE
+    return EXIT_OK
+
+
+def cmd_lint_policy(args: argparse.Namespace) -> int:
+    """Analyze a policy file for over-blocking, statically and against the benign corpus."""
+    payloads = None if args.no_corpus else args.payloads
+    try:
+        report = lint_policy(args.policy, payloads, probes=not args.no_probes)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+    if args.format == "json":
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_report(report))
+    return lint_exit_code(report, args.fail_on)
+
+
 def _claude_config_path() -> Path:
     home = Path.home()
     if sys.platform == "darwin":
@@ -994,6 +1028,55 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_verify_scope_args(p_verify)
     p_verify.set_defaults(handler=cmd_verify)
+
+    p_lint = sub.add_parser(
+        "lint-policy",
+        help="Predict which policy rules over-block, statically and against the benign corpus",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Offline: no proxy, no network. Static checks read each rule's regexes; the empirical\n"
+            "half evaluates every rule on its own through PolicyEngine against the benign payloads\n"
+            "in --payloads, and reports the matched span of every benign block. --no-corpus falls\n"
+            "back to generated plausible-benign strings only.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 findings at or above --fail-on.\n"
+            "Examples:\n"
+            "  agentparry lint-policy\n"
+            "  agentparry lint-policy --policy config/default_policy.yaml --format json\n"
+            "  agentparry lint-policy --fail-on medium\n"
+        ),
+    )
+    p_lint.add_argument(
+        "--policy",
+        default="config/default_policy.yaml",
+        help="Policy YAML to lint (default: config/default_policy.yaml)",
+    )
+    p_lint.add_argument("--payloads", default="attacks/payloads.yaml", help="Payload YAML holding the benign corpus")
+    p_lint.add_argument(
+        "--no-corpus",
+        action="store_true",
+        dest="no_corpus",
+        help="Skip the payload file and rely on generated benign strings",
+    )
+    p_lint.add_argument(
+        "--no-probes",
+        action="store_true",
+        dest="no_probes",
+        help="Static checks and corpus only, no generated benign strings",
+    )
+    p_lint.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Report format (default: text)",
+    )
+    p_lint.add_argument(
+        "--fail-on",
+        choices=LINT_FAIL_LEVELS,
+        default="high",
+        dest="fail_on",
+        help="Lowest severity that exits 3 (default: high)",
+    )
+    p_lint.set_defaults(handler=cmd_lint_policy)
 
     p_claude = sub.add_parser(
         "install-claude",
