@@ -792,6 +792,215 @@ def test_harden_parser_defaults() -> None:
     assert args.allow_remote is False
 
 
+def _save_before(tmp_path: Path, report: ScanReport) -> Path:
+    path = tmp_path / "before.json"
+    path.write_text(report.model_dump_json(), encoding="utf-8")
+    return path
+
+
+def test_verify_requires_before() -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli._build_parser().parse_args(["verify", "--target", LOCAL_TARGET])
+    assert exc.value.code == cli.EXIT_USAGE
+
+
+def test_verify_missing_before_report_errors(tmp_path: Path) -> None:
+    args = cli._build_parser().parse_args(["verify", "--before", str(tmp_path / "nope.json")])
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_verify(args)
+    assert "before report not found" in str(exc.value)
+
+
+def test_verify_rejects_a_non_report_file(tmp_path: Path) -> None:
+    path = tmp_path / "before.json"
+    path.write_text("not json", encoding="utf-8")
+    args = cli._build_parser().parse_args(["verify", "--before", str(path)])
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_verify(args)
+    assert "not a valid scan report" in str(exc.value)
+
+
+def test_verify_target_defaults_to_the_before_report_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = _report([_vulnerable("pe-004")], target="http://127.0.0.5:7777/mcp")
+    path = _save_before(tmp_path, before)
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([_blocked("pe-004")]))
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path)])
+    assert cli.cmd_verify(args) == cli.EXIT_OK
+    assert calls["rescans"] == [{"target": "http://127.0.0.5:7777/mcp", "safe": False}]
+    assert calls["probes"] == [{"target": "http://127.0.0.5:7777/mcp", "safe": False}]
+
+
+def test_verify_explicit_target_overrides_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_before(tmp_path, _report([_vulnerable("pe-004")], target="http://127.0.0.5:7777/mcp"))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([_blocked("pe-004")]))
+
+    args = cli._build_parser().parse_args(
+        ["verify", "--before", str(path), "--target", LOCAL_TARGET]
+    )
+    assert cli.cmd_verify(args) == cli.EXIT_OK
+    assert calls["rescans"] == [{"target": LOCAL_TARGET, "safe": False}]
+
+
+def test_verify_refuses_a_safe_before_report_without_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_before(tmp_path, _report([_safe_allowed("pe-004")], safe=True))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([]))
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path)])
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_verify(args)
+    assert "--full" in str(exc.value)
+    assert "rescans" not in calls
+
+
+def test_verify_accepts_a_safe_before_report_with_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_before(tmp_path, _report([_safe_allowed("pe-004")], safe=True))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[_report([_blocked("pe-004")], safe=True)])
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path), "--full", "--safe"])
+    assert cli.cmd_verify(args) == cli.EXIT_OK
+    assert len(calls["scans"]) == 1
+
+
+def test_verify_full_uses_a_full_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _save_before(tmp_path, _report([_vulnerable("pe-004"), _blocked("pe-001")]))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[_report([_blocked("pe-004"), _blocked("pe-001")])])
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path), "--full"])
+    assert cli.cmd_verify(args) == cli.EXIT_OK
+    assert calls["scans"] == [{"target": LOCAL_TARGET, "discover": False, "safe": False}]
+    assert "rescans" not in calls
+
+
+def test_verify_default_prints_the_unreplayed_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = _report([_vulnerable("pe-004"), _blocked("pe-001"), _benign_blocked("bn-001")])
+    path = _save_before(tmp_path, before)
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([_blocked("pe-004")]))
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path)])
+    assert cli.cmd_verify(args) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    # pe-001 was correct and not replayed; bn-001 was already a false positive.
+    assert "Not replayed: 1 payloads that behaved correctly before" in out
+    assert "Use --full in CI." in out
+
+
+def test_verify_exit_3_when_vulnerabilities_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_before(tmp_path, _report([_vulnerable("pe-004")]))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([_vulnerable("pe-004")]))
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path)])
+    assert cli.cmd_verify(args) == cli.EXIT_VULNERABLE
+
+
+def test_verify_max_vulns_gives_slack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _save_before(tmp_path, _report([_vulnerable("pe-004")]))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([_vulnerable("pe-004")]))
+
+    args = cli._build_parser().parse_args(
+        ["verify", "--before", str(path), "--max-vulns", "1"]
+    )
+    assert cli.cmd_verify(args) == cli.EXIT_OK
+
+
+def test_verify_exit_3_on_regression(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A payload that was blocked before and gets through now, only visible with --full."""
+    path = _save_before(tmp_path, _report([_blocked("pe-001")]))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[_report([_vulnerable("pe-001")])])
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path), "--full"])
+    assert cli.cmd_verify(args) == cli.EXIT_VULNERABLE
+
+
+def test_verify_reports_false_positives_introduced_by_hardening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = _report([_vulnerable("pe-004"), _benign_allowed("bn-001")])
+    path = _save_before(tmp_path, before)
+    calls: dict[str, Any] = {}
+    _patch_harness(
+        monkeypatch, calls, scans=[_report([_blocked("pe-004"), _benign_blocked("bn-001")])]
+    )
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path), "--full"])
+    assert cli.cmd_verify(args) == cli.EXIT_VULNERABLE
+    out = capsys.readouterr().out
+    assert "Fixed: 1" in out
+    assert "False positives introduced by the new rules: 1" in out
+
+
+def test_verify_remote_target_refused_without_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_before(tmp_path, _report([_vulnerable("pe-004")], target="https://prod.example/mcp"))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([]))
+
+    args = cli._build_parser().parse_args(["verify", "--before", str(path)])
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_verify(args)
+    assert "not a loopback" in str(exc.value)
+    assert "rescans" not in calls
+
+
+def test_verify_remote_target_allowed_with_allow_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_before(tmp_path, _report([_vulnerable("pe-004")], target="https://prod.example/mcp"))
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[], rescan=_report([_blocked("pe-004")]))
+
+    args = cli._build_parser().parse_args(
+        ["verify", "--before", str(path), "--allow-remote"]
+    )
+    assert cli.cmd_verify(args) == cli.EXIT_OK
+    assert calls["rescans"] == [{"target": "https://prod.example/mcp", "safe": False}]
+
+
+def test_verify_keyboard_interrupt_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_before(tmp_path, _report([_vulnerable("pe-004")]))
+
+    def _boom(coro: Any) -> int:
+        coro.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.asyncio, "run", _boom)
+    args = cli._build_parser().parse_args(["verify", "--before", str(path)])
+    assert cli.cmd_verify(args) == cli.EXIT_INTERRUPTED
+
+
+def test_verify_parser_defaults(tmp_path: Path) -> None:
+    args = cli._build_parser().parse_args(["verify", "--before", "b.json"])
+    assert args.handler is cli.cmd_verify
+    assert args.target is None
+    assert args.full is False
+    assert args.max_vulns == 0
+    assert args.output is None
+
+
 def test_main_dispatches_wrap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["agentparry", "wrap", "--command", "npx x", "--policy", "p.yaml"])
     with patch.object(cli, "stdio_main_argv", return_value=0):

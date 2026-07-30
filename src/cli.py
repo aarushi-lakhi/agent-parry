@@ -410,6 +410,60 @@ def cmd_harden(args: argparse.Namespace) -> int:
         return EXIT_INTERRUPTED
 
 
+async def _cmd_verify_live(args: argparse.Namespace, before: ScanReport) -> int:
+    scanner = Scanner(payloads_path=args.payloads)
+    await _probe_target(args.target, safe=args.safe)
+
+    after = await _run_after_scan(
+        scanner,
+        before,
+        target=args.target,
+        full=args.full,
+        discover=args.discover,
+        safe=args.safe,
+    )
+    scanner.print_comparison(before, after)
+    analysis = _analyze_rescan(before, after)
+    _print_analysis(analysis, full=args.full, max_vulns=args.max_vulns)
+    if args.output:
+        for path in save_scan_outputs(scanner, after, args.output, args.format):
+            print(f"Report saved: {path}", file=sys.stderr)
+    return vulnerability_exit_code(
+        analysis.remaining, args.max_vulns, regression=analysis.regression
+    )
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Re-scan a target and compare it against a scan taken before the rules landed.
+
+    `--before` is required rather than optional: a baseline scanned inside this
+    invocation would be taken after the rules were already in force, so every
+    comparison would be against the hardened state and read as a clean sheet.
+    """
+    before_path = Path(args.before)
+    if not before_path.is_file():
+        raise SystemExit(f"error: before report not found: {args.before}")
+    try:
+        before = ScanReport.model_validate_json(before_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise SystemExit(f"error: {args.before} is not a valid scan report: {exc}") from exc
+
+    if before.safe_mode and not args.full:
+        raise SystemExit(
+            "error: the before report was taken in --safe mode, so it has no passed-through "
+            "results for a rescan to replay. Re-run with --full."
+        )
+
+    if args.target is None:
+        args.target = before.target_url or PROXY_URL
+    _guard_live_target(args.target, safe=args.safe, allow_remote=args.allow_remote)
+
+    try:
+        return asyncio.run(_cmd_verify_live(args, before))
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+
+
 def _claude_config_path() -> Path:
     home = Path.home()
     if sys.platform == "darwin":
@@ -550,13 +604,13 @@ def cmd_install_openclaw(args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_scan_target_args(parser: argparse.ArgumentParser) -> None:
+def _add_scan_target_args(parser: argparse.ArgumentParser, *, target_default: str) -> None:
     """Target selection and payload-execution safety flags, shared by harden and verify."""
     parser.add_argument(
         "--target",
         default=None,
         metavar="URL",
-        help=f"Proxy JSON-RPC URL (default: {PROXY_URL})",
+        help=f"Proxy JSON-RPC URL (default: {target_default})",
     )
     parser.add_argument("--payloads", default="attacks/payloads.yaml", help="Attack payloads YAML")
     parser.add_argument(
@@ -685,7 +739,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  agentparry harden --target https://prod.example/mcp --safe --yes\n"
         ),
     )
-    _add_scan_target_args(p_harden)
+    _add_scan_target_args(p_harden, target_default=PROXY_URL)
     p_harden.add_argument(
         "--policy",
         default="config/default_policy.yaml",
@@ -717,6 +771,42 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_verify_scope_args(p_harden)
     p_harden.set_defaults(handler=cmd_harden)
+
+    p_verify = sub.add_parser(
+        "verify",
+        help="Re-scan a target and compare it against a saved pre-hardening scan",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "--before is required: a baseline taken now would already include the new rules.\n"
+            "The default replays only the payloads that got through before, which cannot see\n"
+            "regressions or over-blocking among the rest; use --full in CI.\n"
+            "Exit codes: 0 clean, 1 error, 2 usage, 3 vulnerabilities remain or a regression was\n"
+            "found, 130 interrupted.\n"
+            "Examples:\n"
+            "  agentparry verify --before reports/scan_2026-04-12.json\n"
+            "  agentparry verify --before reports/before.json --full --max-vulns 0\n"
+        ),
+    )
+    p_verify.add_argument(
+        "--before",
+        required=True,
+        metavar="PATH",
+        help="Saved scan JSON from before the rules were applied",
+    )
+    _add_scan_target_args(p_verify, target_default="the before report's target_url")
+    p_verify.add_argument(
+        "--output",
+        default=None,
+        help="Save the post-hardening scan here",
+    )
+    p_verify.add_argument(
+        "--format",
+        choices=("json", "md", "both"),
+        default="json",
+        help="Format for --output (default: json)",
+    )
+    _add_verify_scope_args(p_verify)
+    p_verify.set_defaults(handler=cmd_verify)
 
     p_claude = sub.add_parser(
         "install-claude",
