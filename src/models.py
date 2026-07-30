@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 PROXY_PORT = 9090
 MOCK_SERVER_PORT = 8080
@@ -108,6 +109,117 @@ class Finding(BaseModel):
     matched_pattern: str | None = None
 
 
+AUDIT_SCHEMA_VERSION = 1
+
+AUDIT_SEVERITY_ORDER = ("low", "medium", "high", "critical")
+
+
+def max_severity(severities: Iterable[str]) -> str | None:
+    """Return the highest severity present, or None for an empty input."""
+    ranked = [s for s in severities if s in AUDIT_SEVERITY_ORDER]
+    if not ranked:
+        return None
+    return max(ranked, key=AUDIT_SEVERITY_ORDER.index)
+
+
+class AuditAction(str, Enum):
+    """What a proxy actually did at one decision point.
+
+    Deliberately not `PolicyAction`: injection blocks, invalid params, unknown
+    methods and fail-open are not policy actions, and folding them into the
+    policy enum would make the column ambiguous for a reader.
+    """
+
+    ALLOW = "ALLOW"
+    BLOCK_POLICY = "BLOCK_POLICY"
+    BLOCK_INJECTION = "BLOCK_INJECTION"
+    REQUIRE_APPROVAL = "REQUIRE_APPROVAL"
+    REDACT_OUTPUT = "REDACT_OUTPUT"
+    INVALID_PARAMS = "INVALID_PARAMS"
+    METHOD_NOT_FOUND = "METHOD_NOT_FOUND"
+    PASSTHROUGH = "PASSTHROUGH"
+    FAIL_OPEN = "FAIL_OPEN"
+
+
+class AuditTransport(str, Enum):
+    """Which proxy emitted a record."""
+
+    HTTP = "http"
+    STDIO = "stdio"
+
+
+class AuditDirection(str, Enum):
+    """Which leg of the hop a record describes."""
+
+    CLIENT_TO_SERVER = "client->server"
+    SERVER_TO_CLIENT = "server->client"
+
+
+class AuditArgsMode(str, Enum):
+    """How much of the tool arguments a record carries."""
+
+    NONE = "none"
+    PREVIEW = "preview"
+    FULL = "full"
+
+
+class AuditFinding(BaseModel):
+    """One inspector or policy finding, summarized for the audit log.
+
+    `pattern` is the regex source, never the matched text.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    severity: str = "low"
+    description: str = ""
+    field: str | None = None
+    pattern: str | None = None
+
+
+class AuditRecord(BaseModel):
+    """One append-only JSONL line describing a single policy decision.
+
+    `extra="forbid"` so the round-trip test is meaningful. The compatibility
+    rule is additive fields only; any rename or removal bumps
+    `AUDIT_SCHEMA_VERSION`.
+
+    `(run_id, seq)` is the ordering key. Wall-clock `ts` can step backwards
+    under NTP, so it is a timestamp and not a sequence.
+
+    `request_id` is stringified so the column type is stable across JSON-RPC
+    ids that arrive as int and as str.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = AUDIT_SCHEMA_VERSION
+    ts: str
+    seq: int = 0
+    run_id: str
+    pid: int
+    transport: AuditTransport
+    direction: AuditDirection = AuditDirection.CLIENT_TO_SERVER
+    action: AuditAction
+    method: str | None = None
+    tool: str | None = None
+    rule: str | None = None
+    request_id: str | None = None
+    session_id: str | None = None
+    args_mode: AuditArgsMode = AuditArgsMode.NONE
+    arg_hash: str | None = None
+    arg_hash_key_id: str | None = None
+    arg_keys: list[str] = Field(default_factory=list)
+    arg_bytes: int | None = None
+    arg_preview: str | None = None
+    arguments: dict[str, Any] | None = None
+    findings: list[AuditFinding] = Field(default_factory=list)
+    finding_count: int = 0
+    max_severity: str | None = None
+    pii_redactions: int | None = None
+    detail: str = ""
+
+
 class AttackPayload(BaseModel):
     """Defines one scanner attack payload and expected behavior."""
 
@@ -201,6 +313,8 @@ class ProxyStats(BaseModel):
 
 
 __all__ = [
+    "AUDIT_SCHEMA_VERSION",
+    "AUDIT_SEVERITY_ORDER",
     "MCP_EXACT_METHODS",
     "MCP_PASSTHROUGH_PREFIXES",
     "MOCK_SERVER_PORT",
@@ -210,6 +324,12 @@ __all__ = [
     "TOOLS_CALL_METHOD",
     "AttackPayload",
     "AttackResult",
+    "AuditAction",
+    "AuditArgsMode",
+    "AuditDirection",
+    "AuditFinding",
+    "AuditRecord",
+    "AuditTransport",
     "Finding",
     "JsonRpcError",
     "JsonRpcRequest",
@@ -220,4 +340,5 @@ __all__ = [
     "ScanReport",
     "is_known_mcp_method",
     "is_tools_call",
+    "max_severity",
 ]
