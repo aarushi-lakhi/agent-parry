@@ -514,6 +514,18 @@ class TestProxyMetadataInspection(unittest.TestCase):
         self.assertEqual(0, stats.metadata_injections)
 
     @patch("src.proxy._forward_to_upstream")
+    def test_policy_disable_also_bypasses_metadata_inspection(self, mock_forward) -> None:
+        result = {"tools": [copy.deepcopy(POISONED_TOOL)]}
+        mock_forward.return_value = {"jsonrpc": "2.0", "id": 107, "result": copy.deepcopy(result)}
+        self.client.post("/policy/disable")
+        try:
+            response = self.client.post("/mcp", json=self._list_request(107))
+        finally:
+            self.client.post("/policy/enable")
+        self.assertEqual(result, response.json()["result"])
+        self.assertEqual(0, stats.metadata_injections)
+
+    @patch("src.proxy._forward_to_upstream")
     def test_error_response_from_upstream_passes_through(self, mock_forward) -> None:
         mock_forward.return_value = {
             "jsonrpc": "2.0",

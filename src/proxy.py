@@ -297,6 +297,8 @@ def _inspect_metadata(request: JsonRpcRequest, upstream_payload: dict[str, Any])
 def _handle_mcp_rpc(request: JsonRpcRequest, *, safe_scan: bool = False) -> JsonRpcResponse:
     if request.method in METADATA_METHODS:
         upstream_payload = _forward_to_upstream(request.model_dump())
+        if _bypass_all and not safe_scan:
+            return JsonRpcResponse.model_validate(upstream_payload)
         return _inspect_metadata(request, upstream_payload)
 
     if request.method != "tools/call":

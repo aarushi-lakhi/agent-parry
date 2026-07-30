@@ -16,16 +16,34 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from src.inspector import METADATA_METHODS, MetadataInspector
 from src.models import (
+    METADATA_BLOCK_ERROR_CODE,
     PROXY_URL,
     AttackPayload,
     AttackResult,
+    Finding,
     ScanReport,
 )
 
 console = Console()
 
 SAFE_SCAN_HEADER = "AgentParry-Safe-Scan"
+
+METADATA_CATEGORY = "tool_poisoning"
+"""Category for the discovery-side rows, so rule generation skips them.
+
+No pattern_match rule on a tools/call argument can address a poisoned
+description, so generating one would be theatre.
+"""
+
+_METADATA_SEVERE = frozenset({"high", "critical"})
+"""Severities that make a surviving metadata finding count as vulnerable.
+
+Medium covers oversized prose and long whitespace runs, which real servers do by
+accident, so counting those as a vulnerability would make every honest server
+look poisoned.
+"""
 
 _TOOL_KEYWORD_HINTS: dict[str, tuple[str, ...]] = {
     "shell_exec": ("shell", "bash", "cmd", "exec", "terminal", "sh"),
@@ -210,6 +228,56 @@ def build_dynamic_payloads(tools: list[dict[str, Any]]) -> list[AttackPayload]:
     return dynamic
 
 
+def metadata_payload(method: str) -> AttackPayload:
+    """Return the synthetic payload row standing in for one discovery method."""
+    return AttackPayload(
+        id=f"meta-{method.replace('/', '-')}",
+        name=f"Poisoned metadata in {method}",
+        category=METADATA_CATEGORY,
+        tool=method,
+        arguments={},
+        expected_behavior="block",
+        severity="critical",
+        description="Server-authored metadata the client hands to the model during discovery",
+    )
+
+
+def is_metadata_payload(payload: AttackPayload) -> bool:
+    """Report whether a payload row came from the metadata scan phase."""
+    return payload.category == METADATA_CATEGORY
+
+
+def classify_metadata_findings(method: str, findings: list[Finding], body: dict[str, Any]) -> AttackResult:
+    """Score one discovery method against what the inspector found in the response.
+
+    Ground truth is this re-run of the inspector over what actually came back, not
+    any marker the proxy attached to it, so a proxy that self-reports a clean
+    ``tools/list`` while forwarding a poisoned one still scores as vulnerable.
+    """
+    payload = metadata_payload(method)
+    severe = [finding for finding in findings if finding.severity in _METADATA_SEVERE]
+    if not severe:
+        note = "No high or critical metadata findings in the response"
+        medium = len(findings) - len(severe)
+        if medium:
+            note += f" ({medium} medium finding(s) recorded)"
+        return AttackResult(payload=payload, was_blocked=True, proxy_response=body, notes=note)
+
+    fields = []
+    for finding in severe:
+        if finding.field and finding.field not in fields:
+            fields.append(finding.field)
+    shown = ", ".join(fields[:3])
+    if len(fields) > 3:
+        shown += f", +{len(fields) - 3} more"
+    return AttackResult(
+        payload=payload,
+        passed_through=True,
+        proxy_response=body,
+        notes=f"{len(severe)} poisoned metadata finding(s) reached the client: {shown}",
+    )
+
+
 def _print_discovered_tools(names: list[str]) -> None:
     display = ", ".join(names)
     if len(display) > 500:
@@ -229,6 +297,7 @@ class Scanner:
             self.payloads = [
                 AttackPayload(**entry) for entry in data.get("payloads", [])
             ]
+        self._metadata_inspector = MetadataInspector()
 
 
     async def run_scan(
@@ -251,8 +320,12 @@ class Scanner:
         payloads_to_run: list[AttackPayload] = []
 
         async with httpx.AsyncClient(timeout=10.0) as client:
+            metadata_results, metadata_tools = await self._scan_metadata(client, proxy_url, headers)
+
             if discover:
-                tools = await discover_tools(client, proxy_url, headers)
+                tools = metadata_tools if metadata_tools is not None else await discover_tools(
+                    client, proxy_url, headers
+                )
                 discovered_names = sorted(
                     t["name"] for t in tools if isinstance(t.get("name"), str)
                 )
@@ -275,7 +348,10 @@ class Scanner:
                 client, proxy_url, headers, payloads_to_run
             )
 
-        total = len(payloads_to_run)
+        results, blocked, redacted, passed_vuln, policy_safe = _merge_metadata_results(
+            metadata_results, results, blocked, redacted, passed_vuln, policy_safe
+        )
+        total = len(results)
         score = round((passed_vuln / total) * 100, 1) if total else 0.0
 
         return ScanReport(
@@ -294,6 +370,83 @@ class Scanner:
             total_yaml_payloads=total_yaml,
             payload_stats=payload_stats,
         )
+
+    async def _scan_metadata(
+        self,
+        client: httpx.AsyncClient,
+        proxy_url: str,
+        headers: dict[str, str],
+    ) -> tuple[list[AttackResult], list[dict[str, Any]] | None]:
+        """Call initialize and tools/list, and score the metadata that comes back.
+
+        Also returns the raw tool list so ``--discover`` does not have to ask
+        again. A method the target refuses for any reason other than a metadata
+        block produces no row at all: recording an unavailable endpoint as blocked
+        would silently improve the score.
+        """
+        results: list[AttackResult] = []
+        tools: list[dict[str, Any]] | None = None
+
+        for method in ("initialize", "tools/list"):
+            body = await self._discovery_call(client, proxy_url, headers, method)
+            if body is None:
+                continue
+            error = body.get("error")
+            if isinstance(error, dict):
+                if error.get("code") == METADATA_BLOCK_ERROR_CODE:
+                    results.append(
+                        AttackResult(
+                            payload=metadata_payload(method),
+                            was_blocked=True,
+                            proxy_response=body,
+                            notes="Proxy blocked the discovery response outright",
+                        )
+                    )
+                else:
+                    console.print(f"Skipping {method} metadata scan: {error.get('message', error)}")
+                continue
+
+            result = body.get("result")
+            if not isinstance(result, dict):
+                console.print(f"Skipping {method} metadata scan: result is not an object")
+                continue
+
+            findings: list[Finding] = []
+            if method == "tools/list":
+                raw_tools = result.get("tools")
+                if isinstance(raw_tools, list):
+                    tools = [tool for tool in raw_tools if isinstance(tool, dict)]
+                    for tool in tools:
+                        findings.extend(self._metadata_inspector.scan_tool(tool))
+            else:
+                instructions = result.get("instructions")
+                if isinstance(instructions, str):
+                    findings.extend(self._metadata_inspector.scan_instructions(instructions))
+
+            results.append(classify_metadata_findings(method, findings, body))
+
+        poisoned = sum(1 for result in results if result.passed_through)
+        console.print(
+            f"Metadata scan: {len(results)} of {len(METADATA_METHODS)} discovery methods checked, "
+            f"{poisoned} still carrying poisoned metadata"
+        )
+        return results, tools
+
+    @staticmethod
+    async def _discovery_call(
+        client: httpx.AsyncClient,
+        proxy_url: str,
+        headers: dict[str, str],
+        method: str,
+    ) -> dict[str, Any] | None:
+        rpc = {"jsonrpc": "2.0", "method": method, "id": f"meta-{method}", "params": {}}
+        try:
+            resp = await client.post(proxy_url, json=rpc, headers=headers)
+            body = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            console.print(f"Skipping {method} metadata scan: {exc}")
+            return None
+        return body if isinstance(body, dict) else None
 
     async def _execute_payloads(
         self,
@@ -354,9 +507,9 @@ class Scanner:
         *,
         safe: bool = False,
     ) -> ScanReport:
-        vulnerable_payloads = [
-            r.payload for r in original_report.results if r.passed_through
-        ]
+        vulnerable = [r.payload for r in original_report.results if r.passed_through]
+        metadata_ids = {payload.id for payload in vulnerable if is_metadata_payload(payload)}
+        vulnerable_payloads = [payload for payload in vulnerable if not is_metadata_payload(payload)]
 
         headers: dict[str, str] = {}
         if safe:
@@ -369,6 +522,11 @@ class Scanner:
         policy_safe = 0
 
         async with httpx.AsyncClient(timeout=10.0) as client:
+            metadata_results: list[AttackResult] = []
+            if metadata_ids:
+                rescanned, _tools = await self._scan_metadata(client, proxy_url, headers)
+                metadata_results = [r for r in rescanned if r.payload.id in metadata_ids]
+
             for idx, payload in enumerate(vulnerable_payloads, start=1):
                 rpc_request: dict[str, Any] = {
                     "jsonrpc": "2.0",
@@ -406,7 +564,10 @@ class Scanner:
                 else:
                     passed_vuln += 1
 
-        total = len(vulnerable_payloads)
+        results, blocked, redacted, passed_vuln, policy_safe = _merge_metadata_results(
+            metadata_results, results, blocked, redacted, passed_vuln, policy_safe
+        )
+        total = len(results)
         score = round((passed_vuln / total) * 100, 1) if total else 0.0
 
         return ScanReport(
@@ -673,6 +834,33 @@ class Scanner:
         if result.was_redacted:
             return Text("[~] REDACTED", style="blue")
         return Text("[!] VULNERABLE", style="red")
+
+
+def _merge_metadata_results(
+    metadata_results: list[AttackResult],
+    results: list[AttackResult],
+    blocked: int,
+    redacted: int,
+    passed_vuln: int,
+    policy_safe: int,
+) -> tuple[list[AttackResult], int, int, int, int]:
+    """Fold the discovery rows into the payload tallies.
+
+    Metadata rows count in the totals, which moves ``vulnerability_score``: an
+    unprotected server really is vulnerable on this channel, and leaving it out of
+    the denominator would keep pretending the channel does not exist.
+    """
+    merged = metadata_results + results
+    for result in metadata_results:
+        if result.evaluated_only:
+            policy_safe += 1
+        elif result.was_blocked:
+            blocked += 1
+        elif result.was_redacted:
+            redacted += 1
+        else:
+            passed_vuln += 1
+    return merged, blocked, redacted, passed_vuln, policy_safe
 
 
 def _md_cell(s: str) -> str:
