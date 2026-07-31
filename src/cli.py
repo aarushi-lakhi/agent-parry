@@ -1224,6 +1224,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  agentparry scan --target http://localhost:9090/mcp --output reports/\n"
             "  agentparry scan --target http://localhost:9090/mcp --discover --format both\n"
             "  agentparry scan --target http://localhost:9090/mcp --safe --format md --output reports/scan.md\n"
+            "  agentparry scan --target http://localhost:9090/mcp --format html --output reports/scan.html\n"
             "  agentparry scan --report-only reports/scan_2026-04-12.json\n"
         ),
     )
@@ -1243,13 +1244,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument(
         "--output",
         default="reports/",
-        help="Output directory or file (.json / .md) depending on --format",
+        help="Output directory or file (.json / .md / .html) depending on --format",
     )
     p_scan.add_argument(
         "--format",
-        choices=("json", "md", "both"),
+        choices=("json", "md", "html", "both"),
         default="json",
-        help="Write JSON, Markdown, or both (default: json)",
+        help="Write JSON, Markdown, HTML, or all three with both (default: json)",
     )
     p_scan.add_argument(
         "--discover",
@@ -1320,7 +1321,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_harden.add_argument(
         "--format",
-        choices=("json", "md", "both"),
+        choices=("json", "md", "html", "both"),
         default="json",
         help="Format for --output (default: json)",
     )
@@ -1356,7 +1357,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_verify.add_argument(
         "--format",
-        choices=("json", "md", "both"),
+        choices=("json", "md", "html", "both"),
         default="json",
         help="Format for --output (default: json)",
     )

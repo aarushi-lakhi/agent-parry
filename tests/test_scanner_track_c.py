@@ -105,7 +105,7 @@ def test_save_markdown_report_contains_sections(tmp_path: Path) -> None:
     assert "## Recommended rules" in text
 
 
-def test_save_scan_outputs_both_writes_two_files(tmp_path: Path) -> None:
+def test_save_scan_outputs_both_writes_three_files(tmp_path: Path) -> None:
     report = ScanReport(
         total_attacks=0,
         blocked=0,
@@ -116,9 +116,10 @@ def test_save_scan_outputs_both_writes_two_files(tmp_path: Path) -> None:
     )
     scanner = Scanner(payloads_path=None)
     paths = save_scan_outputs(scanner, report, str(tmp_path), "both")
-    assert len(paths) == 2
+    assert len(paths) == 3
     assert any(p.endswith(".json") for p in paths)
     assert any(p.endswith(".md") for p in paths)
+    assert any(p.endswith(".html") for p in paths)
 
 
 POISONED_TOOL = {
