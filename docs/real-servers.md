@@ -43,14 +43,13 @@ This was the expected failure, and it did not happen.
 
 - **0 of 16 injection patterns matched any of 76 real prose leaves.** Not one hit
   from `INJECTION_PATTERNS` or `METADATA_PATTERNS`, in any severity.
-- **2 findings total across 75 tools**, both `medium`, both from the structural
-  heuristics rather than the pattern table: an opaque base64-shaped blob in
-  `everything`'s `gzip-file-as-resource` schema default (it is a real URL fragment),
-  and `sequential-thinking`'s 2781-character description tripping the 2000-character
-  oversize rule.
+- **0 findings total across 75 tools**, at any severity. The capture originally
+  produced two, both `medium`, both from the structural heuristics rather than the
+  pattern table, and both were the heuristic being wrong rather than the server
+  being suspicious. Fixing them is the section below.
 - **The shipped default (`action: redact`, `severity_threshold: critical`) rewrote
   nothing.** 0 tools dropped, 0 descriptions redacted, 0 tool lists blocked, across
-  all eight servers. `severity_threshold: high` is equally inert.
+  all eight servers. So is `high`, and so, now, is `medium`.
 
 The reason the patterns hold up is that they are narrow in the right place. Real
 descriptions do contain imperative prose, but not the *specific* imperative prose
@@ -61,25 +60,69 @@ live patterns require far more than that, and none of the near-misses reach them
 `always call X first`, 0 for `do not tell/reveal/mention`, 0 for any XML-ish tag at
 all, 0 for a sensitive path.
 
-**The number to start quoting: 0 actionable metadata findings on 75 real tools from
-8 servers, at the shipped default.** That is the real false-positive figure and it
+**The number to start quoting: 0 metadata findings on 75 real tools from 8
+servers, at any severity.** That is the real false-positive figure and it
 replaces the residual-risk caveat in the `MetadataInspector` docstring.
 
-### The one place it does damage a working tool
+### The two places it used to damage a working tool
 
-`severity_threshold: medium` is not a free tightening. At medium the same corpus
-loses two capabilities:
+At `severity_threshold: medium` the same corpus used to lose two capabilities.
+Both were the heuristic misreading a normal server, and both are fixed.
 
-- `everything`'s `gzip-file-as-resource` is **dropped entirely**. The blob finding
-  is on `inputSchema.properties.data.default`, a non-prose leaf, so redaction
-  escalates to dropping the tool.
-- `sequential-thinking`'s `sequentialthinking` description is **fully redacted**.
-  That description *is* the tool: it is a 2781-character spec of how to use it, and
-  replacing it with a marker leaves the model a tool it cannot drive.
+**`everything`'s `gzip-file-as-resource` was dropped entirely.** The opaque-blob
+rule matched `com/modelcontextprotocol/servers/refs/heads/main/README` inside
+`inputSchema.properties.data.default`, which holds a real
+`raw.githubusercontent.com` URL. The finding sits on a non-prose leaf, so
+redaction escalates to dropping the tool.
 
-So the critical-only default is doing real work, and lowering it should be an
-explicit, per-server decision. `MAX_DESCRIPTION_CHARS = 2000` is also too low for
-real servers: one legitimate description in eight already exceeds it.
+The obvious fix is to exempt the `default` key the way `pattern` and `format`
+already are. That is the wrong fix. A schema default is model-facing text an
+attacker controls, and being non-prose it is precisely the leaf where a finding
+costs the whole tool, so blinding the rule to it gives up a real surface. The key
+is not what made this a false positive: the *value* is a URL, and a URL path is
+long, mixed-case, punctuation-heavy and does not decode to text, which is the
+blob shape exactly. The same URL in a `description` would have matched too. So
+the suppression is on URL spans wherever they appear, on both the argument side
+and the metadata side, and `default` stays scanned. A blob sitting next to a URL
+is still a finding; a blob that *is* the URL is not.
+
+**`sequential-thinking`'s `sequentialthinking` description was fully redacted.**
+That description *is* the tool, a 2781-character spec of how to drive it, and
+replacing it with a marker leaves the model a tool it cannot use and no
+explanation.
+
+Two things were wrong. `MAX_DESCRIPTION_CHARS = 2000` was too low, and the
+finding was `medium`, which made it actionable.
+
+The distribution over all 75 real descriptions:
+
+| | chars |
+|---|---|
+| min | 14 |
+| median | 57 |
+| p90 | 323 |
+| p95 | 360 |
+| second largest | 457 |
+| max | 2781 |
+| all 75 combined | 10,732 |
+
+74 of 75 sit under 460 and one sits at 2781, so the corpus sets a floor rather
+than a target: **any cap between 460 and 2781 catches only a legitimate tool.**
+The cap is now **8000**, roughly 2000 tokens, near three times the outlier and
+three quarters of what all eight servers spend on all 75 descriptions put
+together. It stays below `MAX_METADATA_LEAF_CHARS = 20000` so the signal is still
+reachable before a leaf is dropped from scanning entirely.
+
+The finding is also **`low` now, not `medium`**, which means it can never reach a
+severity threshold on its own. Length is a fact about the author, not the
+content. A wall of text is where an instruction hides, but it is not evidence
+that one is there, and the pattern tables and the invisible-character rule are
+what find it when it is. An oversize finding still shows up in a report and in
+the audit log, where a human can weigh it; what it no longer does is silently
+cost the model a tool for the crime of being documented thoroughly.
+
+With both fixed, `severity_threshold: medium` is inert on the corpus too, so
+lowering it is no longer a per-server judgement call.
 
 ## Tool-name remapping in `--discover` mostly fails, and when it succeeds it lies
 
@@ -163,7 +206,7 @@ Fixes, in value order: descend into `array`/`object` schemas to find string leav
 pick a valid `enum` member and append the injection payload rather than replacing
 the value; fill required non-strings with a schema-shaped default (`0`, `[]`, `{}`).
 
-## Pinning survives a real `tools/list`. Pagination does not
+## Pinning survives a real `tools/list`, and now survives pagination too
 
 Per server, three consecutive observations of the same real `tools/list`:
 `created`, `unchanged`, `unchanged`. Same for `initialize`. Set fingerprints are
@@ -172,18 +215,40 @@ order-independent on all eight real catalogues. Nothing spurious, no drift.
 **No real server in the corpus paginates `tools/list`.** All eight return a single
 page with no `nextCursor`, including playwright at 24 tools.
 
-Which is why this is broken. `_observe_tools_list` decides `paginated` from
-`nextCursor` on the page in hand. The *last* page of a paginated response has no
-`nextCursor`, so it is diffed as if it were the complete catalogue. Splitting
-playwright's real 24-tool catalogue into two pages produces, on page two, a
+Which is why this was broken. `_observe_tools_list` used to decide `paginated`
+from `nextCursor` on the page in hand. The *last* page of a paginated response has
+none, so it was diffed as if it were the complete catalogue. Splitting
+playwright's real 24-tool catalogue into two pages produced, on page two, a
 `changed` observation with **12 tools removed and 12 added** — a full rug-pull
-warning on a server that did nothing. It recurs on every discovery and the pin
-never converges. The MCP spec allows cursor pagination on `tools/list`, so this is
-a live bug that no reference server happens to trigger.
+warning on a server that did nothing. It recurred on every discovery and the pin
+never converged. The MCP spec allows cursor pagination on `tools/list`, so this
+was a live bug that no reference server happens to trigger.
 
-`test_paginated_tools_list_produces_a_spurious_diff` pins the broken behavior so a
-fix is visible when it lands. The fix is to carry the paginated flag across a
-cursor walk rather than deriving it per page.
+A `tools/list` cursor walk is now correlated and diffed as one sequence. Pages are
+buffered in memory on the pinner and keyed on the **request** `cursor`: a request
+with no cursor starts a walk, a request carrying a cursor continues the walk that
+handed that cursor out. Nothing reaches the pin store until the page without a
+`nextCursor` arrives, so the same split playwright catalogue now reads `partial`,
+`created`, then `partial`, `unchanged` on every later discovery. Splitting it 2,
+3, 8 or 24 ways pins the identical set fingerprint.
+
+What that costs, stated as assumptions:
+
+- **One walk is in flight per server key at a time.** A second walk starting
+  (a request with no cursor) discards whatever the first had buffered.
+- **A walk whose first page this proxy never saw is never recorded.** An orphan
+  continuation, a cursor that does not match the open walk, and a walk past the
+  page or tool budget all end in `partial` with the pin untouched. A half-fetched
+  catalogue recorded as the whole one would pin a subset and then report every
+  later full listing as a pile of additions, which is worse than recording
+  nothing.
+- **A client that abandons pagination costs nothing.** The buffer is dropped by
+  the next page-one request, or by a 300-second TTL, whichever comes first.
+- **Interleaved traffic is fine.** Only `tools/list` touches the walk, so a
+  `tools/call` or an `initialize` between pages passes through it.
+- **A caller that passes no request params** (the CLI, a direct `observe` call)
+  falls back to appending to whatever walk is still open. Weaker, but still
+  convergent for a plain sequential fetch.
 
 ## The benign corpus does not resemble real traffic
 
@@ -215,11 +280,11 @@ Stop:
 
 Start:
 
-- 0 actionable metadata findings on 75 real tools from 8 servers, at the shipped
-  default. 2 total findings, both `medium`, both below threshold.
+- 0 metadata findings on 75 real tools from 8 servers, at any severity. Every
+  threshold, `medium` included, rewrites nothing.
 - 71% of schema-driven probes are schema-valid; 29% of real tools get no injection
   probe at all.
-- Pins settle on all 8 real catalogues; the paginated path is broken.
+- Pins settle on all 8 real catalogues, and on a synthetic paginated one.
 
 ## Reproducing
 

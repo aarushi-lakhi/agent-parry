@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,8 @@ import pytest
 
 from src.inspector import (
     INJECTION_PATTERNS,
+    MAX_DESCRIPTION_CHARS,
+    MAX_METADATA_LEAF_CHARS,
     METADATA_PATTERNS,
     MetadataInspector,
     MetadataInspectorSettings,
@@ -114,9 +118,9 @@ class TestCorpusShape:
 class TestMetadataInspectorOnRealServers:
     """The headline question: does poison detection fire on clean servers?
 
-    Answer, over 75 real tools: not once from the pattern table. The two findings
-    in the corpus are structural heuristics at ``medium``, below the shipped
-    ``critical`` threshold, so nothing is rewritten by default.
+    Answer, over 75 real tools: not once, from the pattern table or from the
+    structural heuristics. Zero findings at any severity, so every threshold
+    including ``medium`` leaves all eight catalogues untouched.
     """
 
     def test_no_injection_pattern_matches_real_prose(self) -> None:
@@ -139,12 +143,7 @@ class TestMetadataInspectorOnRealServers:
             instructions = entry["initialize"].get("instructions")
             if isinstance(instructions, str) and instructions:
                 findings.extend(inspector.scan_instructions(instructions))
-        assert len(findings) == 2
-        assert {f.severity for f in findings} == {"medium"}
-        assert sorted(f.matched_pattern for f in findings) == [
-            "opaque encoded blob",
-            "oversized metadata",
-        ]
+        assert findings == []
 
     @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
     def test_default_settings_never_damage_a_real_tool(self, entry: dict[str, Any]) -> None:
@@ -163,8 +162,9 @@ class TestMetadataInspectorOnRealServers:
         after = inspector.inspect_initialize(entry["initialize"]).result.get("instructions")
         assert after == before
 
-    @pytest.mark.parametrize("threshold", ["critical", "high"])
-    def test_thresholds_above_medium_are_inert(self, threshold: str) -> None:
+    @pytest.mark.parametrize("threshold", ["critical", "high", "medium"])
+    def test_every_threshold_is_inert_on_real_servers(self, threshold: str) -> None:
+        """Medium used to drop one working tool and redact one the model needs."""
         inspector = MetadataInspector(
             MetadataInspectorSettings(action="redact", severity_threshold=threshold)
         )
@@ -173,19 +173,68 @@ class TestMetadataInspectorOnRealServers:
             assert result.dropped_tools == []
             assert result.redacted_tools == []
 
-    def test_medium_threshold_damages_two_real_tools(self) -> None:
-        """Lowering the threshold to medium is not free, and this says how much."""
-        inspector = MetadataInspector(
-            MetadataInspectorSettings(action="redact", severity_threshold="medium")
+    def test_the_gzip_default_url_is_not_an_opaque_blob(self) -> None:
+        """A real raw.githubusercontent.com default used to read as encoded bytes."""
+        tool = next(t for t in tools_of(_entry("everything")) if t["name"] == "gzip-file-as-resource")
+        assert tool["inputSchema"]["properties"]["data"]["default"].startswith("https://")
+        findings = MetadataInspector().scan_tool(tool)
+        assert [f.matched_pattern for f in findings] == []
+
+
+class TestRealDescriptionLengths:
+    """What real tool descriptions actually measure, and what the cap must clear.
+
+    ``MAX_DESCRIPTION_CHARS`` is the only inspector setting a real server has ever
+    tripped. These numbers are why it is 8000 and not 2000, and they fail loudly
+    if someone changes the cap without meaning to.
+    """
+
+    @staticmethod
+    def _lengths() -> list[int]:
+        return sorted(
+            len(tool["description"])
+            for entry in CORPUS
+            for tool in tools_of(entry)
+            if isinstance(tool.get("description"), str)
         )
-        dropped: list[str] = []
-        redacted: list[str] = []
-        for entry in CORPUS:
-            result = inspector.inspect_tools_list(entry["tools_list"])
-            dropped.extend(result.dropped_tools)
-            redacted.extend(result.redacted_tools)
-        assert dropped == ["gzip-file-as-resource"]
-        assert redacted == ["sequentialthinking"]
+
+    def test_every_real_tool_has_a_description(self) -> None:
+        assert len(self._lengths()) == EXPECTED_TOOL_TOTAL
+
+    def test_the_distribution_is_pinned(self) -> None:
+        lengths = self._lengths()
+        assert (lengths[0], lengths[-1]) == (14, 2781)
+        assert statistics.median(lengths) == 57
+        assert lengths[math.ceil(0.90 * len(lengths)) - 1] == 323
+        assert lengths[math.ceil(0.95 * len(lengths)) - 1] == 360
+        assert sum(lengths) == 10_732
+
+    def test_the_outlier_is_alone_and_far_out(self) -> None:
+        """Nothing sits between 460 and 2781, so no cap in that range is defensible."""
+        lengths = self._lengths()
+        assert lengths[-2] == 457
+        assert lengths[-1] == 2781
+
+    def test_the_cap_clears_every_real_description_with_headroom(self) -> None:
+        lengths = self._lengths()
+        assert lengths[-1] < MAX_DESCRIPTION_CHARS < MAX_METADATA_LEAF_CHARS
+        assert 2 * lengths[-1] <= MAX_DESCRIPTION_CHARS
+
+    def test_no_real_description_is_oversized(self) -> None:
+        inspector = MetadataInspector()
+        oversized = [
+            tool["name"]
+            for entry in CORPUS
+            for tool in tools_of(entry)
+            for finding in inspector.scan_tool(tool)
+            if finding.matched_pattern == "oversized metadata"
+        ]
+        assert oversized == []
+
+    def test_the_only_real_instructions_string_is_under_the_cap(self) -> None:
+        instructions = _entry("everything")["initialize"]["instructions"]
+        assert len(instructions) == 1_574
+        assert MetadataInspector().scan_instructions(instructions) == []
 
 
 class TestRemappingAgainstRealToolNames:
@@ -371,32 +420,74 @@ class TestPinningRealToolLists:
         assert [e["server"] for e in CORPUS if e["paginated"]] == []
         assert {e["page_count"] for e in CORPUS} == {1}
 
-    def test_paginated_tools_list_produces_a_spurious_diff(self, tmp_path: Path) -> None:
-        """Known gap, from a real catalogue split into two pages.
+    @staticmethod
+    def _paged_walk(
+        pinner: ToolPinner, identity: ServerIdentity, tools: list[dict[str, Any]], pages: int
+    ) -> list[Any]:
+        """Serve ``tools`` over ``pages`` cursor-linked pages, as a real client would."""
+        size = -(-len(tools) // pages)
+        chunks = [tools[start : start + size] for start in range(0, len(tools), size)]
+        observations = []
+        cursor: str | None = None
+        for index, chunk in enumerate(chunks):
+            result: dict[str, Any] = {"tools": _copy({"t": chunk})["t"]}
+            if index + 1 < len(chunks):
+                result["nextCursor"] = f"page{index + 2}"
+            params = {} if cursor is None else {"cursor": cursor}
+            observations.append(pinner.observe("tools/list", result, [], identity=identity, params=params))
+            cursor = result.get("nextCursor")
+        return observations
 
-        ``_observe_tools_list`` reads pagination off ``nextCursor`` on the page in
-        hand, so the final page has none and is diffed as a complete catalogue.
-        Every tool from the earlier pages reads as removed. Any server that
-        paginates ``tools/list`` therefore warns on every discovery and never
-        converges.
+    def test_a_paginated_catalogue_converges_like_an_unpaginated_one(self, tmp_path: Path) -> None:
+        """Playwright's real 24 tools split across two pages, fetched three times.
+
+        The pin is diffed once per completed walk, so the sequence reads
+        created, unchanged, unchanged. Before pages were correlated the last page
+        of each walk was diffed as a whole catalogue and reported 12 removed and
+        12 added, forever.
         """
         tools = tools_of(_entry("playwright"))
-        half = len(tools) // 2
+        assert len(tools) == 24
         pinner = ToolPinner(store=PinStore(tmp_path / "pins.json"), inspector=MetadataInspector())
         identity = ServerIdentity.for_command("paged-server", transport=AuditTransport.HTTP)
 
-        first = pinner.observe(
-            "tools/list", {"tools": tools[:half], "nextCursor": "page2"}, [], identity=identity
-        )
-        assert first.status == "created"
-        assert first.paginated is True
+        for _ in range(3):
+            observations = self._paged_walk(pinner, identity, tools, pages=2)
+            assert [o.status for o in observations[:-1]] == ["partial"]
+            assert all(o.paginated for o in observations)
 
-        last = pinner.observe("tools/list", {"tools": tools[half:]}, [], identity=identity)
-        assert last.status == "changed"
-        assert last.paginated is False
-        assert last.diff is not None
-        assert len(last.diff.removed) == half
-        assert len(last.diff.added) == len(tools) - half
+        assert self._paged_walk(pinner, identity, tools, pages=2)[-1].status == "unchanged"
+        pin = PinStore(tmp_path / "pins.json").get(identity.key)
+        assert pin is not None
+        assert pin.tool_count == 24
+        assert pin.set_fingerprint == tools_set_fingerprint(tools)
+
+    @pytest.mark.parametrize("pages", [2, 3, 8, 24])
+    def test_page_size_does_not_change_the_pinned_catalogue(self, tmp_path: Path, pages: int) -> None:
+        tools = tools_of(_entry("playwright"))
+        pinner = ToolPinner(store=PinStore(tmp_path / "pins.json"), inspector=MetadataInspector())
+        identity = ServerIdentity.for_command("paged-server", transport=AuditTransport.HTTP)
+        assert self._paged_walk(pinner, identity, tools, pages=pages)[-1].status == "created"
+        pin = PinStore(tmp_path / "pins.json").get(identity.key)
+        assert pin is not None
+        assert pin.set_fingerprint == tools_set_fingerprint(tools)
+
+    def test_a_half_fetched_catalogue_is_not_recorded_as_the_whole_one(self, tmp_path: Path) -> None:
+        """The failure a per-page pin would cause: a pinned subset, then mass additions."""
+        tools = tools_of(_entry("playwright"))
+        store = PinStore(tmp_path / "pins.json")
+        pinner = ToolPinner(store=store, inspector=MetadataInspector())
+        identity = ServerIdentity.for_command("paged-server", transport=AuditTransport.HTTP)
+
+        page = {"tools": _copy({"t": tools[:12]})["t"], "nextCursor": "page2"}
+        abandoned = pinner.observe("tools/list", page, [], identity=identity, params={})
+        assert abandoned.status == "partial"
+        assert store.get(identity.key) is None
+
+        whole = {"tools": _copy({"t": tools})["t"]}
+        full = pinner.observe("tools/list", whole, [], identity=identity, params={})
+        assert full.status == "created"
+        assert full.diff is None
 
 
 class TestBenignCorpusVersusRealSchemas:
