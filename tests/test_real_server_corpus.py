@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from src.inspector import (
     INJECTION_PATTERNS,
@@ -31,6 +32,7 @@ from src.inspector import (
     METADATA_PATTERNS,
     MetadataInspector,
     MetadataInspectorSettings,
+    OutputInspector,
 )
 from src.models import AuditTransport
 from src.pins import PinStore, ServerIdentity, ToolPinner, tools_set_fingerprint
@@ -116,6 +118,73 @@ class TestCorpusShape:
     def test_no_sensitive_strings_survived_sanitization(self, entry: dict[str, Any]) -> None:
         blob = json.dumps(entry)
         assert _SENSITIVE.search(blob) is None, "sanitizer let a host, home path or token through"
+
+
+def tool_strings(entry: dict[str, Any]) -> list[str]:
+    """Return every string anywhere inside the entry's tool objects."""
+    out: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                out.append(key)
+                walk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                walk(nested)
+        elif isinstance(value, str):
+            out.append(value)
+
+    walk(tools_of(entry))
+    return out
+
+
+class TestSecretRedactionOnRealServers:
+    """The widened secret patterns must not fire on any real tool.
+
+    A redaction pattern that matches a tool description or a schema string would
+    mangle live traffic, which is the same over-blocking failure the three
+    narrowed policy rules taught this project.
+    """
+
+    def test_no_secret_pattern_matches_any_real_tool_string(self) -> None:
+        patterns = [
+            (name, re.compile(pattern, re.IGNORECASE))
+            for name, pattern in OutputInspector._DEFAULT_PATTERNS.items()
+        ]
+        hits: list[tuple[str, str, str]] = []
+        for entry in CORPUS:
+            for text in tool_strings(entry) + prose_leaves(entry):
+                for name, pattern in patterns:
+                    match = pattern.search(text)
+                    if match is not None:
+                        hits.append((entry["server"], name, match.group(0)[:60]))
+        assert hits == []
+
+    def test_the_sweep_actually_covered_every_tool(self) -> None:
+        assert sum(len(tools_of(e)) for e in CORPUS) == EXPECTED_TOOL_TOTAL
+        assert sum(len(tool_strings(e)) for e in CORPUS) > 1000
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_output_inspection_leaves_a_real_catalogue_byte_identical(
+        self, entry: dict[str, Any]
+    ) -> None:
+        sanitized, findings = OutputInspector().inspect("tools/list", entry["tools_list"])
+        assert findings == []
+        assert sanitized == entry["tools_list"]
+
+
+class TestSecretRedactionOnBenignPayloads:
+    """The same sweep over the payloads that are supposed to pass through."""
+
+    def test_no_secret_pattern_matches_a_benign_payload(self) -> None:
+        payloads = yaml.safe_load(PAYLOADS.read_text(encoding="utf-8"))["payloads"]
+        benign = [p for p in payloads if p.get("category") == "benign"]
+        assert len(benign) >= 9
+        for payload in benign:
+            sanitized, findings = OutputInspector().inspect(payload["tool"], dict(payload))
+            assert findings == []
+            assert sanitized == dict(payload)
 
 
 class TestMetadataInspectorOnRealServers:
