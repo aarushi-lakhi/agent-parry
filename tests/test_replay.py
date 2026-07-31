@@ -261,6 +261,25 @@ def test_every_audit_action_is_summarized_without_an_other_bucket(tmp_path: Path
     assert all(count == 1 for count in summary.actions.values())
 
 
+def test_taint_hits_are_counted_and_sampled(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    for action in (AuditAction.TAINT_FLAG, AuditAction.REDACT_TAINT, AuditAction.BLOCK_TAINT):
+        _emit(
+            writer,
+            action=action,
+            method="tools/call",
+            tool="email_send",
+            rule="taint_tracking",
+            detail=f"{action.value.lower()}: 1 tainted value(s) kinds=api_key from=file_read",
+        )
+    writer.close()
+    summary = replay.summarize(replay.read_log(tmp_path / "audit.jsonl"))
+    assert summary.taint == 3
+    assert summary.taint_tools == {"email_send": 3}
+    assert len(summary.taint_samples) == 3
+    assert "kinds=api_key" in replay.render_text(replay.ReplayReport(summary=summary))
+
+
 def test_response_side_actions_are_counted_by_kind(tmp_path: Path) -> None:
     summary = replay.summarize(replay.read_log(_seed_response_side_log(tmp_path)))
     side = summary.response_side

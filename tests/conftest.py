@@ -46,3 +46,4 @@ def isolate_agentparry_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("AGENTPARRY_HOME", str(tmp_path / "home" / ".agentparry"))
     monkeypatch.delenv("AGENTPARRY_POLICY", raising=False)
     monkeypatch.delenv("AGENTPARRY_PAYLOADS", raising=False)
+    monkeypatch.delenv("AGENTPARRY_TAINT", raising=False)
