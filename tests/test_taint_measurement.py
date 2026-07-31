@@ -22,6 +22,8 @@ import pytest
 
 from src import mock_server
 from src import proxy as proxy_module
+from src.inspector import OutputInspector
+from src.mock_server import _mock_file_content
 from src.models import AttackPayload, AttackStep, JsonRpcRequest, ScanReport
 from src.scanner import (
     OBSERVED_ALLOW,
@@ -29,6 +31,7 @@ from src.scanner import (
     OUTCOME_TRUE_BLOCK,
     Scanner,
 )
+from src.taint import seedable_candidates
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PAYLOADS = REPO_ROOT / "attacks" / "payloads.yaml"
@@ -256,6 +259,26 @@ def test_the_one_hit_is_the_two_call_exfiltration(corpus_flag) -> None:
     result = _by_id(report)["cte-001"]
     assert [step.tool for step in result.step_results] == ["file_read", "email_send"]
     assert result.step_results[1].executed is True
+
+
+def test_output_redaction_already_covers_most_of_the_flagship_demo() -> None:
+    """What taint adds over redaction on the headline attack, stated as one fact.
+
+    OutputInspector removes the API key and the URL password from the .env read
+    before the client ever sees them, so the second call cannot carry either.
+    The one value that survives is the Stripe secret, because the ``api_key``
+    pattern wants 20+ characters after the prefix, and that is the only thing
+    taint tracking catches here.
+    """
+    inspected, findings = OutputInspector().inspect(
+        "file_read", {"content": _mock_file_content(ENV_PATH)}
+    )
+    survivors = [
+        value
+        for _kind, value, _start, _end in seedable_candidates(inspected["content"])
+    ]
+    assert len(findings) == 2
+    assert survivors == ["sk_" + "live_" + "abc123"]
 
 
 def test_no_benign_payload_in_the_corpus_trips_it(corpus_flag, corpus_off) -> None:
