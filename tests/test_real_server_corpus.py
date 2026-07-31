@@ -371,32 +371,74 @@ class TestPinningRealToolLists:
         assert [e["server"] for e in CORPUS if e["paginated"]] == []
         assert {e["page_count"] for e in CORPUS} == {1}
 
-    def test_paginated_tools_list_produces_a_spurious_diff(self, tmp_path: Path) -> None:
-        """Known gap, from a real catalogue split into two pages.
+    @staticmethod
+    def _paged_walk(
+        pinner: ToolPinner, identity: ServerIdentity, tools: list[dict[str, Any]], pages: int
+    ) -> list[Any]:
+        """Serve ``tools`` over ``pages`` cursor-linked pages, as a real client would."""
+        size = -(-len(tools) // pages)
+        chunks = [tools[start : start + size] for start in range(0, len(tools), size)]
+        observations = []
+        cursor: str | None = None
+        for index, chunk in enumerate(chunks):
+            result: dict[str, Any] = {"tools": _copy({"t": chunk})["t"]}
+            if index + 1 < len(chunks):
+                result["nextCursor"] = f"page{index + 2}"
+            params = {} if cursor is None else {"cursor": cursor}
+            observations.append(pinner.observe("tools/list", result, [], identity=identity, params=params))
+            cursor = result.get("nextCursor")
+        return observations
 
-        ``_observe_tools_list`` reads pagination off ``nextCursor`` on the page in
-        hand, so the final page has none and is diffed as a complete catalogue.
-        Every tool from the earlier pages reads as removed. Any server that
-        paginates ``tools/list`` therefore warns on every discovery and never
-        converges.
+    def test_a_paginated_catalogue_converges_like_an_unpaginated_one(self, tmp_path: Path) -> None:
+        """Playwright's real 24 tools split across two pages, fetched three times.
+
+        The pin is diffed once per completed walk, so the sequence reads
+        created, unchanged, unchanged. Before pages were correlated the last page
+        of each walk was diffed as a whole catalogue and reported 12 removed and
+        12 added, forever.
         """
         tools = tools_of(_entry("playwright"))
-        half = len(tools) // 2
+        assert len(tools) == 24
         pinner = ToolPinner(store=PinStore(tmp_path / "pins.json"), inspector=MetadataInspector())
         identity = ServerIdentity.for_command("paged-server", transport=AuditTransport.HTTP)
 
-        first = pinner.observe(
-            "tools/list", {"tools": tools[:half], "nextCursor": "page2"}, [], identity=identity
-        )
-        assert first.status == "created"
-        assert first.paginated is True
+        for _ in range(3):
+            observations = self._paged_walk(pinner, identity, tools, pages=2)
+            assert [o.status for o in observations[:-1]] == ["partial"]
+            assert all(o.paginated for o in observations)
 
-        last = pinner.observe("tools/list", {"tools": tools[half:]}, [], identity=identity)
-        assert last.status == "changed"
-        assert last.paginated is False
-        assert last.diff is not None
-        assert len(last.diff.removed) == half
-        assert len(last.diff.added) == len(tools) - half
+        assert self._paged_walk(pinner, identity, tools, pages=2)[-1].status == "unchanged"
+        pin = PinStore(tmp_path / "pins.json").get(identity.key)
+        assert pin is not None
+        assert pin.tool_count == 24
+        assert pin.set_fingerprint == tools_set_fingerprint(tools)
+
+    @pytest.mark.parametrize("pages", [2, 3, 8, 24])
+    def test_page_size_does_not_change_the_pinned_catalogue(self, tmp_path: Path, pages: int) -> None:
+        tools = tools_of(_entry("playwright"))
+        pinner = ToolPinner(store=PinStore(tmp_path / "pins.json"), inspector=MetadataInspector())
+        identity = ServerIdentity.for_command("paged-server", transport=AuditTransport.HTTP)
+        assert self._paged_walk(pinner, identity, tools, pages=pages)[-1].status == "created"
+        pin = PinStore(tmp_path / "pins.json").get(identity.key)
+        assert pin is not None
+        assert pin.set_fingerprint == tools_set_fingerprint(tools)
+
+    def test_a_half_fetched_catalogue_is_not_recorded_as_the_whole_one(self, tmp_path: Path) -> None:
+        """The failure a per-page pin would cause: a pinned subset, then mass additions."""
+        tools = tools_of(_entry("playwright"))
+        store = PinStore(tmp_path / "pins.json")
+        pinner = ToolPinner(store=store, inspector=MetadataInspector())
+        identity = ServerIdentity.for_command("paged-server", transport=AuditTransport.HTTP)
+
+        page = {"tools": _copy({"t": tools[:12]})["t"], "nextCursor": "page2"}
+        abandoned = pinner.observe("tools/list", page, [], identity=identity, params={})
+        assert abandoned.status == "partial"
+        assert store.get(identity.key) is None
+
+        whole = {"tools": _copy({"t": tools})["t"]}
+        full = pinner.observe("tools/list", whole, [], identity=identity, params={})
+        assert full.status == "created"
+        assert full.diff is None
 
 
 class TestBenignCorpusVersusRealSchemas:

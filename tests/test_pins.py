@@ -8,6 +8,7 @@ import os
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +16,9 @@ from unittest.mock import patch
 from src.inspector import MetadataInspector, MetadataInspectorSettings
 from src.models import AuditTransport, PinFile, ServerPin, ToolPin
 from src.pins import (
+    MAX_WALK_PAGES,
     PIN_REDACTION,
+    WALK_TTL_SECONDS,
     PinStore,
     ServerIdentity,
     ToolPinner,
@@ -39,6 +42,11 @@ TOOL_A = {
 TOOL_B = {
     "name": "beta",
     "description": "Write a record.",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+TOOL_C = {
+    "name": "gamma",
+    "description": "Delete a record.",
     "inputSchema": {"type": "object", "properties": {}},
 }
 POISONED_CHANGE = (
@@ -476,48 +484,143 @@ class TestDiffing(_PinnerCase):
 
 
 class TestPagination(_PinnerCase):
-    def test_a_paginated_page_skips_set_level_diffing(self) -> None:
-        pinner = self._pinner()
-        pinner.observe("tools/list", _tools(TOOL_A, TOOL_B))
-        page = {**_tools(TOOL_A), "nextCursor": "page-2"}
-        observation = pinner.observe("tools/list", page)
-        self.assertEqual("unchanged", observation.status, msg="page 1 of 2 must not read as a removal")
-        self.assertTrue(observation.paginated)
+    """A cursor walk is one catalogue, diffed once, never page by page."""
 
-    def test_a_paginated_page_still_catches_a_changed_tool(self) -> None:
-        pinner = self._pinner()
-        pinner.observe("tools/list", _tools(TOOL_A, TOOL_B))
-        edited = {**TOOL_A, "description": "Look up a record by id. Now with caching."}
-        observation = pinner.observe("tools/list", {**_tools(edited), "nextCursor": "page-2"})
-        assert observation.diff is not None
-        self.assertEqual(["alpha"], observation.diff.changed)
-        self.assertEqual([], observation.diff.removed)
-        self.assertFalse(observation.diff.set_changed)
+    @staticmethod
+    def _walk(pinner: ToolPinner) -> list[str]:
+        """Fetch alpha then beta over two pages, the way a client would."""
+        statuses = [
+            pinner.observe(
+                "tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={}
+            ).status,
+            pinner.observe("tools/list", _tools(TOOL_B), params={"cursor": "page-2"}).status,
+        ]
+        return statuses
 
-    def test_a_paginated_first_pin_records_no_set_fingerprint(self) -> None:
+    def test_a_walk_converges_instead_of_reporting_churn(self) -> None:
         pinner = self._pinner()
-        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"})
+        self.assertEqual(["partial", "created"], self._walk(pinner))
+        self.assertEqual(["partial", "unchanged"], self._walk(pinner))
+        self.assertEqual(["partial", "unchanged"], self._walk(pinner))
+
+    def test_a_completed_walk_pins_every_page(self) -> None:
+        pinner = self._pinner()
+        self._walk(pinner)
         pin = self._pin()
-        self.assertIsNone(pin.set_fingerprint)
-        self.assertIsNone(pin.tool_count)
-        self.assertEqual({"alpha"}, set(pin.tools))
+        self.assertEqual({"alpha", "beta"}, set(pin.tools))
+        self.assertEqual(2, pin.tool_count)
+        self.assertEqual(tools_set_fingerprint([TOOL_A, TOOL_B]), pin.set_fingerprint)
 
-    def test_a_later_page_reports_its_tools_as_added_and_merges_on_accept(self) -> None:
-        """Unverified: a page 2 and a genuine addition look identical from here."""
+    def test_a_completed_walk_is_flagged_paginated(self) -> None:
         pinner = self._pinner()
-        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"})
-        observation = pinner.observe("tools/list", {**_tools(TOOL_B), "nextCursor": "page-3"})
-        assert observation.diff is not None
-        self.assertEqual(["beta"], observation.diff.added)
-        self.assertEqual([], observation.diff.removed)
-        accept_pending(PinStore(self.pins_path), self.identity.key)
+        observation = pinner.observe(
+            "tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={}
+        )
+        self.assertTrue(observation.paginated)
+        final = pinner.observe("tools/list", _tools(TOOL_B), params={"cursor": "page-2"})
+        self.assertTrue(final.paginated)
+
+    def test_a_half_fetched_walk_writes_nothing(self) -> None:
+        pinner = self._pinner()
+        observation = pinner.observe(
+            "tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={}
+        )
+        self.assertEqual("partial", observation.status)
+        self.assertFalse(observation.reportable)
+        self.assertIsNone(PinStore(self.pins_path).get(self.identity.key))
+
+    def test_abandoning_a_walk_then_listing_in_full_is_not_a_diff(self) -> None:
+        pinner = self._pinner()
+        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={})
+        first = pinner.observe("tools/list", _tools(TOOL_A, TOOL_B), params={})
+        self.assertEqual("created", first.status)
+        second = pinner.observe("tools/list", _tools(TOOL_A, TOOL_B), params={})
+        self.assertEqual("unchanged", second.status)
+
+    def test_a_continuation_whose_first_page_was_never_seen_writes_nothing(self) -> None:
+        pinner = self._pinner()
+        observation = pinner.observe("tools/list", _tools(TOOL_B), params={"cursor": "page-2"})
+        self.assertEqual("partial", observation.status)
+        self.assertIsNone(PinStore(self.pins_path).get(self.identity.key))
+
+    def test_a_cursor_that_does_not_match_the_open_walk_is_not_stitched_on(self) -> None:
+        pinner = self._pinner()
+        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={})
+        observation = pinner.observe("tools/list", _tools(TOOL_B), params={"cursor": "elsewhere"})
+        self.assertEqual("partial", observation.status)
+        self.assertIsNone(PinStore(self.pins_path).get(self.identity.key))
+
+    def test_an_interleaved_initialize_does_not_break_the_walk(self) -> None:
+        pinner = self._pinner()
+        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={})
+        pinner.observe("initialize", {"serverInfo": {"name": "stub", "version": "1.0"}})
+        observation = pinner.observe("tools/list", _tools(TOOL_B), params={"cursor": "page-2"})
+        self.assertEqual("created", observation.status)
         self.assertEqual({"alpha", "beta"}, set(self._pin().tools))
 
-    def test_the_skip_reason_is_logged(self) -> None:
+    def test_a_stale_walk_is_dropped_rather_than_continued(self) -> None:
         pinner = self._pinner()
-        with self.assertLogs("src.pins", level="INFO") as logs:
+        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={})
+        with patch("src.pins.time.monotonic", return_value=time.monotonic() + WALK_TTL_SECONDS + 1):
+            observation = pinner.observe("tools/list", _tools(TOOL_B), params={"cursor": "page-2"})
+        self.assertEqual("partial", observation.status)
+        self.assertIsNone(PinStore(self.pins_path).get(self.identity.key))
+
+    def test_an_endless_walk_is_bounded_and_never_recorded(self) -> None:
+        pinner = self._pinner()
+        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "c0"}, params={})
+        for index in range(MAX_WALK_PAGES + 2):
+            pinner.observe(
+                "tools/list",
+                {**_tools(TOOL_A), "nextCursor": f"c{index + 1}"},
+                params={"cursor": f"c{index}"},
+            )
+        observation = pinner.observe(
+            "tools/list", _tools(TOOL_B), params={"cursor": f"c{MAX_WALK_PAGES + 2}"}
+        )
+        self.assertEqual("partial", observation.status)
+        self.assertIsNone(PinStore(self.pins_path).get(self.identity.key))
+
+    def test_a_tool_edited_on_a_later_page_reads_as_changed_not_added(self) -> None:
+        pinner = self._pinner()
+        self._walk(pinner)
+        edited = {**TOOL_B, "description": "Write a record. Now with caching."}
+        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={})
+        observation = pinner.observe("tools/list", _tools(edited), params={"cursor": "page-2"})
+        self.assertEqual("changed", observation.status)
+        assert observation.diff is not None
+        self.assertEqual(["beta"], observation.diff.changed)
+        self.assertEqual([], observation.diff.added)
+        self.assertEqual([], observation.diff.removed)
+
+    def test_a_removal_on_a_later_page_is_still_caught(self) -> None:
+        pinner = self._pinner()
+        self._walk(pinner)
+        observation = pinner.observe("tools/list", _tools(TOOL_A), params={})
+        self.assertEqual("changed", observation.status)
+        assert observation.diff is not None
+        self.assertEqual(["beta"], observation.diff.removed)
+
+    def test_a_caller_that_passes_no_params_still_converges(self) -> None:
+        """The fallback rule: a page after one that promised more is its continuation."""
+        pinner = self._pinner()
+        for _ in range(2):
             pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"})
-        self.assertTrue(any("nextCursor" in line for line in logs.output))
+            status = pinner.observe("tools/list", _tools(TOOL_B)).status
+        self.assertEqual("unchanged", status)
+        self.assertEqual({"alpha", "beta"}, set(self._pin().tools))
+
+    def test_an_unpaginated_list_is_not_flagged_paginated(self) -> None:
+        observation = self._pinner().observe("tools/list", _tools(TOOL_A, TOOL_B), params={})
+        self.assertFalse(observation.paginated)
+
+    def test_accepting_a_paginated_diff_stores_the_whole_catalogue(self) -> None:
+        pinner = self._pinner()
+        self._walk(pinner)
+        pinner.observe("tools/list", {**_tools(TOOL_A), "nextCursor": "page-2"}, params={})
+        pinner.observe("tools/list", _tools(TOOL_B, TOOL_C), params={"cursor": "page-2"})
+        accept_pending(PinStore(self.pins_path), self.identity.key)
+        self.assertEqual({"alpha", "beta", "gamma"}, set(self._pin().tools))
 
 
 class TestPinStore(unittest.TestCase):
