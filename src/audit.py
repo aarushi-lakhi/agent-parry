@@ -214,7 +214,8 @@ def build_preview(tool_name: str, arguments: dict[str, Any], inspector: OutputIn
 
     Reuses OutputInspector rather than adding a second redactor so the audit
     path and the response path can never disagree. That inspector knows exactly
-    five patterns (SSN, credit card, `sk-`-style API keys, AWS access key ids,
+    six patterns (SSN, credit card, `sk-` and `sk_live_`-style API keys, upper
+    case `KEY=` / `SECRET=` / `TOKEN=` assignments, AWS access key ids,
     credentials in a URL) and will not catch bearer tokens, JWTs, private keys,
     names or addresses. `preview` is a debugging aid, not a safe-to-share mode.
     """

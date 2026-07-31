@@ -286,13 +286,57 @@ class InputInspector:
         return [(leaf_path, text) for leaf_path, _container, _key, text in iter_string_leaves(value, path)]
 
 
+API_KEY_PATTERN = (
+    r"\bsk-proj-[A-Za-z0-9_-]{6,}"
+    r"|\bsk-ant-[A-Za-z0-9-]{6,}"
+    r"|\bsk-[A-Za-z0-9_-]{20,}"
+    r"|\bsk_(?:live|test)_[A-Za-z0-9]{6,}"
+)
+"""Vendor API-key shapes, each alternative carrying its own minimum body length.
+
+One shared floor cannot serve every prefix, because the prefixes differ in how
+much evidence they are on their own.
+
+``sk-`` is two generic characters, so it keeps a 20-character body: a real
+OpenAI secret key is 48, and anything much shorter is likelier an identifier
+than a credential. ``sk-proj-``, ``sk-ant-`` and ``sk_live_`` / ``sk_test_`` are
+multi-segment prefixes that no English word or ordinary identifier carries, so
+the prefix is the evidence and a 6-character body suffices. That is what catches
+a truncated or short-form Stripe secret such as ``sk_live_`` plus six
+characters, which a flat 20-character floor let walk out of a ``.env`` read.
+
+``pk_`` is deliberately absent. A Stripe publishable key is built to be embedded
+in browser JavaScript, so redacting it protects nothing, while ``pk_`` is short
+enough to collide with ordinary primary-key and public-key identifiers.
+"""
+
+SECRET_ASSIGNMENT_PATTERN = (
+    r"(?-i:\b[A-Z][A-Z0-9_]{0,40}(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?))"
+    r"\s*=\s*[\"']?[^\s\"'&;<>${}\[\]]{8,}"
+)
+"""Env-style assignment whose variable name declares the value a credential.
+
+``STRIPE_SECRET=`` is strong evidence regardless of what follows, so a value
+here needs no recognizable vendor prefix, only eight characters. The name must
+be upper case, which is the ``.env`` and ``export`` shape, so a lower-case
+``token=`` query parameter does not qualify.
+
+The value charset excludes the characters that only ever appear in something
+that is not a secret: ``<your-key>`` and ``${VAR}`` placeholders, and the square
+brackets of a ``[REDACTED-…]`` marker a previous pass already wrote, which is
+what keeps redaction idempotent.
+"""
+
+
 class OutputInspector:
     """Detect and redact PII from nested JSON-like tool response payloads."""
 
+    # api_key precedes secret_assignment so the narrower span wins and the variable name survives.
     _DEFAULT_PATTERNS: ClassVar[dict[str, str]] = {
         "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
         "credit_card": r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b",
-        "api_key": r"\b(sk-|pk_|sk_live_|sk_test_)\S{20,}\b",
+        "api_key": API_KEY_PATTERN,
+        "secret_assignment": SECRET_ASSIGNMENT_PATTERN,
         "aws_key": r"\bAKIA[0-9A-Z]{16}\b",
         "password_in_url": r"://[^:]+:[^@]+@",
     }
@@ -300,6 +344,7 @@ class OutputInspector:
         "ssn": "SSN",
         "credit_card": "CC",
         "api_key": "API_KEY",
+        "secret_assignment": "SECRET",
         "aws_key": "AWS_KEY",
         "password_in_url": "PASSWORD",
     }
