@@ -29,6 +29,7 @@ from src.models import (
     Finding,
     ScanReport,
 )
+from src.resources import UNSET, Unset, resolve_payloads
 from src.terminal import CONTROL_CHARS_RE
 
 console = Console()
@@ -810,7 +811,9 @@ def _print_discovered_tools(names: list[str]) -> None:
 class Scanner:
     """Loads attack payloads from YAML and fires them at the proxy."""
 
-    def __init__(self, payloads_path: str | None = "attacks/payloads.yaml") -> None:
+    def __init__(self, payloads_path: str | Path | None | Unset = UNSET) -> None:
+        if isinstance(payloads_path, Unset):
+            payloads_path = resolve_payloads().path
         if payloads_path is None:
             self.payloads: list[AttackPayload] = []
         else:

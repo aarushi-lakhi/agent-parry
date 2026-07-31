@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import json
 import os
 import sys
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,7 @@ from src import cli
 from src.inspector import MetadataInspector
 from src.models import AttackPayload, AttackResult, ScanReport
 from src.pins import PinStore, ServerIdentity, ToolPinner
+from src.resources import copy_out_policy, packaged_policy_path, resolve_policy, user_policy_path
 
 LOCAL_TARGET = "http://127.0.0.1:9090/mcp"
 
@@ -442,14 +446,18 @@ def test_install_claude_new_server(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     pol = tmp_path / "pol.yaml"
     pol.write_text("payloads: []\n", encoding="utf-8")
 
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude(args) == 0
+    assert cli.cmd_install_claude(args) == 0
 
     data = json.loads(cfg.read_text(encoding="utf-8"))
     entry = data["mcpServers"]["mine"]
-    assert entry["command"] == "/fake/python"
-    assert entry["args"][:4] == ["-m", "src.stdio_proxy", "--policy", str(pol.resolve())]
-    assert "--wrap" in entry["args"]
+    assert entry["command"] == "agentparry"
+    assert entry["args"] == [
+        "wrap",
+        "--policy",
+        str(pol.resolve()),
+        "--command",
+        "npx server-bin",
+    ]
     assert entry["env"]["AGENTPARRY_POLICY"] == str(pol.resolve())
     bak = cfg.with_suffix(cfg.suffix + ".bak")
     assert not bak.exists()  # no backup when file did not exist before
@@ -518,22 +526,16 @@ def test_install_claude_wraps_existing_unwrapped_entry(
     pol = tmp_path / "pol.yaml"
     pol.write_text("x: 1\n", encoding="utf-8")
 
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
+    assert cli.cmd_install_claude(_install_claude_args("fs", pol)) == 0
 
     entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
-    assert entry["command"] == "/fake/python"
+    assert entry["command"] == "agentparry"
     assert entry["args"] == [
-        "-m",
-        "src.stdio_proxy",
+        "wrap",
         "--policy",
         str(pol.resolve()),
-        "--wrap",
-        "npx",
-        "--",
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "/data",
+        "--command",
+        "npx -y @modelcontextprotocol/server-filesystem /data",
     ]
     assert entry["env"] == {"TOKEN": "abc", "AGENTPARRY_POLICY": str(pol.resolve())}
 
@@ -552,29 +554,24 @@ def test_install_claude_rerun_does_not_nest_proxy(
     second = tmp_path / "second.yaml"
     second.write_text("x: 2\n", encoding="utf-8")
 
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude(_install_claude_args("fs", first)) == 0
-        after_first = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
-        # Re-run with a different --policy: retargets in place, no second proxy.
-        assert cli.cmd_install_claude(_install_claude_args("fs", second)) == 0
+    assert cli.cmd_install_claude(_install_claude_args("fs", first)) == 0
+    after_first = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    # Re-run with a different --policy: retargets in place, no second proxy.
+    assert cli.cmd_install_claude(_install_claude_args("fs", second)) == 0
 
     entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
-    assert entry["args"].count("src.stdio_proxy") == 1
-    assert entry["args"].count("--wrap") == 1
+    assert entry["args"].count("wrap") == 1
+    assert entry["args"].count("--command") == 1
     assert entry["args"] == [
-        "-m",
-        "src.stdio_proxy",
+        "wrap",
         "--policy",
         str(second.resolve()),
-        "--wrap",
-        "npx",
-        "--",
-        "-y",
-        "srv",
+        "--command",
+        "npx -y srv",
     ]
     assert entry["env"]["AGENTPARRY_POLICY"] == str(second.resolve())
     # Only the policy moved; the wrapped child command is untouched.
-    assert entry["args"][4:] == after_first["args"][4:]
+    assert entry["args"][3:] == after_first["args"][3:]
 
 
 def test_install_claude_rerun_with_same_policy_is_idempotent(
@@ -654,7 +651,7 @@ def test_install_claude_preserved_fields_survive_a_rerun(
     entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
     assert entry["timeout"] == 1234
     assert entry["alwaysLoad"] is False
-    assert entry["args"].count("src.stdio_proxy") == 1
+    assert entry["args"].count("--command") == 1
 
 
 def test_install_claude_backup_written_when_wrapping_existing_entry(
@@ -675,29 +672,142 @@ def test_install_claude_backup_written_when_wrapping_existing_entry(
     assert json.loads(bak.read_text(encoding="utf-8")) == original
 
 
+def test_install_claude_without_policy_records_no_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The portable entry: no interpreter path, no policy path, resolved at run time."""
+    cfg = tmp_path / "claude_desktop_config.json"
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    args = cli._build_parser().parse_args(
+        ["install-claude", "--server-name", "fs", "--command", "npx some-mcp-server"]
+    )
+
+    assert cli.cmd_install_claude(args) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    assert entry == {
+        "command": "agentparry",
+        "args": ["wrap", "--command", "npx some-mcp-server"],
+        "env": {},
+    }
+
+
+def test_install_claude_python_escape_hatch_records_the_module_form(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "claude_desktop_config.json"
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    args = cli._build_parser().parse_args(
+        [
+            "install-claude",
+            "--server-name",
+            "fs",
+            "--command",
+            "npx srv --flag",
+            "--python",
+            "/venv/bin/python",
+        ]
+    )
+
+    assert cli.cmd_install_claude(args) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    assert entry["command"] == "/venv/bin/python"
+    assert entry["args"] == ["-m", "src.stdio_proxy", "--wrap", "npx", "--", "srv", "--flag"]
+
+
+def test_install_claude_upgrades_a_legacy_interpreter_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .mcp.json committed by an older release loses its machine-specific paths on re-run."""
+    cfg = tmp_path / "claude_desktop_config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "fs": {
+                        "command": "/old/venv/bin/python",
+                        "args": [
+                            "-m",
+                            "src.stdio_proxy",
+                            "--policy",
+                            "/old/checkout/config/default_policy.yaml",
+                            "--wrap",
+                            "npx",
+                            "--",
+                            "-y",
+                            "@x/fs",
+                        ],
+                        "env": {"AGENTPARRY_POLICY": "/old/checkout/config/default_policy.yaml"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_claude_config_path", lambda: cfg)
+    args = cli._build_parser().parse_args(["install-claude", "--server-name", "fs"])
+
+    assert cli.cmd_install_claude(args) == 0
+
+    entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["fs"]
+    assert entry == {
+        "command": "agentparry",
+        "args": ["wrap", "--command", "npx -y @x/fs"],
+        "env": {},
+    }
+
+
+def test_install_claude_code_project_scope_warns_only_when_a_path_is_recorded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    portable = cli._build_parser().parse_args(
+        [
+            "install-claude-code",
+            "--server-name",
+            "mine",
+            "--command",
+            "npx srv",
+            "--project-dir",
+            str(tmp_path),
+        ]
+    )
+    assert cli.cmd_install_claude_code(portable) == 0
+    assert "will not work in another checkout" not in capsys.readouterr().out
+
+    pinned, _pol = _cc_args(tmp_path, "--project-dir", str(tmp_path))
+    assert cli.cmd_install_claude_code(pinned) == 0
+    assert "will not work in another checkout" in capsys.readouterr().out
+
+
 def test_is_wrapped_stdio_args_matches_on_shape_not_command() -> None:
     assert cli._is_wrapped_stdio_args(["-m", "src.stdio_proxy", "--policy", "p"])
+    assert cli._is_wrapped_stdio_args(["wrap", "--policy", "p", "--command", "npx srv"])
+    assert cli._is_wrapped_stdio_args(["wrap", "--command", "npx srv"])
+    assert not cli._is_wrapped_stdio_args(["wrap", "--policy", "p"])
     assert not cli._is_wrapped_stdio_args(["-y", "@modelcontextprotocol/server-filesystem"])
     assert not cli._is_wrapped_stdio_args([])
     assert not cli._is_wrapped_stdio_args(None)
     assert not cli._is_wrapped_stdio_args("-m src.stdio_proxy")
 
 
-def test_repolicy_stdio_args_ignores_child_policy_flag() -> None:
-    wrapped = cli._wrap_stdio_args("/old.yaml", "npx", ["srv", "--policy", "child.yaml"])
-    out = cli._repolicy_stdio_args("/new.yaml", wrapped)
-    assert out == [
-        "-m",
-        "src.stdio_proxy",
-        "--policy",
-        "/new.yaml",
-        "--wrap",
-        "npx",
-        "--",
-        "srv",
-        "--policy",
-        "child.yaml",
-    ]
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        cli._wrap_stdio_args("/old.yaml", "npx", ["srv", "--policy", "child.yaml"]),
+        cli._wrap_cli_args("/old.yaml", "npx", ["srv", "--policy", "child.yaml"]),
+    ],
+    ids=["legacy", "console-script"],
+)
+def test_wrapped_child_command_ignores_child_policy_flag(wrapped: list[str]) -> None:
+    assert cli._wrapped_child_command(wrapped) == ("npx", ["srv", "--policy", "child.yaml"])
+
+
+def test_wrapped_child_command_rejects_args_without_a_command() -> None:
+    with pytest.raises(SystemExit):
+        cli._wrapped_child_command(["-m", "src.stdio_proxy", "--policy", "p"])
+    with pytest.raises(SystemExit):
+        cli._wrapped_child_command(["wrap", "--policy", "p"])
 @pytest.mark.parametrize(
     ("url", "loopback"),
     [
@@ -973,6 +1083,121 @@ def test_harden_refuses_to_prompt_on_a_non_tty(
     assert "scans" not in calls  # refused before firing any payload
 
 
+def _quickstart_args(*extra: str) -> Any:
+    return cli._build_parser().parse_args(["quickstart", *extra])
+
+
+def test_quickstart_requires_exactly_one_source() -> None:
+    for argv in ([], ["--command", "npx srv", "--target", LOCAL_TARGET]):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_quickstart(_quickstart_args(*argv))
+        assert "exactly one of --command or --target" in str(exc.value)
+
+
+def test_quickstart_scans_a_target_safely_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[_report([_vulnerable("pe-004"), _blocked("pe-001")])])
+
+    assert cli.cmd_quickstart(_quickstart_args("--target", LOCAL_TARGET)) == cli.EXIT_OK
+    assert calls["scans"] == [{"target": LOCAL_TARGET, "discover": True, "safe": True, "include_known_gaps": False}]
+    out = capsys.readouterr().out
+    assert "Still getting through: 1 payload(s): pe-004" in out
+    assert f"agentparry harden --target {LOCAL_TARGET} --safe --yes" in out
+
+
+def test_quickstart_command_run_does_not_hand_back_a_dead_port(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: dict[str, Any] = {}
+    _patch_harness(monkeypatch, calls, scans=[_report([_blocked("pe-001")])])
+    booted: list[tuple[str, str]] = []
+
+    @contextlib.asynccontextmanager
+    async def _fake_proxy(command: str, policy: str) -> AsyncIterator[str]:
+        booted.append((command, policy))
+        yield "http://127.0.0.1:65000/mcp"
+
+    monkeypatch.setattr(cli, "_local_proxy", _fake_proxy)
+
+    assert cli.cmd_quickstart(_quickstart_args("--command", "npx srv")) == cli.EXIT_OK
+    assert booted == [("npx srv", str(packaged_policy_path()))]
+    out = capsys.readouterr().out
+    assert 'agentparry wrap --command "npx srv"' in out
+    assert "--target http://127.0.0.1:65000/mcp" not in out
+
+
+def test_quickstart_verdict_truncates_a_long_gap_list() -> None:
+    results = [_vulnerable(f"pe-{i:03d}") for i in range(cli.QUICKSTART_MAX_GAPS + 3)]
+    lines = cli.quickstart_verdict(_report(results))
+    assert lines[-1].endswith("and 3 more")
+    assert lines[-1].count(",") == cli.QUICKSTART_MAX_GAPS - 1
+
+
+def test_quickstart_verdict_says_so_when_nothing_got_through() -> None:
+    assert cli.quickstart_verdict(_report([_blocked("pe-001")]))[-1] == "Nothing got through."
+
+
+def _subcommand_names(parser: argparse.ArgumentParser) -> list[str]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return list(action.choices)
+    raise AssertionError("no subparsers on the parser")
+
+
+def test_help_groups_every_subcommand_by_verb() -> None:
+    parser = cli._build_parser()
+    text = parser.format_help()
+    for name in _subcommand_names(parser):
+        assert f"    {name} " in text, name
+    for heading in ("START HERE", "SCAN,", "PROTECT,", "VERIFY,"):
+        assert heading in text
+
+
+def test_harden_copies_a_packaged_policy_out_instead_of_writing_package_data(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No --policy means the packaged default, which is read-only; the merge goes to the user copy."""
+    packaged = packaged_policy_path()
+    original = packaged.read_text(encoding="utf-8")
+    calls: dict[str, Any] = {}
+    _patch_harness(
+        monkeypatch,
+        calls,
+        scans=[_report([_vulnerable("pe-004")])],
+        rescan=_report([_blocked("pe-004")]),
+    )
+    args = cli._build_parser().parse_args(["harden", "--target", LOCAL_TARGET, "--yes"])
+
+    assert cli.cmd_harden(args) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert packaged.read_text(encoding="utf-8") == original
+    assert "autogen_pe-004" in _rule_names(user_policy_path())
+    assert str(user_policy_path()) in out
+    assert "ships inside the package" in out
+    # The copy now shadows the packaged default for every later command.
+    assert resolve_policy().path == user_policy_path()
+
+
+def test_harden_writes_the_user_copy_in_place_once_it_exists(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy_out_policy()
+    calls: dict[str, Any] = {}
+    _patch_harness(
+        monkeypatch,
+        calls,
+        scans=[_report([_vulnerable("pe-004")])],
+        rescan=_report([_blocked("pe-004")]),
+    )
+    args = cli._build_parser().parse_args(["harden", "--target", LOCAL_TARGET, "--yes"])
+
+    assert cli.cmd_harden(args) == cli.EXIT_OK
+    assert user_policy_path().with_suffix(".yaml.bak").exists()
+    assert "autogen_pe-004" in _rule_names(user_policy_path())
+
+
 def test_harden_missing_policy_file_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1190,7 +1415,8 @@ def test_harden_parser_defaults() -> None:
     args = cli._build_parser().parse_args(["harden"])
     assert args.handler is cli.cmd_harden
     assert args.target is None
-    assert args.policy == "config/default_policy.yaml"
+    assert args.policy is None
+    assert args.payloads is None
     assert args.max_vulns == 0
     assert args.dry_run is False
     assert args.full is False
@@ -1437,15 +1663,19 @@ def _cc_args(tmp_path: Path, *extra: str) -> tuple[object, Path]:
 def test_install_claude_code_project_scope_writes_mcp_json(tmp_path: Path) -> None:
     args, pol = _cc_args(tmp_path, "--command", "npx server-bin", "--project-dir", str(tmp_path))
 
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude_code(args) == 0
+    assert cli.cmd_install_claude_code(args) == 0
 
     cfg = tmp_path / ".mcp.json"
     entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["mine"]
     assert entry["type"] == "stdio"
-    assert entry["command"] == "/fake/python"
-    assert entry["args"][:4] == ["-m", "src.stdio_proxy", "--policy", str(pol.resolve())]
-    assert entry["args"][-2:] == ["--wrap", "npx"] or "--wrap" in entry["args"]
+    assert entry["command"] == "agentparry"
+    assert entry["args"] == [
+        "wrap",
+        "--policy",
+        str(pol.resolve()),
+        "--command",
+        "npx server-bin",
+    ]
     assert entry["env"]["AGENTPARRY_POLICY"] == str(pol.resolve())
 
 
@@ -1462,8 +1692,7 @@ def test_install_claude_code_user_scope_preserves_other_keys(
     monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: home))
 
     args, _pol = _cc_args(tmp_path, "--command", "npx server-bin", "--scope", "user")
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude_code(args) == 0
+    assert cli.cmd_install_claude_code(args) == 0
 
     data = json.loads(cfg.read_text(encoding="utf-8"))
     assert data["numStartups"] == 7
@@ -1483,8 +1712,7 @@ def test_install_claude_code_local_scope_nests_under_project(
     args, _pol = _cc_args(
         tmp_path, "--command", "npx server-bin", "--scope", "local", "--project-dir", str(proj)
     )
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude_code(args) == 0
+    assert cli.cmd_install_claude_code(args) == 0
 
     data = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
     # Local scope must not leak the server into the user-wide mapping.
@@ -1512,11 +1740,10 @@ def test_install_claude_code_wraps_existing_entry(tmp_path: Path) -> None:
     )
     args, pol = _cc_args(tmp_path, "--project-dir", str(tmp_path))
 
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude_code(args) == 0
+    assert cli.cmd_install_claude_code(args) == 0
 
     entry = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["mine"]
-    assert entry["args"][-4:] == ["--wrap", "npx", "--", "-y"] or "--wrap" in entry["args"]
+    assert entry["args"][-1] == "npx -y @x/fs /tmp"
     assert entry["env"]["A"] == "1"
     assert entry["env"]["AGENTPARRY_POLICY"] == str(pol.resolve())
     assert entry["timeout"] == 30
@@ -1525,14 +1752,14 @@ def test_install_claude_code_wraps_existing_entry(tmp_path: Path) -> None:
 
 def test_install_claude_code_rerun_does_not_nest(tmp_path: Path) -> None:
     args, _pol = _cc_args(tmp_path, "--command", "npx server-bin", "--project-dir", str(tmp_path))
-    with patch.object(cli.sys, "executable", "/fake/python"):
-        assert cli.cmd_install_claude_code(args) == 0
-        args2, _ = _cc_args(tmp_path, "--project-dir", str(tmp_path))
-        assert cli.cmd_install_claude_code(args2) == 0
+    assert cli.cmd_install_claude_code(args) == 0
+    args2, _ = _cc_args(tmp_path, "--project-dir", str(tmp_path))
+    assert cli.cmd_install_claude_code(args2) == 0
 
     entry = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["mine"]
-    assert entry["args"].count("src.stdio_proxy") == 1
-    assert entry["args"].count("--wrap") == 1
+    assert entry["args"].count("wrap") == 1
+    assert entry["args"].count("--command") == 1
+    assert entry["args"][-1] == "npx server-bin"
 
 
 def test_install_claude_code_rejects_url_only_entry(tmp_path: Path) -> None:

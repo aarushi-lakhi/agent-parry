@@ -26,6 +26,8 @@ from src.normalize import (
     TextView,
     find_invisible,
 )
+from src.resources import UNSET, Unset
+from src.resources import policy_path as resolve_policy_path
 
 logger = logging.getLogger(__name__)
 
@@ -163,10 +165,10 @@ class PolicyEngine:
 
     def __init__(
         self,
-        policy_path: str = "config/default_policy.yaml",
+        policy_path: str | Path | Unset = UNSET,
         policy: dict[str, Any] | None = None,
     ) -> None:
-        self.policy_path = Path(policy_path)
+        self.policy_path = resolve_policy_path(policy_path)
         self._raw_policy: dict[str, Any] = {"rules": [], "settings": {}}
         self._raw_rules: list[dict[str, Any]] = []
         self._rules: list[Rule] = []

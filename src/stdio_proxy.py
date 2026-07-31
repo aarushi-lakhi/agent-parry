@@ -50,6 +50,7 @@ from src.models import (
 )
 from src.pins import ServerIdentity, ToolPinner, audit_findings_for
 from src.policy import PolicyEngine
+from src.resources import POLICY_DEFAULT_HELP, resolve_policy
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
@@ -83,12 +84,8 @@ def _parse_child_command(wrap_argv: list[str]) -> tuple[str, list[str]]:
 
 
 def _resolve_policy_path(explicit: str | None) -> str:
-    env_path = os.environ.get("AGENTPARRY_POLICY")
-    if explicit:
-        return explicit
-    if env_path:
-        return env_path
-    return "config/default_policy.yaml"
+    """Policy file for this session: flag, then env, then user copy, then packaged."""
+    return str(resolve_policy(explicit).path)
 
 
 def _default_log_path() -> Path:
@@ -1004,9 +1001,9 @@ async def _run_proxy(argv: list[str]) -> int:
             epilog=(
                 "Examples:\n"
                 "  python -m src.stdio_proxy --wrap npx -- some-mcp-server\n"
-                "  python -m src.stdio_proxy --policy config/default_policy.yaml --verbose --wrap uvx -- pkg\n"
+                "  python -m src.stdio_proxy --policy my_policy.yaml --verbose --wrap uvx -- pkg\n"
                 "\n"
-                "Default policy path: config/default_policy.yaml, overridden by AGENTPARRY_POLICY.\n"
+                f"Default policy: {POLICY_DEFAULT_HELP}.\n"
                 "Default log file: ~/.agentparry/proxy.log\n"
                 "Default audit log: ~/.agentparry/audit.jsonl, overridden by AGENTPARRY_AUDIT_PATH.\n"
                 "Policy edits are picked up while running; pass --no-reload-on-change to opt out.\n"
@@ -1016,7 +1013,7 @@ async def _run_proxy(argv: list[str]) -> int:
         help_parser.add_argument(
             "--policy",
             metavar="PATH",
-            help="Policy YAML (default: config/default_policy.yaml or AGENTPARRY_POLICY)",
+            help=f"Policy YAML (default: {POLICY_DEFAULT_HELP})",
         )
         help_parser.add_argument(
             "--log",
@@ -1065,7 +1062,7 @@ async def _run_proxy(argv: list[str]) -> int:
     parser.add_argument(
         "--policy",
         default=None,
-        help="Policy YAML path (default: config/default_policy.yaml or AGENTPARRY_POLICY)",
+        help=f"Policy YAML path (default: {POLICY_DEFAULT_HELP})",
     )
     parser.add_argument(
         "--log",
