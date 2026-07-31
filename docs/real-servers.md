@@ -81,50 +81,85 @@ So the critical-only default is doing real work, and lowering it should be an
 explicit, per-server decision. `MAX_DESCRIPTION_CHARS = 2000` is also too low for
 real servers: one legitimate description in eight already exceeds it.
 
-## Tool-name remapping in `--discover` mostly fails, and when it succeeds it lies
+## Tool-name remapping in `--discover` lied, and now refuses to guess
 
-30 (server, payload-tool) pairs, four payload tool names against eight servers:
+### What it used to do
 
-| Mechanism | Count |
-|---|---|
-| exact match | 0 |
-| casefold match | 0 |
-| `difflib` fuzzy match | 2 |
-| keyword hint | 9 |
-| unmapped | 21 |
-
-Not one of the 11 successful mappings is semantically right:
+Four payload tool names against eight servers produced 11 mappings, and not one of
+them was the same kind of thing as the payload:
 
 ```
-file_read   -> edit_file                 (filesystem)
+file_read   -> edit_file / read_file     (filesystem, depending on tool order)
 email_send  -> read_file                 (filesystem)
+file_read   -> gzip-file-as-resource     (everything)
+email_send  -> get-annotated-message     (everything)
 shell_exec  -> git_show                  (git)
-file_read   -> open_nodes                (memory)
-shell_exec  -> browser_snapshot          (playwright)
-http_fetch  -> browser_click             (playwright)
+file_read   -> open_nodes / read_graph   (memory)
+file_read   -> browser_file_upload       (playwright)
+shell_exec  -> browser_snapshot / browser_take_screenshot  (playwright)
+http_fetch  -> browser_click / browser_close               (playwright)
 email_send  -> browser_console_messages  (playwright)
 ```
 
-Two consequences.
+Two causes. `difflib.get_close_matches` at cutoff 0.55 finds a nearest string in any
+list of decent size, and the keyword hints matched substrings, which is how `sh`
+matched `browser_take_screenshot`. Note the pairs that differ above: the target
+depended on the order the server happened to list its tools in, because the old code
+took the first hint hit it saw.
 
-**`--discover` is unsafe outside `--safe`, concretely.** `file_read` maps to
-`edit_file` on the reference filesystem server. A path-traversal payload written to
-test a read tool is delivered to a write tool. It happens to bounce off schema
-validation today because `edit_file` also requires `edits`, but the design does not
-prevent this, and a server whose write tool has a single required path argument
-would take it.
+**It was unsafe outside `--safe`, concretely.** `file_read` mapped to
+`browser_file_upload` on playwright and to `edit_file` on filesystem. A path-traversal
+payload written to test a read tool was delivered to a write tool.
 
-**"Matched N of 65 payloads" measures tool-name count, not coverage.** Against
-playwright's 24 tools it reports **65 of 65 matched, 100%**, because with enough
-names `difflib` at cutoff 0.55 always finds something. Against sequential-thinking
-and time it reports 0. The number tracks how many names the server exposes, and a
-scan that reports 100% matched against playwright has tested nothing about
-playwright.
+### What it does now
 
-Proposal: drop the `difflib` fallback, keep only exact, casefold and explicitly
-curated hints, and report unmapped payloads as `unavailable` rather than remapping
-them onto a stranger. `--discover` against an unrecognized server should lean on
-the schema-driven probes, which at least know what they are aiming at.
+A mapping is accepted only on evidence that the candidate does the same kind of thing:
+
+- **The payload's own arguments are the requirement.** `file_read` carries `path`,
+  `shell_exec` carries `command`, `email_send` carries `to`/`subject`/`body`. The
+  candidate's `inputSchema` has to declare every one of them, with a compatible type
+  and no violated `enum`, and every property it marks `required` has to be one the
+  payload supplies. That kills `edit_file` (needs `edits`), `browser_file_upload`
+  (takes `paths`, an array) and everything on `memory` and `git` at once.
+- **The tool's name has to say it does that job**, as whole tokens rather than
+  substrings, and must not carry a mutating verb the capability does not claim. That
+  is what stops a read payload landing on `create_directory`, which takes exactly one
+  required `path` and was the residual risk in the old design.
+- **`difflib` only breaks ties** between candidates that already passed both gates.
+- **Anything else is unmapped**, reported as a gap, and never sent.
+
+Per server, payloads mapped out of 65:
+
+| Server | Before | After | Mappings after |
+|---|---|---|---|
+| everything | 35 | 0 | none |
+| fetch | 9 | 9 | `http_fetch -> fetch` |
+| filesystem | 35 | 15 | `file_read -> read_file` |
+| git | 20 | 0 | none |
+| memory | 15 | 0 | none |
+| playwright | 65 | 9 | `http_fetch -> browser_navigate` |
+| sequential-thinking | 0 | 0 | none |
+| time | 0 | 0 | none |
+
+179 mapped payloads become 33. All three surviving mappings are the same kind of
+thing as the payload; 1 of the previous 11 was. The drop is the point: no server in
+this corpus runs shell commands or sends email, so 21 `shell_exec` and 20
+`email_send` payloads have nowhere honest to go on any of them.
+
+The one true positive the argument gate costs is playwright's
+`browser_run_code_unsafe`, which really does execute code but takes `code` rather
+than `command`. The schema-driven probe generator reaches it anyway.
+
+**Recommendation, implemented: refuse low-confidence mappings outside `--safe`.**
+Description-only evidence (`weak`) is accepted only in safe mode, where nothing is
+forwarded upstream and a wrong guess costs a policy evaluation rather than a real
+call. On this corpus the weak tier fires zero times, so the gate costs no coverage
+today and bounds the damage of any future loosening.
+
+**Stop reading "matched N of 65" as coverage.** The scan report now carries mapped
+and unmapped counts, the accepted mappings with their confidence and the evidence
+each rested on, and how many payloads were refused for low confidence. A mapped
+payload tested one tool; an unmapped payload tested nothing and says so.
 
 ## Schema-driven dynamic probes are mostly sensible, with two blind spots
 
@@ -211,7 +246,8 @@ Stop:
 
 - "over-block 0%" as an AgentParry property. It is 0/15 on four mock tool names.
 - "detection 86.2%" as a detection rate. It is a mock-server regression score.
-- "matched N of 65 payloads" as discovery coverage. It counts server tool names.
+- "matched N of 65 payloads" as discovery coverage. Mapped and unmapped are both
+  reported now, and neither is coverage.
 
 Start:
 
