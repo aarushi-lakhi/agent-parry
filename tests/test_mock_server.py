@@ -289,7 +289,19 @@ class TestHttpFetchStub(unittest.TestCase):
         self.assertIn("Deploy approved", content)
 
     def test_http_fetch_maps_onto_a_differently_named_fetch_tool(self) -> None:
-        self.assertEqual("fetchUrl", map_yaml_tool_to_server("http_fetch", ["fetchUrl"]))
+        tool = {
+            "name": "fetchUrl",
+            "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}},
+        }
+        self.assertEqual(
+            "fetchUrl",
+            map_yaml_tool_to_server("http_fetch", [tool], arguments={"url": "http://x"}),
+        )
+
+    def test_a_differently_named_fetch_tool_without_a_schema_is_unmapped(self) -> None:
+        self.assertIsNone(
+            map_yaml_tool_to_server("http_fetch", ["fetchUrl"], arguments={"url": "http://x"})
+        )
 
 
 if __name__ == "__main__":

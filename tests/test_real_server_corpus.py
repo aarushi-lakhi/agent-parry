@@ -31,7 +31,10 @@ from src.inspector import (
 from src.models import AuditTransport
 from src.pins import PinStore, ServerIdentity, ToolPinner, tools_set_fingerprint
 from src.scanner import (
+    _CAPABILITIES,
+    _MUTATING_VERBS,
     Scanner,
+    _tokens,
     build_dynamic_payloads,
     filter_and_remap_payloads,
     map_yaml_tool_to_server,
@@ -188,101 +191,145 @@ class TestMetadataInspectorOnRealServers:
         assert redacted == ["sequentialthinking"]
 
 
-class TestRemappingAgainstRealToolNames:
-    """What ``--discover`` actually does to payload tool names on a real server."""
+YAML_TOOLS = ("email_send", "file_read", "http_fetch", "shell_exec")
 
-    YAML_TOOLS = ("email_send", "file_read", "http_fetch", "shell_exec")
+REMAP_ARGUMENTS: dict[str, dict[str, Any]] = {
+    "email_send": {"to": "a@b.example", "subject": "s", "body": "b"},
+    "file_read": {"path": "../../../etc/passwd"},
+    "http_fetch": {"url": "http://169.254.169.254/"},
+    "shell_exec": {"command": "id"},
+}
+"""The arguments `attacks/payloads.yaml` actually carries for each of its tools."""
+
+FORBIDDEN_MAPPINGS = [
+    ("everything", "email_send", "get-annotated-message"),
+    ("everything", "file_read", "gzip-file-as-resource"),
+    ("filesystem", "email_send", "read_file"),
+    ("filesystem", "file_read", "edit_file"),
+    ("git", "shell_exec", "git_show"),
+    ("memory", "file_read", "open_nodes"),
+    ("memory", "file_read", "read_graph"),
+    ("playwright", "email_send", "browser_console_messages"),
+    ("playwright", "file_read", "browser_file_upload"),
+    ("playwright", "http_fetch", "browser_click"),
+    ("playwright", "http_fetch", "browser_close"),
+    ("playwright", "shell_exec", "browser_snapshot"),
+    ("playwright", "shell_exec", "browser_take_screenshot"),
+]
+"""Every mapping the fuzzy matcher produced on this corpus, in either tool order.
+
+None of them is the same kind of thing as the payload, and the filesystem and
+playwright file_read entries deliver a path-traversal payload to a tool that
+writes.
+"""
+
+
+class TestRemappingAgainstRealToolNames:
+    """What ``--discover`` aims at a real server, and what it now refuses to aim."""
+
+    def _match(self, entry: dict[str, Any], yaml_tool: str, **kwargs: Any) -> str | None:
+        return map_yaml_tool_to_server(
+            yaml_tool, tools_of(entry), arguments=REMAP_ARGUMENTS[yaml_tool], **kwargs
+        )
 
     def test_no_yaml_tool_name_exists_on_any_real_server(self) -> None:
         real = {t["name"] for e in CORPUS for t in tools_of(e)}
-        assert real.isdisjoint(self.YAML_TOOLS)
-        assert {n.lower() for n in real}.isdisjoint(self.YAML_TOOLS)
+        assert real.isdisjoint(YAML_TOOLS)
+        assert {n.lower() for n in real}.isdisjoint(YAML_TOOLS)
+
+    @pytest.mark.parametrize("server,yaml_tool,forbidden", FORBIDDEN_MAPPINGS)
+    def test_known_bad_mappings_never_come_back(
+        self, server: str, yaml_tool: str, forbidden: str
+    ) -> None:
+        entry = _entry(server)
+        assert self._match(entry, yaml_tool) != forbidden
+        assert self._match(entry, yaml_tool, allow_weak=True) != forbidden
 
     def test_mapping_outcome_per_server_is_pinned(self) -> None:
-        observed: dict[str, dict[str, str | None]] = {}
-        for entry in CORPUS:
-            names = sorted(t["name"] for t in tools_of(entry))
-            observed[entry["server"]] = {
-                yaml_tool: map_yaml_tool_to_server(yaml_tool, names)
-                for yaml_tool in self.YAML_TOOLS
+        observed = {
+            entry["server"]: {
+                yaml_tool: self._match(entry, yaml_tool) for yaml_tool in YAML_TOOLS
             }
-        assert observed == {
-            "everything": {
-                "email_send": "get-annotated-message",
-                "file_read": "gzip-file-as-resource",
-                "http_fetch": None,
-                "shell_exec": None,
-            },
-            "fetch": {
-                "email_send": None,
-                "file_read": None,
-                "http_fetch": "fetch",
-                "shell_exec": None,
-            },
-            "filesystem": {
-                "email_send": "read_file",
-                "file_read": "edit_file",
-                "http_fetch": None,
-                "shell_exec": None,
-            },
-            "git": {
-                "email_send": None,
-                "file_read": None,
-                "http_fetch": None,
-                "shell_exec": "git_show",
-            },
-            "memory": {
-                "email_send": None,
-                "file_read": "open_nodes",
-                "http_fetch": None,
-                "shell_exec": None,
-            },
-            "playwright": {
-                "email_send": "browser_console_messages",
-                "file_read": "browser_file_upload",
-                "http_fetch": "browser_click",
-                "shell_exec": "browser_snapshot",
-            },
-            "sequential_thinking": {
-                "email_send": None,
-                "file_read": None,
-                "http_fetch": None,
-                "shell_exec": None,
-            },
-            "time": {
-                "email_send": None,
-                "file_read": None,
-                "http_fetch": None,
-                "shell_exec": None,
-            },
+            for entry in CORPUS
+        }
+        accepted = {
+            server: {tool: name for tool, name in row.items() if name}
+            for server, row in observed.items()
+        }
+        assert accepted == {
+            "everything": {},
+            "fetch": {"http_fetch": "fetch"},
+            "filesystem": {"file_read": "read_file"},
+            "git": {},
+            "memory": {},
+            "playwright": {"http_fetch": "browser_navigate"},
+            "sequential_thinking": {},
+            "time": {},
         }
 
-    def test_a_read_payload_lands_on_a_write_tool(self) -> None:
-        """The concrete reason a remapped scan must not run outside --safe."""
-        names = sorted(t["name"] for t in tools_of(_entry("filesystem")))
-        assert map_yaml_tool_to_server("file_read", names) == "edit_file"
-
-    def test_matched_counts_measure_fuzz_not_coverage(self) -> None:
-        scanner = Scanner(str(PAYLOADS))
-        total = len(scanner.payloads)
-        matched = {}
-        for entry in CORPUS:
-            names = sorted(t["name"] for t in tools_of(entry))
-            _, count = filter_and_remap_payloads(scanner.payloads, names)
-            matched[entry["server"]] = count
-        assert matched["playwright"] == total
-        assert matched["sequential_thinking"] == 0
-        assert matched["time"] == 0
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_mapping_does_not_depend_on_tool_order(self, entry: dict[str, Any]) -> None:
+        """The fuzzy matcher picked whichever near-miss the server listed first."""
+        shuffled = dict(entry)
+        shuffled["tools_list"] = {"tools": list(reversed(tools_of(entry)))}
+        for yaml_tool in YAML_TOOLS:
+            assert self._match(entry, yaml_tool) == self._match(shuffled, yaml_tool)
 
     @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
-    def test_every_remapped_payload_names_a_real_tool(self, entry: dict[str, Any]) -> None:
+    def test_a_read_payload_never_lands_on_a_mutating_tool(self, entry: dict[str, Any]) -> None:
+        mapped = self._match(entry, "file_read")
+        if mapped is None:
+            return
+        assert not _tokens(mapped) & (_MUTATING_VERBS - _CAPABILITIES["file_read"].verbs)
+
+    def test_mapped_and_unmapped_account_for_every_payload(self) -> None:
         scanner = Scanner(str(PAYLOADS))
-        names = sorted(t["name"] for t in tools_of(entry))
-        mapped, _ = filter_and_remap_payloads(scanner.payloads, names)
+        total = len(scanner.payloads)
+        counts = {}
+        for entry in CORPUS:
+            mapped, summary = filter_and_remap_payloads(scanner.payloads, tools_of(entry))
+            assert summary.mapped == len(mapped)
+            assert summary.mapped + summary.unmapped == total
+            assert sum(summary.unmapped_tools.values()) == summary.unmapped
+            counts[entry["server"]] = summary.mapped
+        assert counts == {
+            "everything": 0,
+            "fetch": 9,
+            "filesystem": 15,
+            "git": 0,
+            "memory": 0,
+            "playwright": 9,
+            "sequential_thinking": 0,
+            "time": 0,
+        }
+
+    def test_low_confidence_mappings_are_refused_and_none_are_lost_here(self) -> None:
+        """Safe mode may widen the net. On this corpus it finds nothing extra."""
+        scanner = Scanner(str(PAYLOADS))
+        for entry in CORPUS:
+            strict, summary = filter_and_remap_payloads(scanner.payloads, tools_of(entry))
+            wide, _ = filter_and_remap_payloads(scanner.payloads, tools_of(entry), allow_weak=True)
+            assert summary.refused_low_confidence == 0
+            assert [p.id for p in strict] == [p.id for p in wide]
+
+    @pytest.mark.parametrize("entry", CORPUS, ids=corpus_ids())
+    def test_every_remapped_payload_is_one_the_target_tool_accepts(
+        self, entry: dict[str, Any]
+    ) -> None:
+        scanner = Scanner(str(PAYLOADS))
+        schemas = {t["name"]: t.get("inputSchema") or {} for t in tools_of(entry)}
+        mapped, summary = filter_and_remap_payloads(scanner.payloads, tools_of(entry))
         for payload in mapped:
-            assert payload.tool in names
-            for step in payload.steps:
-                assert step.tool in names
+            for tool, arguments in [(payload.tool, payload.arguments)] + [
+                (s.tool, s.arguments) for s in payload.steps
+            ]:
+                schema = schemas[tool]
+                props = schema.get("properties") or {}
+                assert set(arguments) <= set(props)
+                assert set(schema.get("required") or []) <= set(arguments)
+        for mapping in summary.mappings:
+            assert mapping.server_tool in schemas
+            assert mapping.confidence in {"exact", "schema"}
 
 
 class TestDynamicProbesAgainstRealSchemas:

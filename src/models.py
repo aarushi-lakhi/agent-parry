@@ -527,6 +527,46 @@ class AttackPayload(BaseModel):
     known_gap: bool = False
 
 
+class ToolMapping(BaseModel):
+    """One accepted mapping of a payload's tool name onto a real server tool.
+
+    ``confidence`` is ``exact`` when the two names are the same name written
+    differently, and ``schema`` or ``weak`` when the mapping rests on the
+    candidate's ``inputSchema`` accepting the payload's arguments plus verb
+    evidence that it does the same kind of thing. ``reason`` records which
+    evidence, so a reader can disagree with a specific mapping.
+    """
+
+    yaml_tool: str
+    server_tool: str
+    confidence: str
+    reason: str
+
+
+class RemapSummary(BaseModel):
+    """What ``--discover`` could and could not aim at a server's real tools.
+
+    ``mapped`` and ``unmapped`` are payload counts and always sum to the payload
+    total. Neither is coverage: a mapped payload tests one tool of many, and an
+    unmapped payload is a declared gap rather than a pass.
+    """
+
+    mapped: int = 0
+    unmapped: int = 0
+    refused_low_confidence: int = 0
+    mappings: list[ToolMapping] = Field(default_factory=list)
+    unmapped_tools: dict[str, int] = Field(default_factory=dict)
+
+    @property
+    def by_confidence(self) -> dict[str, int]:
+        """Distinct accepted mappings counted by confidence tier."""
+
+        counts: dict[str, int] = {}
+        for mapping in self.mappings:
+            counts[mapping.confidence] = counts.get(mapping.confidence, 0) + 1
+        return counts
+
+
 class AttackStepResult(BaseModel):
     """What the target did with one step of a sequence payload.
 
@@ -648,6 +688,7 @@ class ScanReport(BaseModel):
     target_url: str = ""
     safe_mode: bool = False
     discovered_tools: list[str] = Field(default_factory=list)
+    remap: RemapSummary | None = None
     matched_yaml_payloads: int = 0
     total_yaml_payloads: int = 0
     payload_stats: dict[str, Any] = Field(default_factory=dict)

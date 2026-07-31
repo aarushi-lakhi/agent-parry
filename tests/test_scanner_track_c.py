@@ -18,17 +18,194 @@ from src.scanner import (
     Scanner,
     build_dynamic_payloads,
     classify_metadata_findings,
+    filter_and_remap_payloads,
     map_yaml_tool_to_server,
+    match_tool,
+    remap_lines,
     save_scan_outputs,
 )
 
 
+def _tool(name: str, props: dict[str, Any], required: list[str], description: str = "") -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {"type": "object", "properties": props, "required": required},
+    }
+
+
+PATH_PROP = {"path": {"type": "string"}}
+
+
 def test_map_yaml_tool_keyword_bash() -> None:
-    assert map_yaml_tool_to_server("shell_exec", ["bash_tool", "other"]) == "bash_tool"
+    bash = {
+        "name": "bash_tool",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    }
+    other = {"name": "other", "inputSchema": {"type": "object", "properties": {}}}
+    assert (
+        map_yaml_tool_to_server("shell_exec", [bash, other], arguments={"command": "id"})
+        == "bash_tool"
+    )
+
+
+def test_map_yaml_tool_keyword_needs_a_schema_that_takes_the_arguments() -> None:
+    bash = {
+        "name": "bash_tool",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"script": {"type": "string"}},
+            "required": ["script"],
+        },
+    }
+    assert map_yaml_tool_to_server("shell_exec", [bash], arguments={"command": "id"}) is None
 
 
 def test_map_yaml_tool_exact_case_insensitive() -> None:
     assert map_yaml_tool_to_server("Email_Send", ["email_send"]) == "email_send"
+
+
+READ_ARGS = {"path": "../../../etc/passwd"}
+
+
+def test_a_write_tool_taking_only_a_path_is_still_refused_for_a_read_payload() -> None:
+    """The residual risk in the old design: one required path argument was enough."""
+    tools = [_tool("create_directory", PATH_PROP, ["path"], "Create a directory at path.")]
+    assert match_tool("file_read", READ_ARGS, tools) is None
+    assert match_tool("file_read", READ_ARGS, tools, allow_weak=True) is None
+
+
+def test_the_reading_tool_wins_over_other_schema_compatible_readers() -> None:
+    tools = [
+        _tool("list_directory", PATH_PROP, ["path"]),
+        _tool("get_file_info", PATH_PROP, ["path"]),
+        _tool("read_file", PATH_PROP, ["path"]),
+    ]
+    mapping = match_tool("file_read", READ_ARGS, tools)
+    assert mapping is not None
+    assert mapping.server_tool == "read_file"
+    assert mapping.confidence == "schema"
+
+
+def test_an_argument_the_tool_does_not_declare_blocks_the_mapping() -> None:
+    tools = [_tool("read_resource", {"uri": {"type": "string"}}, ["uri"], "Read a resource.")]
+    assert match_tool("file_read", READ_ARGS, tools) is None
+
+
+def test_a_required_argument_the_payload_cannot_supply_blocks_the_mapping() -> None:
+    tools = [
+        _tool("read_range", {"path": {"type": "string"}, "lines": {"type": "array"}},
+              ["path", "lines"])
+    ]
+    assert match_tool("file_read", READ_ARGS, tools) is None
+
+
+def test_an_enum_the_payload_violates_blocks_the_mapping() -> None:
+    tools = [_tool("read_file", {"path": {"type": "string", "enum": ["a.txt"]}}, ["path"])]
+    assert match_tool("file_read", READ_ARGS, tools) is None
+
+
+def test_description_only_evidence_is_weak_and_off_outside_safe_mode() -> None:
+    tools = [_tool("cat9000", PATH_PROP, ["path"], "Reads the file at path and returns it.")]
+    assert match_tool("file_read", READ_ARGS, tools) is None
+    mapping = match_tool("file_read", READ_ARGS, tools, allow_weak=True)
+    assert mapping is not None
+    assert mapping.confidence == "weak"
+
+
+def test_remap_summary_counts_mapped_unmapped_and_refusals() -> None:
+    payloads = [
+        AttackPayload(id="r", name="r", category="c", tool="file_read", arguments=READ_ARGS),
+        AttackPayload(id="s", name="s", category="c", tool="shell_exec",
+                      arguments={"command": "id"}),
+    ]
+    tools = [_tool("cat9000", PATH_PROP, ["path"], "Reads the file at path and returns it.")]
+    _, strict = filter_and_remap_payloads(payloads, tools)
+    assert (strict.mapped, strict.unmapped, strict.refused_low_confidence) == (0, 2, 1)
+    assert strict.unmapped_tools == {"file_read": 1, "shell_exec": 1}
+
+    mapped, wide = filter_and_remap_payloads(payloads, tools, allow_weak=True)
+    assert [p.tool for p in mapped] == ["cat9000"]
+    assert (wide.mapped, wide.unmapped) == (1, 1)
+    assert wide.by_confidence == {"weak": 1}
+
+
+def _discover_scan(tools: list[dict[str, Any]], payloads: list[AttackPayload]) -> tuple[Any, list[str]]:
+    called: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        method = body.get("method")
+        rid = body.get("id")
+        if method == "initialize":
+            result: dict[str, Any] = {"protocolVersion": "2025-06-18", "serverInfo": {"name": "t"}}
+        elif method == "tools/list":
+            result = {"tools": tools}
+        else:
+            called.append((body.get("params") or {}).get("name", ""))
+            result = {"content": "ok"}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": result})
+
+    scanner = Scanner(payloads_path=None)
+    scanner.payloads = payloads
+    original = httpx.AsyncClient
+
+    def patched(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(httpx, "AsyncClient", patched)
+        report = asyncio.run(scanner.run_scan(proxy_url="http://target/mcp", discover=True))
+    return report, called
+
+
+def test_discover_never_delivers_a_read_payload_to_a_write_tool(tmp_path: Path) -> None:
+    tools = [
+        _tool("read_file", PATH_PROP, ["path"], "Read a file."),
+        _tool("write_file", {"path": {"type": "string"}}, ["path"], "Write a file."),
+        _tool("mailer", {"to": {"type": "string"}}, ["to"], "Send mail."),
+    ]
+    payloads = [
+        AttackPayload(id="r", name="r", category="c", tool="file_read", arguments=READ_ARGS),
+        AttackPayload(id="s", name="s", category="c", tool="shell_exec",
+                      arguments={"command": "id"}),
+    ]
+    report, called = _discover_scan(tools, payloads)
+    assert report.remap is not None
+    assert (report.remap.mapped, report.remap.unmapped) == (1, 1)
+    assert report.remap.unmapped_tools == {"shell_exec": 1}
+    assert [m.server_tool for m in report.remap.mappings] == ["read_file"]
+    assert "read_file" in called
+    remapped = [r.payload.tool for r in report.results if r.payload.id == "r"]
+    assert remapped == ["read_file"]
+
+    path = tmp_path / "out.md"
+    Scanner(payloads_path=None).save_markdown_report(report, path)
+    text = path.read_text(encoding="utf-8")
+    assert "**Payloads mapped onto real tools:** 1 of 2" in text
+    assert "**Payloads unmapped, never sent, untested:** 1" in text
+    assert "not coverage" in text
+
+
+def test_remap_lines_report_the_gap_and_never_claim_coverage() -> None:
+    payloads = [
+        AttackPayload(id="r", name="r", category="c", tool="file_read", arguments=READ_ARGS),
+        AttackPayload(id="s", name="s", category="c", tool="shell_exec",
+                      arguments={"command": "id"}),
+    ]
+    tools = [_tool("read_file", PATH_PROP, ["path"])]
+    _, summary = filter_and_remap_payloads(payloads, tools)
+    text = "\n".join(remap_lines(summary, len(payloads), safe=False))
+    assert "Mapped 1 of 2" in text
+    assert "1 payloads have no counterpart" in text
+    assert "untested gap, not a pass" in text
+    assert "file_read -> read_file [schema]" in text
+    assert "coverage" not in text.lower()
 
 
 def test_classify_safe_scan_response() -> None:
