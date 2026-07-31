@@ -16,6 +16,7 @@ from src.inspector import (
     ResultInspectorSettings,
     is_fenced,
 )
+from src.mock_server import _mock_file_content
 from src.normalize import raw_only_normalizer
 
 ZWSP = "\u200b"
@@ -269,6 +270,137 @@ class TestOutputInspectorRedactionTiers(unittest.TestCase):
         payload = {"text": "Привет, отчёт готов.", "path": "/usr/local/bin", "n": 12}
         sanitized, findings = self.inspector.inspect("file_read", payload)
         self.assertEqual(payload, sanitized)
+        self.assertEqual([], findings)
+
+
+# Assembled from parts: GitHub secret scanning has blocked a push on this repo before.
+SK = "sk" + "-"
+SK_ = "sk" + "_"
+
+
+def _key(prefix: str, body_length: int) -> str:
+    """Return a key-shaped string with a body of exactly ``body_length``."""
+    return prefix + ("a1b2c3d4e5" * 20)[:body_length]
+
+
+class TestApiKeyPrefixMinimums(unittest.TestCase):
+    """Each prefix carries its own floor; see ``API_KEY_PATTERN``."""
+
+    def setUp(self) -> None:
+        self.inspector = OutputInspector()
+
+    def redacted(self, value: str) -> bool:
+        sanitized, _ = self.inspector.inspect("file_read", {"v": value})
+        return sanitized["v"] != value
+
+    def test_bare_sk_dash_needs_twenty_characters(self) -> None:
+        self.assertFalse(self.redacted(_key(SK, 19)))
+        self.assertTrue(self.redacted(_key(SK, 20)))
+
+    def test_a_real_length_openai_key_redacts(self) -> None:
+        self.assertTrue(self.redacted(_key(SK, 48)))
+
+    def test_sk_proj_needs_only_six_characters(self) -> None:
+        self.assertFalse(self.redacted(_key(SK + "proj-", 5)))
+        self.assertTrue(self.redacted(_key(SK + "proj-", 6)))
+
+    def test_sk_ant_needs_only_six_characters(self) -> None:
+        self.assertFalse(self.redacted(_key(SK + "ant-", 5)))
+        self.assertTrue(self.redacted(_key(SK + "ant-", 6)))
+
+    def test_stripe_secret_keys_need_only_six_characters(self) -> None:
+        for prefix in (SK_ + "live_", SK_ + "test_"):
+            with self.subTest(prefix=prefix):
+                self.assertFalse(self.redacted(_key(prefix, 5)))
+                self.assertTrue(self.redacted(_key(prefix, 6)))
+
+    def test_the_short_stripe_key_that_used_to_escape_is_redacted(self) -> None:
+        sanitized, findings = self.inspector.inspect("file_read", {"v": SK_ + "live_abc123"})
+        self.assertEqual("[REDACTED-API_KEY]", sanitized["v"])
+        self.assertEqual(1, len(findings))
+
+    def test_publishable_stripe_keys_are_not_redacted(self) -> None:
+        """A ``pk_`` key ships to browsers by design, so redacting it protects nothing."""
+        for prefix in ("pk" + "_live_", "pk" + "_test_"):
+            with self.subTest(prefix=prefix):
+                self.assertFalse(self.redacted(_key(prefix, 24)))
+
+
+class TestSecretAssignmentContext(unittest.TestCase):
+    """``SECRET=`` is evidence on its own, so the value needs no vendor prefix."""
+
+    def setUp(self) -> None:
+        self.inspector = OutputInspector()
+
+    def redact(self, value: str) -> str:
+        return self.inspector.inspect("file_read", {"v": value})[0]["v"]
+
+    def test_an_unprefixed_value_redacts_under_an_assignment(self) -> None:
+        self.assertEqual("[REDACTED-SECRET]", self.redact("DEPLOY_TOKEN=hunter2hunter2"))
+
+    def test_every_declaring_suffix_is_recognized(self) -> None:
+        for name in ("APP_KEY", "APP_SECRET", "APP_TOKEN", "APP_PASSWORD", "APP_CREDENTIALS"):
+            with self.subTest(name=name):
+                self.assertEqual("[REDACTED-SECRET]", self.redact(f"{name}=abcdefgh12345678"))
+
+    def test_a_short_value_stays(self) -> None:
+        self.assertEqual("APP_TOKEN=abc", self.redact("APP_TOKEN=abc"))
+
+    def test_a_name_that_declares_nothing_stays(self) -> None:
+        self.assertEqual("LOG_LEVEL=debugging", self.redact("LOG_LEVEL=debugging"))
+
+    def test_a_lowercase_query_parameter_stays(self) -> None:
+        url = "https://docs.company.com/search?token=abcdefghijkl"
+        self.assertEqual(url, self.redact(url))
+
+    def test_the_vendor_prefix_wins_so_the_variable_name_survives(self) -> None:
+        self.assertEqual(
+            "STRIPE_SECRET=[REDACTED-API_KEY]", self.redact("STRIPE_SECRET=" + SK_ + "live_abc123")
+        )
+
+
+class TestSecretRedactionBenignCanaries(unittest.TestCase):
+    """Ordinary text that a widened secret pattern must still leave alone."""
+
+    CANARIES = (
+        "Rotate the " + SK_ + "live key in the Stripe dashboard before Friday.",
+        "The " + SK + "prefix marks an OpenAI secret key; publishable keys use pk_.",
+        "Set STRIPE_SECRET to your " + SK_ + "test_... value from the dashboard.",
+        "export API_KEY=<your-key-here>",
+        "API_KEY=${OPENAI_API_KEY}",
+        SK + "1234",
+        SK_ + "live_x",
+        "ask-me-about-the-risk-free-desk-side-task-based-workflow",
+        "DATABASE_URL=postgres://reports.internal:5432/main",
+        "Primary key column pk_id joins to the tasks table.",
+    )
+
+    def test_no_canary_is_redacted(self) -> None:
+        inspector = OutputInspector()
+        for canary in self.CANARIES:
+            with self.subTest(canary=canary):
+                sanitized, findings = inspector.inspect("file_read", {"v": canary})
+                self.assertEqual(canary, sanitized["v"])
+                self.assertEqual([], findings)
+
+
+class TestMockEnvReadRedaction(unittest.TestCase):
+    def test_all_three_secrets_in_the_mock_env_file_are_redacted(self) -> None:
+        content = _mock_file_content("/home/user/.env")
+        sanitized, findings = OutputInspector().inspect("file_read", {"content": content})
+        redacted = sanitized["content"]
+
+        self.assertEqual(3, len(findings))
+        self.assertIn("[REDACTED-PASSWORD]", redacted)
+        self.assertEqual(2, redacted.count("[REDACTED-API_KEY]"))
+        for line in redacted.splitlines():
+            self.assertIn("REDACTED", line)
+
+    def test_a_second_pass_does_not_redact_the_first_pass_markers(self) -> None:
+        inspector = OutputInspector()
+        once, _ = inspector.inspect("file_read", {"content": _mock_file_content("/home/user/.env")})
+        twice, findings = inspector.inspect("file_read", once)
+        self.assertEqual(once, twice)
         self.assertEqual([], findings)
 
 
