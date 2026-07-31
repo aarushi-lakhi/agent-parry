@@ -40,6 +40,14 @@ Distinct from -32003 because nothing here failed a content scan. The catalogue
 may be perfectly clean; it is simply not the catalogue that was pinned.
 """
 
+TAINT_BLOCK_ERROR_CODE = -32005
+"""Taint-side block: an argument carried a value from an earlier tool result.
+
+Distinct from -32001 because no pattern in this call is suspicious. The evidence
+is a relationship between two calls, so an operator seeing this needs to look at
+the session rather than at the argument.
+"""
+
 TOOLS_CALL_METHOD = "tools/call"
 TOOLS_LIST_METHOD = "tools/list"
 
@@ -186,6 +194,9 @@ class AuditAction(str, Enum):
     BLOCK_RESULT_INJECTION = "BLOCK_RESULT_INJECTION"
     BLOCK_METADATA = "BLOCK_METADATA"
     BLOCK_PIN = "BLOCK_PIN"
+    BLOCK_TAINT = "BLOCK_TAINT"
+    TAINT_FLAG = "TAINT_FLAG"
+    REDACT_TAINT = "REDACT_TAINT"
     NEUTRALIZE_RESULT = "NEUTRALIZE_RESULT"
     REDACT_METADATA = "REDACT_METADATA"
     PIN_CREATED = "PIN_CREATED"
@@ -718,6 +729,7 @@ class ProxyStats(BaseModel):
     metadata_tools_dropped: int = 0
     pin_diffs: int = 0
     terminal_escapes_stripped: int = 0
+    taint_hits: int = 0
 
     def increment(
         self,
@@ -733,6 +745,7 @@ class ProxyStats(BaseModel):
         metadata_tools_dropped: int = 0,
         pin_diffs: int = 0,
         terminal_escapes_stripped: int = 0,
+        taint_hits: int = 0,
     ) -> None:
         """Increment one or more counters by non-negative deltas."""
 
@@ -748,6 +761,7 @@ class ProxyStats(BaseModel):
             "metadata_tools_dropped": metadata_tools_dropped,
             "pin_diffs": pin_diffs,
             "terminal_escapes_stripped": terminal_escapes_stripped,
+            "taint_hits": taint_hits,
         }
 
         for name, delta in deltas.items():
@@ -765,6 +779,7 @@ class ProxyStats(BaseModel):
         self.metadata_tools_dropped += metadata_tools_dropped
         self.pin_diffs += pin_diffs
         self.terminal_escapes_stripped += terminal_escapes_stripped
+        self.taint_hits += taint_hits
 
     def reset(self) -> None:
         """Reset all counters to zero."""
@@ -780,6 +795,7 @@ class ProxyStats(BaseModel):
         self.metadata_tools_dropped = 0
         self.pin_diffs = 0
         self.terminal_escapes_stripped = 0
+        self.taint_hits = 0
 
 
 __all__ = [
@@ -797,6 +813,7 @@ __all__ = [
     "PROXY_PORT",
     "PROXY_URL",
     "RESULT_INJECTION_ERROR_CODE",
+    "TAINT_BLOCK_ERROR_CODE",
     "TOOLS_CALL_METHOD",
     "TOOLS_LIST_METHOD",
     "AttackPayload",

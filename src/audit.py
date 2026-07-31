@@ -510,6 +510,13 @@ def format_console_line(record: AuditRecord, *, arguments: dict[str, Any] | None
         AuditAction.BLOCK_PIN,
     ):
         return f"[PIN]     {record.method or '-':<10} {record.detail}"
+    if record.action in (
+        AuditAction.TAINT_FLAG,
+        AuditAction.REDACT_TAINT,
+        AuditAction.BLOCK_TAINT,
+    ):
+        # detail, never arguments: the argument in a taint hit is by definition the secret.
+        return f"[TAINT]   {tool:<10} {record.detail}"
     args_text = json.dumps(arguments or {}, separators=(", ", ": "), ensure_ascii=True, default=str)
     if record.action is AuditAction.BLOCK_POLICY:
         return f"[BLOCK]   {tool:<10} {args_text}  <- {record.rule or 'policy_block'}"

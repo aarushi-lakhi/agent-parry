@@ -537,6 +537,22 @@ def terminal_strip_observed(result_value: dict[str, Any]) -> str | None:
     return OBSERVED_REDACT
 
 
+def taint_observed(result_value: dict[str, Any]) -> str | None:
+    """Read whether cross-call taint tracking rewrote the outgoing arguments.
+
+    Only an action the client can feel is marked, so a ``flag`` hit is invisible
+    here by design: it records evidence in the audit log and forwards the call
+    unchanged, which is a pass-through however loudly it is logged.
+    """
+    marker = result_value.get(AGENTPARRY_KEY)
+    if not isinstance(marker, dict):
+        return None
+    taint = marker.get("taint")
+    if not isinstance(taint, dict) or taint.get("action") != "redact":
+        return None
+    return OBSERVED_REDACT
+
+
 def observed_from_result(result: AttackResult, *, safe: bool) -> str:
     """Derive what the proxy actually did with one payload.
 
@@ -1974,6 +1990,14 @@ class Scanner:
                     proxy_response=body,
                     observed_behavior=OBSERVED_REDACT,
                     notes="Terminal escapes stripped from result by proxy",
+                )
+            if taint_observed(result_value) == OBSERVED_REDACT:
+                return AttackResult(
+                    payload=payload,
+                    was_redacted=True,
+                    proxy_response=body,
+                    observed_behavior=OBSERVED_REDACT,
+                    notes="Tainted value redacted from the outgoing argument by proxy",
                 )
 
         if isinstance(result_value, str) and "[REDACTED" in result_value:

@@ -94,6 +94,16 @@ what was recorded earlier instead of inspecting the payload on its own.
 trust from the CLI, which is why the group spans both directions.
 """
 
+TAINT_ACTIONS = frozenset(
+    {AuditAction.TAINT_FLAG, AuditAction.REDACT_TAINT, AuditAction.BLOCK_TAINT}
+)
+"""Cross-call taint, reported apart from the single-message inspectors.
+
+A taint record is a verdict on a relationship between two calls, not on the
+message it is attached to, so folding it into the input-side group would put a
+row in the report that no rule and no pattern explains.
+"""
+
 LIFECYCLE_ACTIONS = frozenset({AuditAction.POLICY_RELOAD})
 """Proxy lifecycle, not a verdict on any message.
 
@@ -223,6 +233,9 @@ class LogSummary(BaseModel):
     rules: list[RuleUsage] = Field(default_factory=list)
     fail_open: int = 0
     fail_open_samples: list[str] = Field(default_factory=list)
+    taint: int = 0
+    taint_tools: dict[str, int] = Field(default_factory=dict)
+    taint_samples: list[str] = Field(default_factory=list)
     stdio_require_approval: int = 0
     stdio_require_approval_tools: dict[str, int] = Field(default_factory=dict)
     response_side: ResponseSideCounts = Field(default_factory=ResponseSideCounts)
@@ -470,7 +483,10 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
     runs: set[str] = set()
     fail_open_samples: list[str] = []
     reload_samples: list[str] = []
+    taint_samples: list[str] = []
+    taint_tools: Counter[str] = Counter()
     fail_open = 0
+    taint = 0
     policy_reloads = 0
     stdio_approvals = 0
     policy_decisions = 0
@@ -500,6 +516,13 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
             fail_open += 1
             if len(fail_open_samples) < MAX_SAMPLES:
                 fail_open_samples.append(
+                    f"seq={record.seq} tool={record.tool or '-'} {record.detail or 'no detail'}"
+                )
+        if record.action in TAINT_ACTIONS:
+            taint += 1
+            taint_tools[record.tool or "-"] += 1
+            if len(taint_samples) < MAX_SAMPLES:
+                taint_samples.append(
                     f"seq={record.seq} tool={record.tool or '-'} {record.detail or 'no detail'}"
                 )
         if (
@@ -552,6 +575,9 @@ def summarize(log: AuditLog, *, bucket: str = DEFAULT_BUCKET, top: int = DEFAULT
         rules=usage,
         fail_open=fail_open,
         fail_open_samples=fail_open_samples,
+        taint=taint,
+        taint_tools=dict(taint_tools.most_common(top)),
+        taint_samples=taint_samples,
         stdio_require_approval=stdio_approvals,
         stdio_require_approval_tools=dict(approval_tools.most_common()),
         response_side=response,
@@ -949,6 +975,13 @@ def render_text(report: ReplayReport) -> str:
     for sample in summary.fail_open_samples:
         out.append(f"  {sample}")
     out.append(
+        f"Cross-call taint hits (a value from an earlier result reached an argument): {summary.taint}"
+    )
+    if summary.taint_tools:
+        out.append(f"  {_counter_line(summary.taint_tools)}")
+    for sample in summary.taint_samples:
+        out.append(f"  {sample}")
+    out.append(
         f"REQUIRE_APPROVAL over stdio (logged, allowed, never prompted): {summary.stdio_require_approval}"
     )
     if summary.stdio_require_approval_tools:
@@ -1046,6 +1079,7 @@ __all__ = [
     "POLICY_SCOPE_ACTIONS",
     "RESPONSE_SIDE_ACTIONS",
     "RESULT_ACTIONS",
+    "TAINT_ACTIONS",
     "UNKNOWN",
     "UNPOLICED_INPUT_ACTIONS",
     "VERDICT_ACTION_CHANGED",
