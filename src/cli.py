@@ -1,16 +1,24 @@
-"""AgentParry CLI: wrap, scan, harden, verify, replay, and install helpers."""
+"""AgentParry CLI: quickstart, wrap, scan, harden, verify, replay, pins, and install helpers.
+
+`HELP_OVERVIEW` is the grouped narrative `agentparry --help` prints; the per-command
+listing argparse would generate is suppressed in favor of it.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import ipaddress
 import json
 import os
 import shlex
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +69,8 @@ from src.scanner import (
     OUTCOME_TRUE_BLOCK,
     SAFE_SCAN_HEADER,
     Scanner,
+    compute_confusion_matrix,
+    format_rate,
     is_attack_payload,
     result_outcome,
     save_scan_outputs,
@@ -645,6 +655,158 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     try:
         return asyncio.run(_cmd_verify_live(args, before))
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+
+
+QUICKSTART_MAX_GAPS = 5
+QUICKSTART_HEALTH_TIMEOUT = 20.0
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+async def _wait_for_health(url: str, timeout: float) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while loop.time() < deadline:
+            try:
+                if (await client.get(url)).status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(0.25)
+    return False
+
+
+@contextlib.asynccontextmanager
+async def _local_proxy(command: str, policy: str) -> AsyncIterator[str]:
+    """Run an AgentParry HTTP proxy in front of `command` for the life of the block.
+
+    AGENTPARRY_UPSTREAM_URL is dropped from the child environment: the proxy
+    returns 503 when both upstream settings are present, and the caller's shell
+    may already carry one.
+    """
+    port = _free_port()
+    env = {k: v for k, v in os.environ.items() if k != "AGENTPARRY_UPSTREAM_URL"}
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "src.proxy",
+            "--upstream-command", command,
+            "--policy", policy,
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--log-level", "warning",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    try:
+        if not await _wait_for_health(f"http://127.0.0.1:{port}/health", QUICKSTART_HEALTH_TIMEOUT):
+            raise SystemExit(f"error: the proxy did not come up on port {port}; nothing was scanned")
+        yield f"http://127.0.0.1:{port}/mcp"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def quickstart_verdict(report: ScanReport) -> list[str]:
+    """Three numbers and the payloads still getting through, in reading order."""
+    matrix = report.matrix or compute_confusion_matrix(report.results, safe=report.safe_mode)
+    gaps = [
+        r.payload.id
+        for r in report.results
+        if result_outcome(r, safe=report.safe_mode) == OUTCOME_FALSE_NEGATIVE
+    ]
+    lines = [
+        f"Attacks stopped:      {matrix.true_block}/{matrix.attack_total}"
+        f" (detection {format_rate(matrix.detection_rate)})",
+        f"Benign calls allowed: {matrix.true_allow}/{matrix.benign_total}"
+        f" (over-block {format_rate(matrix.false_positive_rate)})",
+    ]
+    if not gaps:
+        lines.append("Nothing got through.")
+        return lines
+    shown = ", ".join(gaps[:QUICKSTART_MAX_GAPS])
+    more = f" and {len(gaps) - QUICKSTART_MAX_GAPS} more" if len(gaps) > QUICKSTART_MAX_GAPS else ""
+    lines.append(f"Still getting through: {len(gaps)} payload(s): {shown}{more}")
+    return lines
+
+
+def _quickstart_next_steps(target: str, command: str | None) -> list[str]:
+    """What to run next, as intent-then-command pairs.
+
+    A `--command` run scanned a throwaway proxy on a port that is already gone,
+    so it must not hand back a `--target` for it.
+    """
+    steps: list[str] = []
+    if command:
+        steps += [
+            "  Keep a proxy in front of that server for real traffic:",
+            f'    agentparry wrap --command "{command}"',
+            "  Or register it with your MCP client:",
+            f'    agentparry install-claude --server-name my-server --command "{command}"',
+        ]
+    else:
+        steps += [
+            "  Write rules for what got through, then re-scan:",
+            f"    agentparry harden --target {target} --safe --yes",
+        ]
+    steps += [
+        "  Read back what the proxy decided:",
+        "    agentparry replay",
+    ]
+    return steps
+
+
+async def _cmd_quickstart_live(args: argparse.Namespace, policy: str) -> int:
+    scanner = Scanner(payloads_path=resolve_payloads(args.payloads).path)
+
+    async def _scan(target: str) -> ScanReport:
+        print(f"[2/3] Safe scan of {target}: policy is evaluated, no call is forwarded upstream")
+        await _probe_target(target, safe=True)
+        return await scanner.run_scan(proxy_url=target, discover=True, safe=True)
+
+    if args.command:
+        print(f"[1/3] Starting an AgentParry proxy in front of: {args.command}")
+        async with _local_proxy(args.command, policy) as target:
+            report = await _scan(target)
+    else:
+        target = args.target
+        print(f"[1/3] Using the proxy already running at {target}")
+        report = await _scan(target)
+
+    print()
+    print("[3/3] Verdict")
+    for line in quickstart_verdict(report):
+        print(f"  {line}")
+    print()
+    print(f"Policy: {policy}")
+    print("Next:")
+    for line in _quickstart_next_steps(target, args.command):
+        print(line)
+    return EXIT_OK
+
+
+def cmd_quickstart(args: argparse.Namespace) -> int:
+    """Scan one server in safe mode and say what to do next.
+
+    Always safe mode, and always exit 0 on a finding: this is the introduction,
+    and `harden`, `verify` and `lint-policy` are the commands that gate.
+    """
+    if bool(args.command) == bool(args.target):
+        raise SystemExit("error: pass exactly one of --command or --target")
+    policy = str(resolve_policy(args.policy).path)
+    try:
+        return asyncio.run(_cmd_quickstart_live(args, policy))
     except KeyboardInterrupt:
         return EXIT_INTERRUPTED
 
@@ -1275,17 +1437,80 @@ def _add_verify_scope_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+HELP_OVERVIEW = f"""AgentParry: a security layer for MCP tool traffic. Three verbs, in this order.
+
+  START HERE
+    quickstart           safe-scan one server and say what to do next
+
+  SCAN, find what a server lets through
+    scan                 fire the attack payloads at a proxy, or re-print a saved report
+    lint-policy          predict which policy rules over-block, offline
+
+  PROTECT, put a policy in front of live traffic
+    wrap                 run the stdio proxy around an MCP server command
+    install-claude       register a wrapped server in Claude Desktop
+    install-claude-code  register a wrapped server in Claude Code
+    install-openclaw     register AgentParry in an OpenClaw gateway
+    pins                 review and accept the tool metadata a server advertises
+
+  VERIFY, prove the rules closed the gap
+    harden               scan, merge the generated rules into the policy, re-scan
+    verify               re-scan and compare against a saved pre-hardening scan
+    replay               re-read the audit log and replay its decisions against a policy
+
+`agentparry <command> --help` carries the flags, the exit codes and examples.
+No command needs a particular working directory. The policy default is
+{POLICY_DEFAULT_HELP};
+payloads resolve the same way from AGENTPARRY_PAYLOADS.
+"""
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentparry",
-        description="AgentParry: scan, protect, and verify AI agent MCP traffic.",
+        usage="agentparry <command> [options]",
+        description=HELP_OVERVIEW,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="<command>",
+        help=argparse.SUPPRESS,
+        prog="agentparry",
+    )
+
+    p_quick = sub.add_parser(
+        "quickstart",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Runs one safe scan and prints a verdict. --command starts a throwaway AgentParry\n"
+            "proxy in front of that server on a free local port and tears it down afterwards;\n"
+            "--target scans a proxy you already have running.\n"
+            "Safe mode always: policy is evaluated and no tool call reaches the server, so this\n"
+            "is safe to point at a production MCP server. Always exits 0 on a finding; harden,\n"
+            "verify and lint-policy are the commands that gate.\n"
+            "Examples:\n"
+            '  agentparry quickstart --command "npx some-mcp-server"\n'
+            "  agentparry quickstart --target http://localhost:9090/mcp\n"
+        ),
+    )
+    p_quick.add_argument("--command", default=None, help="MCP server command line to wrap and scan")
+    p_quick.add_argument("--target", default=None, metavar="URL", help="Proxy JSON-RPC URL to scan")
+    p_quick.add_argument(
+        "--policy",
+        default=None,
+        help=f"Policy YAML (default: {POLICY_DEFAULT_HELP})",
+    )
+    p_quick.add_argument(
+        "--payloads",
+        default=None,
+        help=f"Attack payloads YAML (default: {PAYLOADS_DEFAULT_HELP})",
+    )
+    p_quick.set_defaults(handler=cmd_quickstart)
 
     p_wrap = sub.add_parser(
         "wrap",
-        help="Run the stdio MCP proxy around a server command",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
@@ -1330,7 +1555,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_scan = sub.add_parser(
         "scan",
-        help="Run attack payloads against a proxy or re-print a saved report",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -1383,7 +1607,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_harden = sub.add_parser(
         "harden",
-        help="Scan, merge generated rules into the policy, then re-scan to verify",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Additive: existing autogen_ rules are kept, same-named ones replaced, handwritten\n"
@@ -1446,7 +1669,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_verify = sub.add_parser(
         "verify",
-        help="Re-scan a target and compare it against a saved pre-hardening scan",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "--before is required: a baseline taken now would already include the new rules.\n"
@@ -1482,7 +1704,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_replay = sub.add_parser(
         "replay",
-        help="Re-read a recorded audit log and replay its decisions against a policy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Reads the JSONL audit log written by both proxies. Always reports dead rules,\n"
@@ -1568,7 +1789,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_lint = sub.add_parser(
         "lint-policy",
-        help="Predict which policy rules over-block, statically and against the benign corpus",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Offline: no proxy, no network. Static checks read each rule's regexes; the empirical\n"
@@ -1621,7 +1841,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_pins = sub.add_parser(
         "pins",
-        help="Inspect and accept the pinned tool metadata of wrapped MCP servers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "A pin records what a server advertised the first time it was seen, so a description\n"
@@ -1680,7 +1899,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_claude = sub.add_parser(
         "install-claude",
-        help="Wrap an MCP server in Claude Desktop config via AgentParry stdio proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Resolves claude_desktop_config.json per OS, backs up to .bak, and rewrites or adds mcpServers entry.\n"
@@ -1707,7 +1925,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_code = sub.add_parser(
         "install-claude-code",
-        help="Wrap an MCP server in Claude Code config via AgentParry stdio proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Scopes: project writes ./.mcp.json, local writes projects[cwd].mcpServers in\n"
@@ -1747,7 +1964,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_open = sub.add_parser(
         "install-openclaw",
-        help="Add AgentParry to OpenClaw ~/.openclaw/openclaw.json",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Default: HTTP server at url with transport streamable-http.\n"

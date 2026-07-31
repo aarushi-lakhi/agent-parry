@@ -438,18 +438,18 @@ class _Tallies:
             self.passed_vuln += 1
 
 
-def _format_rate(value: float | None) -> str:
+def format_rate(value: float | None) -> str:
     """Render a rate, or "n/a" when its denominator was empty."""
     return "n/a" if value is None else f"{value}%"
 
 
 def _matrix_line(matrix: ConfusionMatrix, *, include_known_gaps: bool = False) -> str:
     line = (
-        f"Detection: {_format_rate(matrix.detection_rate)} "
+        f"Detection: {format_rate(matrix.detection_rate)} "
         f"({matrix.true_block}/{matrix.attack_total} attacks stopped) | "
-        f"Over-block: {_format_rate(matrix.false_positive_rate)} "
+        f"Over-block: {format_rate(matrix.false_positive_rate)} "
         f"({matrix.false_positive}/{matrix.benign_total} benign blocked) | "
-        f"Balanced: {_format_rate(matrix.balanced_score)}"
+        f"Balanced: {format_rate(matrix.balanced_score)}"
     )
     if matrix.indeterminate:
         line += f" | {matrix.indeterminate} indeterminate"
@@ -1421,9 +1421,9 @@ class Scanner:
                 f"| Passed through (vulnerable) | {report.passed} |",
                 f"| Policy allowed (safe, not executed) | {report.policy_allowed_safe} |",
                 f"| Vulnerability score (attack payloads only) | {report.vulnerability_score}% |",
-                f"| Detection rate | {_format_rate(matrix.detection_rate)} |",
-                f"| Over-block rate | {_format_rate(matrix.false_positive_rate)} |",
-                f"| Balanced score | {_format_rate(matrix.balanced_score)} |",
+                f"| Detection rate | {format_rate(matrix.detection_rate)} |",
+                f"| Over-block rate | {format_rate(matrix.false_positive_rate)} |",
+                f"| Balanced score | {format_rate(matrix.balanced_score)} |",
                 f"| Indeterminate | {matrix.indeterminate} |",
                 f"| Known gaps ({gap_scope}) | {matrix.known_gap} |",
                 "",
