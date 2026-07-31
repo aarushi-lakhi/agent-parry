@@ -25,7 +25,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from src.models import Finding, MetadataInspection, ResultInspection
+from src.models import Finding, MetadataInspection, ResultInspection, TerminalSanitization
 from src.normalize import (
     Normalizer,
     TextView,
@@ -35,6 +35,7 @@ from src.normalize import (
     iter_base64_runs,
     view_priority,
 )
+from src.terminal import DANGEROUS_ESCAPE_RE, SGR_STYLE_RE, strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,28 @@ INJECTION_PATTERNS: tuple[InjectionPattern, ...] = (
         "high",
         "Reference to a credential or sensitive system file",
     ),
+    InjectionPattern(
+        DANGEROUS_ESCAPE_RE,
+        "critical",
+        "Terminal escape sequence that erases, moves, hides or relabels",
+    ),
+    InjectionPattern(
+        SGR_STYLE_RE,
+        "medium",
+        "Terminal colour or style sequence",
+    ),
 )
+"""Shared signatures. The two terminal entries are split by what a sequence does.
+
+Critical, so the input side refuses the call: nothing an MCP client legitimately
+puts in a tool argument needs to erase the screen, reposition the cursor, switch
+to the alternate screen, conceal text or rewrite the window title, and unlike an
+injection phrase there is no ambiguity about whether the value is one.
+
+Colour and style stay medium. An argument carrying them is anomalous rather than
+dangerous, and a shell command printing colour is something a developer really
+does write; blocking that would be the false positive with no attack behind it.
+"""
 
 
 StringLeaf = tuple[str, Any, Any, str]
@@ -441,6 +463,41 @@ Leaf = tuple[str, Any, Any]
 """One scannable string leaf as (path, container, key), so it can be rewritten."""
 
 
+def result_leaves(result: dict[str, Any]) -> list[Leaf]:
+    """Collect every model-readable string leaf of an MCP result.
+
+    Both result-side passes walk it, so the injection scan and the terminal strip
+    cannot disagree about which leaves exist. Both MCP result shapes are covered:
+    a ``content`` array of blocks, and the flat object a simpler server returns.
+
+    Skipped on purpose: base64 image and audio ``data``, resource ``blob``,
+    content-block metadata such as ``uri`` and ``mimeType``, and our own
+    ``_agentparry`` key. None of those is prose a model reads, and running regexes
+    over megabytes of base64 is pure cost.
+    """
+    leaves: list[Leaf] = []
+    content = result.get("content")
+    if isinstance(content, list):
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if isinstance(block_type, str) and block_type.lower() in _CONTENT_BLOCK_SKIP_TYPES:
+                continue
+            if isinstance(block.get("text"), str):
+                leaves.append((f"result.content[{index}].text", block, "text"))
+            resource = block.get("resource")
+            if isinstance(resource, dict) and isinstance(resource.get("text"), str):
+                leaves.append((f"result.content[{index}].resource.text", resource, "text"))
+        structured = result.get("structuredContent")
+        if isinstance(structured, str):
+            leaves.append(("result.structuredContent", result, "structuredContent"))
+        elif structured is not None:
+            leaves.extend(_walk_strings(structured, "result.structuredContent"))
+        return leaves
+    return list(_walk_strings(result, "result"))
+
+
 def code_regions(text: str) -> list[tuple[int, int]]:
     """Return spans covering fenced code blocks and inline code spans."""
     if "`" not in text and "~" not in text:
@@ -750,34 +807,134 @@ class ResultInspector:
         return list(best.values())
 
     def _leaves(self, result: dict[str, Any]) -> list[Leaf]:
-        """Collect every model-readable string leaf of an MCP result.
+        return result_leaves(result)
 
-        Skipped on purpose: base64 image and audio ``data``, resource ``blob``,
-        content-block metadata such as ``uri`` and ``mimeType``, and our own
-        ``_agentparry`` key. None of those is prose a model reads, and running
-        regexes over megabytes of base64 is pure cost.
-        """
-        leaves: list[Leaf] = []
-        content = result.get("content")
-        if isinstance(content, list):
-            for index, block in enumerate(content):
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                if isinstance(block_type, str) and block_type.lower() in _CONTENT_BLOCK_SKIP_TYPES:
-                    continue
-                if isinstance(block.get("text"), str):
-                    leaves.append((f"result.content[{index}].text", block, "text"))
-                resource = block.get("resource")
-                if isinstance(resource, dict) and isinstance(resource.get("text"), str):
-                    leaves.append((f"result.content[{index}].resource.text", resource, "text"))
-            structured = result.get("structuredContent")
-            if isinstance(structured, str):
-                leaves.append(("result.structuredContent", result, "structuredContent"))
-            elif structured is not None:
-                leaves.extend(_walk_strings(structured, "result.structuredContent"))
-            return leaves
-        return list(_walk_strings(result, "result"))
+
+class TerminalSanitizerSettings(BaseModel):
+    """What to do about terminal escape sequences found in a tool result."""
+
+    enabled: bool = True
+    action: Literal["off", "annotate", "strip"] = "strip"
+    exempt_tools: list[str] = Field(default_factory=list)
+    max_leaf_chars: int = Field(default=MAX_RESULT_LEAF_CHARS, gt=0)
+
+
+class TerminalSanitizer:
+    """Remove terminal escape sequences from a tool result before the client sees it.
+
+    Stripping is the default, and this is the one result-side action that does not
+    need a threshold or a fence to justify itself. A prompt-injection pattern
+    cannot tell an instruction from a quotation, so acting on it costs something
+    when it is wrong; an escape sequence either is one or is not, and there is no
+    reading of an MCP tool result under which the client's terminal is supposed to
+    clear its own scrollback, hide the next twenty characters, or rename its
+    window on the server's behalf.
+
+    What that does cost: colour. A tool that returns coloured output loses the
+    colour, because a proxy cannot tell ``ESC[31m`` used to highlight an error
+    from ``ESC[8m`` used to hide a command, and refusing to strip SGR would leave
+    the conceal attribute in place. Cursor-addressed output, a progress bar
+    redrawing itself or a curses-style table, flattens to the characters it wrote
+    without the positioning, so it reads as a run-together line rather than a
+    grid. Both are legibility losses in text the model reads as data anyway. Set
+    ``action: annotate`` to record findings and change nothing, or exempt the tool.
+
+    Run this before :class:`ResultInspector`, so the injection scan reads the text
+    a human would actually see rather than a version with a screen-clear still in
+    it.
+    """
+
+    def __init__(self, settings: TerminalSanitizerSettings | None = None) -> None:
+        """Build a sanitizer, defaulting to stripping every escape sequence."""
+        self._settings = settings or TerminalSanitizerSettings()
+        self._exempt = frozenset(self._settings.exempt_tools)
+
+    @classmethod
+    def from_policy_settings(cls, settings: Any, **kwargs: Any) -> TerminalSanitizer:
+        """Build from the ``settings.terminal_sanitization`` block of a policy file."""
+        raw = settings.get("terminal_sanitization") if isinstance(settings, dict) else None
+        if not isinstance(raw, dict):
+            return cls(**kwargs)
+        overrides = {
+            key: value for key, value in raw.items() if key in TerminalSanitizerSettings.model_fields
+        }
+        try:
+            parsed = TerminalSanitizerSettings(**overrides)
+        except ValidationError:
+            logger.exception("Invalid settings.terminal_sanitization block, using defaults")
+            parsed = TerminalSanitizerSettings()
+        return cls(settings=parsed, **kwargs)
+
+    @property
+    def settings(self) -> TerminalSanitizerSettings:
+        """Return the settings this sanitizer was built with."""
+        return self._settings
+
+    def sanitize(self, tool_name: str, result: dict[str, Any]) -> TerminalSanitization:
+        """Strip escape sequences from every string leaf of one ``tools/call`` result."""
+        if not self._settings.enabled or self._settings.action == "off" or tool_name in self._exempt:
+            return TerminalSanitization(result=result)
+
+        payload = copy.deepcopy(result)
+        findings: list[Finding] = []
+        fields: list[str] = []
+        removed = 0
+
+        for path, container, key in result_leaves(payload):
+            text = container[key]
+            if len(text) > self._settings.max_leaf_chars:
+                logger.info(
+                    "Skipping oversized result leaf for terminal sanitization tool=%s field=%s chars=%s",
+                    tool_name,
+                    path,
+                    len(text),
+                )
+                continue
+            stripped, count = strip_terminal_escapes(text)
+            if not count:
+                continue
+            findings.append(self._finding(tool_name, path, text, count))
+            fields.append(path)
+            removed += count
+            if self._settings.action == "strip":
+                container[key] = stripped
+
+        if not findings:
+            return TerminalSanitization(result=payload)
+
+        action = self._settings.action
+        self._annotate(payload, action, removed, fields)
+        return TerminalSanitization(
+            result=payload,
+            findings=findings,
+            action=action,
+            escapes_removed=removed,
+            fields=fields,
+        )
+
+    @staticmethod
+    def _finding(tool_name: str, path: str, text: str, count: int) -> Finding:
+        """Describe one leaf that carried escapes, without quoting any of them."""
+        dangerous = DANGEROUS_ESCAPE_RE.search(text) is not None
+        kind = "control" if dangerous else "colour or style"
+        return Finding(
+            severity="high" if dangerous else "low",
+            description=f"Terminal {kind} sequences in {tool_name} result ({count} removed)",
+            field=path,
+            matched_pattern="terminal escape sequences",
+        )
+
+    @staticmethod
+    def _annotate(payload: dict[str, Any], action: str, removed: int, fields: list[str]) -> None:
+        """Record what was removed under our own key, merging with what is there."""
+        existing = payload.get(AGENTPARRY_KEY)
+        meta = dict(existing) if isinstance(existing, dict) else {}
+        meta["terminal_escapes"] = {
+            "action": action,
+            "escapes_removed": removed,
+            "fields": list(fields),
+        }
+        payload[AGENTPARRY_KEY] = meta
 
 
 MAX_METADATA_LEAF_CHARS = 20_000
