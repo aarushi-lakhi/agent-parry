@@ -294,6 +294,22 @@ class ResultInspection(BaseModel):
     block_message: str = ""
 
 
+class TerminalSanitization(BaseModel):
+    """Outcome of removing terminal escape sequences from one tool result.
+
+    ``action`` is what was actually done. ``escapes_removed`` counts sequences and
+    stray control bytes, not leaves, and no field carries the removed text: an
+    escape sequence quoted back into a log line or a report is the same attack
+    against whatever renders that.
+    """
+
+    result: dict[str, Any] = Field(default_factory=dict)
+    findings: list[Finding] = Field(default_factory=list)
+    action: Literal["none", "annotate", "strip"] = "none"
+    escapes_removed: int = 0
+    fields: list[str] = Field(default_factory=list)
+
+
 class MetadataInspection(BaseModel):
     """Outcome of scanning a ``tools/list`` or ``initialize`` result for poisoning.
 
@@ -655,6 +671,7 @@ class ProxyStats(BaseModel):
     metadata_injections: int = 0
     metadata_tools_dropped: int = 0
     pin_diffs: int = 0
+    terminal_escapes_stripped: int = 0
 
     def increment(
         self,
@@ -669,6 +686,7 @@ class ProxyStats(BaseModel):
         metadata_injections: int = 0,
         metadata_tools_dropped: int = 0,
         pin_diffs: int = 0,
+        terminal_escapes_stripped: int = 0,
     ) -> None:
         """Increment one or more counters by non-negative deltas."""
 
@@ -683,6 +701,7 @@ class ProxyStats(BaseModel):
             "metadata_injections": metadata_injections,
             "metadata_tools_dropped": metadata_tools_dropped,
             "pin_diffs": pin_diffs,
+            "terminal_escapes_stripped": terminal_escapes_stripped,
         }
 
         for name, delta in deltas.items():
@@ -699,6 +718,7 @@ class ProxyStats(BaseModel):
         self.metadata_injections += metadata_injections
         self.metadata_tools_dropped += metadata_tools_dropped
         self.pin_diffs += pin_diffs
+        self.terminal_escapes_stripped += terminal_escapes_stripped
 
     def reset(self) -> None:
         """Reset all counters to zero."""
@@ -713,6 +733,7 @@ class ProxyStats(BaseModel):
         self.metadata_injections = 0
         self.metadata_tools_dropped = 0
         self.pin_diffs = 0
+        self.terminal_escapes_stripped = 0
 
 
 __all__ = [
@@ -757,6 +778,7 @@ __all__ = [
     "ResultInspection",
     "ScanReport",
     "ServerPin",
+    "TerminalSanitization",
     "ToolPin",
     "is_known_mcp_method",
     "is_tools_call",
