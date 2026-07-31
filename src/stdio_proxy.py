@@ -37,6 +37,7 @@ from src.models import (
     PIN_BLOCK_ERROR_CODE,
     RESULT_INJECTION_ERROR_CODE,
     TOOLS_CALL_METHOD,
+    TOOLS_LIST_METHOD,
     AuditAction,
     AuditDirection,
     AuditTransport,
@@ -344,6 +345,7 @@ class StdioMcpProxy:
         self._audit = audit
         self._pending_forwarded: dict[Any, str] = {}
         self._pending_tools: dict[Any, str] = {}
+        self._pending_params: dict[Any, dict[str, Any]] = {}
 
     @property
     def rule_count(self) -> int:
@@ -446,6 +448,9 @@ class StdioMcpProxy:
             if req_id is not None:
                 m = method if isinstance(method, str) else "unknown"
                 self._pending_forwarded[req_id] = m
+                if m == TOOLS_LIST_METHOD:
+                    request_params = msg.get("params")
+                    self._pending_params[req_id] = request_params if isinstance(request_params, dict) else {}
             if isinstance(method, str) and not is_known_mcp_method(method):
                 logger.warning("Forwarding unknown MCP method without inspection method=%s", method)
                 self._record(
@@ -651,8 +656,10 @@ class StdioMcpProxy:
         is_request = isinstance(msg.get("method"), str)
 
         pending_method: str | None = None
+        pending_params: dict[str, Any] | None = None
         if rid is not None and not is_request:
             pending_method = self._pending_forwarded.pop(rid, None)
+            pending_params = self._pending_params.pop(rid, None)
 
         if rid is not None and not is_request and rid in self._pending_tools:
             tool_name = self._pending_tools.pop(rid)
@@ -765,7 +772,7 @@ class StdioMcpProxy:
             return msg
 
         if pending_method in METADATA_METHODS and msg.get("error") is None:
-            return await self._inspect_metadata(msg, rid, pending_method)
+            return await self._inspect_metadata(msg, rid, pending_method, pending_params)
 
         if is_request:
             method = msg.get("method")
@@ -786,7 +793,9 @@ class StdioMcpProxy:
 
         return msg
 
-    async def _inspect_metadata(self, msg: dict[str, Any], rid: Any, method: str) -> dict[str, Any]:
+    async def _inspect_metadata(
+        self, msg: dict[str, Any], rid: Any, method: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Scan a discovery response for poisoned metadata, failing open on error.
 
         The scan runs on a worker thread: a deeply nested inputSchema walked on
@@ -836,7 +845,7 @@ class StdioMcpProxy:
             self._record(AuditAction.ALLOW, detail="discovery metadata inspected, no findings", **inbound)
             findings = []
 
-        observation = await self._observe_pin(method, result, findings, inbound)
+        observation = await self._observe_pin(method, result, findings, inbound, params)
 
         if inspection is not None and inspection.blocked:
             return {
@@ -868,6 +877,7 @@ class StdioMcpProxy:
         result: dict[str, Any],
         findings: list[Finding],
         inbound: dict[str, Any],
+        params: dict[str, Any] | None = None,
     ) -> PinObservation:
         """Diff the raw discovery result against the pin on disk, failing open.
 
@@ -875,10 +885,14 @@ class StdioMcpProxy:
         rewrote would diff on every run, and would pin poison it had already
         removed as if it were clean. The check touches the filesystem, so it runs
         on a worker thread like the scan above it.
+
+        ``params`` is the request this result answers, which is what tells the
+        pinner whether a ``tools/list`` page starts a cursor walk or continues one.
         """
         logger = logging.getLogger(__name__)
+        observe = functools.partial(self._tool_pinner.observe, params=params)
         try:
-            observation = await asyncio.to_thread(self._tool_pinner.observe, method, result, findings)
+            observation = await asyncio.to_thread(observe, method, result, findings)
         except Exception as exc:
             logger.exception("Tool-list pin check failed for %s; forwarding raw (fail-open)", method)
             self._record(
@@ -1293,6 +1307,7 @@ async def _run_proxy(argv: list[str]) -> int:
 
     proxy._pending_forwarded.clear()
     proxy._pending_tools.clear()
+    proxy._pending_params.clear()
 
     try:
         await asyncio.wait_for(stderr_task, timeout=2.0)
