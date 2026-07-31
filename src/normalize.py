@@ -42,6 +42,13 @@ MIN_OPAQUE_BLOB = 40
 
 VIEW_ORIGINAL = "original"
 VIEW_CANONICAL = "canonical"
+VIEW_DECODED_PERCENT = "decoded:percent"
+"""Name of the percent-decoded view, for callers that want only that decoder.
+
+Percent-encoding is the one encoding an ordinary path or URL really carries, so a
+consumer that would be confused by the plaintext behind a base64 run (a path
+check, for one) can select this view by name instead of turning decoding off.
+"""
 
 _VIEW_PRIORITY = {VIEW_ORIGINAL: 0, VIEW_CANONICAL: 1}
 
@@ -641,6 +648,7 @@ __all__ = [
     "MIN_HEX_FRAGMENT",
     "MIN_OPAQUE_BLOB",
     "VIEW_CANONICAL",
+    "VIEW_DECODED_PERCENT",
     "VIEW_ORIGINAL",
     "Normalizer",
     "NormalizerSettings",

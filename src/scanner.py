@@ -29,6 +29,7 @@ from src.models import (
     Finding,
     ScanReport,
 )
+from src.terminal import CONTROL_CHARS_RE
 
 console = Console()
 
@@ -66,7 +67,7 @@ OUTCOME_ORDER: dict[str, int] = {
     OUTCOME_TRUE_ALLOW: 4,
 }
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_CHARS = CONTROL_CHARS_RE
 
 _OUTPUT_SIDE_ACTIONS = frozenset({OBSERVED_NEUTRALIZE, OBSERVED_REDACT, OBSERVED_BLOCK})
 """Observations that count as acting on a tool result.
@@ -290,6 +291,22 @@ def result_injection_observed(result_value: dict[str, Any]) -> str | None:
     if not isinstance(injection, dict):
         return None
     return _RESULT_INJECTION_OBSERVED.get(str(injection.get("action") or ""))
+
+
+def terminal_strip_observed(result_value: dict[str, Any]) -> str | None:
+    """Read whether terminal escapes were stripped from a result, from our own marker.
+
+    Stripping removes the matched spans and leaves the rest of the output in
+    place, so it scores as a redaction. ``annotate`` returns None: findings were
+    recorded and the text the client renders still carries the escapes.
+    """
+    marker = result_value.get(AGENTPARRY_KEY)
+    if not isinstance(marker, dict):
+        return None
+    stripped = marker.get("terminal_escapes")
+    if not isinstance(stripped, dict) or stripped.get("action") != "strip":
+        return None
+    return OBSERVED_REDACT
 
 
 def observed_from_result(result: AttackResult, *, safe: bool) -> str:
@@ -1627,6 +1644,14 @@ class Scanner:
                     proxy_response=body,
                     observed_behavior=OBSERVED_REDACT,
                     notes="Injected result redacted by proxy",
+                )
+            if terminal_strip_observed(result_value) == OBSERVED_REDACT:
+                return AttackResult(
+                    payload=payload,
+                    was_redacted=True,
+                    proxy_response=body,
+                    observed_behavior=OBSERVED_REDACT,
+                    notes="Terminal escapes stripped from result by proxy",
                 )
 
         if isinstance(result_value, str) and "[REDACTED" in result_value:

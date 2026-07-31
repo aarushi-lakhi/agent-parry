@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import logging
+import posixpath
 import re
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -17,6 +18,8 @@ from pydantic import ValidationError
 
 from src.models import Finding, PolicyAction, PolicyDecision
 from src.normalize import (
+    VIEW_CANONICAL,
+    VIEW_DECODED_PERCENT,
     VIEW_ORIGINAL,
     Normalizer,
     NormalizerSettings,
@@ -29,12 +32,103 @@ logger = logging.getLogger(__name__)
 _SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
 _TOKEN_SPLIT_RE = re.compile(r"[,;\s]+")
 
-_NORMALIZABLE_TYPES = frozenset({"pattern_match", "pii_detection"})
+_NORMALIZABLE_TYPES = frozenset({"pattern_match", "pii_detection", "path_containment"})
+
+_PATH_VIEW_NAMES = frozenset({VIEW_ORIGINAL, VIEW_CANONICAL, VIEW_DECODED_PERCENT})
+"""Views a path is folded in. Base64 and hex plaintext is deliberately excluded.
+
+A long filename that happens to sit in the base64 alphabet decodes to bytes that
+are not a path at all, and treating that as one more spelling of the argument
+turns an ordinary read into a block.
+"""
+
+_REPEATED_SEP_RE = re.compile(r"/{2,}")
+
+_PATH_NORMALIZER: Normalizer | None = None
+
+_PATH_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+"""Control characters in a path. Same class ``src.scanner._md_cell`` strips.
+
+A NUL is the classic truncation trick and nothing else in this class belongs in a
+filename, so their presence makes the value unusable rather than comparable.
+"""
 
 ViewFlags = tuple[bool, bool]
 """Resolved (canonical, decoded) view switches for one condition."""
 
 _NO_VIEWS: ViewFlags = (False, False)
+
+
+def fold_path(text: str) -> str:
+    """Collapse one spelling of a path to a comparable lexical form.
+
+    Purely lexical, and deliberately so. ``Path.resolve()`` would read the
+    filesystem and follow symlinks, which is wrong here for three reasons: the
+    proxy and the MCP server need not share a filesystem at all, so resolving
+    against the proxy's would answer a question about the wrong machine; a
+    relative path would be anchored to the proxy's working directory, which the
+    server never sees; and resolving before the call and reading after it is a
+    TOCTOU window an attacker can win by swapping a symlink in between. A lexical
+    fold has none of that and is identical on both hosts.
+
+    Separators are unified first, because an MCP server on Windows accepts both,
+    then repeated separators collapse, then ``..`` is folded away by
+    ``posixpath.normpath``. The result is casefolded: the server's filesystem may
+    be case-insensitive, and comparing case-sensitively there would let
+    ``/ETC/shadow`` past a rule that names ``/etc``.
+
+    Returns ``""`` for a value with nothing usable in it, including one carrying a
+    control character, which callers must treat as failing every check rather
+    than passing them.
+    """
+    candidate = text.strip().replace("\\", "/")
+    if not candidate or _PATH_CONTROL_RE.search(candidate):
+        return ""
+    folded = posixpath.normpath(_REPEATED_SEP_RE.sub("/", candidate))
+    if folded == ".":
+        return ""
+    return folded.casefold()
+
+
+def folded_path_candidates(text: str) -> list[str]:
+    """Every distinct folded spelling of one path value, across the views policy checks.
+
+    The same view set a ``path_containment`` condition evaluates, exposed for
+    callers that need the folded forms without a rule to evaluate them against,
+    such as rule generation deciding what a payload was reaching for.
+    """
+    global _PATH_NORMALIZER
+    if _PATH_NORMALIZER is None:
+        _PATH_NORMALIZER = Normalizer(NormalizerSettings(canonical=True, decoded=True))
+    folded: list[str] = []
+    for view in _PATH_NORMALIZER.views(text):
+        if view.name not in _PATH_VIEW_NAMES:
+            continue
+        candidate = fold_path(view.text)
+        if candidate and candidate not in folded:
+            folded.append(candidate)
+    return folded
+
+
+def path_segments(folded: str) -> tuple[str, ...]:
+    """Split an already-folded path into its non-empty segments."""
+    return tuple(segment for segment in folded.split("/") if segment and segment != ".")
+
+
+def path_escapes_upward(folded: str) -> bool:
+    """Report whether a folded path still climbs above wherever it started.
+
+    A surviving leading ``..`` is the one traversal signal that needs no
+    configuration: no allowed root can contain it, whatever the root is.
+    """
+    return folded == ".." or folded.startswith("../")
+
+
+def path_within(folded: str, root: str) -> bool:
+    """Report whether a folded path is the given folded root or sits under it."""
+    if folded == root:
+        return True
+    return folded.startswith(f"{root.rstrip('/')}/")
 
 
 @dataclass(slots=True)
@@ -49,6 +143,8 @@ class Condition:
     subdomain_domains: set[str] = dc_field(default_factory=set)
     compiled_patterns: list[re.Pattern[str]] = dc_field(default_factory=list)
     normalize: ViewFlags = _NO_VIEWS
+    allowed_roots: list[str] | None = None
+    denied_paths: list[str] = dc_field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -390,6 +486,9 @@ class PolicyEngine:
                 subdomain_domains=subdomain_domains,
             )
 
+        if cond_type == "path_containment":
+            return self._parse_path_containment(raw_condition, rule_name, cond_index, views)
+
         if cond_type == "pii_detection":
             raw_patterns = raw_condition.get("patterns")
             if not isinstance(raw_patterns, list):
@@ -411,6 +510,65 @@ class PolicyEngine:
             cond_type,
         )
         return None
+
+    def _parse_path_containment(
+        self,
+        raw_condition: dict[str, Any],
+        rule_name: str,
+        cond_index: int,
+        views: ViewFlags,
+    ) -> Condition | None:
+        """Parse a ``path_containment`` condition, folding its roots and denials once.
+
+        ``allowed_roots`` absent and ``allowed_roots: []`` mean different things.
+        Absent asks for no containment requirement, so only the denylist and the
+        traversal check apply. Present but empty flags every absolute path,
+        matching how an empty ``domain_allowlist`` behaves: an operator who wrote
+        the key meant to restrict something, and flagging is the fail-safe reading.
+        """
+        field_name = raw_condition.get("field")
+        raw_roots = raw_condition.get("allowed_roots")
+        raw_denied = raw_condition.get("denied_paths")
+        if not isinstance(field_name, str):
+            return None
+        if raw_roots is not None and not isinstance(raw_roots, list):
+            return None
+        if raw_denied is not None and not isinstance(raw_denied, list):
+            return None
+
+        roots: list[str] | None = None
+        if raw_roots is not None:
+            roots = self._folded_entries(raw_roots, rule_name, cond_index, "allowed_roots")
+        denied = self._folded_entries(raw_denied or [], rule_name, cond_index, "denied_paths")
+        return Condition(
+            type="path_containment",
+            field=field_name,
+            allowed_roots=roots,
+            denied_paths=denied,
+            normalize=views,
+        )
+
+    @staticmethod
+    def _folded_entries(
+        raw_entries: list[Any],
+        rule_name: str,
+        cond_index: int,
+        key: str,
+    ) -> list[str]:
+        folded: list[str] = []
+        for entry in raw_entries:
+            candidate = fold_path(str(entry))
+            if not candidate:
+                logger.warning(
+                    "Dropping unusable path entry rule=%s condition=%s key=%s entry=%r",
+                    rule_name,
+                    cond_index,
+                    key,
+                    entry,
+                )
+                continue
+            folded.append(candidate)
+        return folded
 
     def _compile_patterns(
         self,
@@ -506,6 +664,9 @@ class PolicyEngine:
                     return True
             return False
 
+        if condition.type == "path_containment":
+            return self._path_condition_matches(condition, arguments, findings, view_cache)
+
         if condition.type == "pii_detection":
             flattened_values = self._flatten_values(arguments)
             for candidate in flattened_values:
@@ -529,6 +690,112 @@ class PolicyEngine:
 
         logger.warning("Unhandled condition type during evaluate type=%s", condition.type)
         return False
+
+    def _path_condition_matches(
+        self,
+        condition: Condition,
+        arguments: dict[str, Any],
+        findings: list[Finding],
+        view_cache: dict[tuple[bool, bool, str], list[TextView]],
+    ) -> bool:
+        """Flag a path argument that leaves its allowed roots or names a denied path.
+
+        Containment here is a policy assertion, not a guarantee. The check is
+        lexical and the filesystem it describes belongs to the MCP server, which
+        may be a different host or container; a symlink inside an allowed root
+        still points wherever the server's filesystem says it points, and nothing
+        the proxy can see would reveal that. What this does guarantee is that
+        every spelling of a path the proxy can recover agrees on where the path
+        claims to go.
+
+        Every recoverable spelling is checked, not just the raw one, and any one
+        of them failing flags the value. That is what makes ``%2e%2e%2f`` and a
+        fullwidth solidus land on the same answer as ``../``.
+        """
+        for candidate in self._flatten_values(arguments.get(condition.field or "")):
+            if not candidate.strip():
+                continue
+            for view in self._views(condition, candidate, view_cache):
+                if view.name not in _PATH_VIEW_NAMES:
+                    continue
+                finding = self._path_finding(condition, fold_path(view.text), view)
+                if finding is not None:
+                    findings.append(finding)
+                    return True
+        return False
+
+    @staticmethod
+    def _path_finding(condition: Condition, folded: str, view: TextView) -> Finding | None:
+        """Describe what is wrong with one folded path, or None when nothing is.
+
+        A relative path that does not climb is left alone by the containment half.
+        The proxy does not know the MCP server's working directory, so it cannot
+        say which root such a path lands in, and treating every relative path as
+        an escape blocks the ordinary reads a filesystem server exists to do. The
+        denylist still applies to its segments, which is what a relative entry in
+        ``denied_paths`` is for.
+        """
+        field = condition.field
+        if not folded:
+            return Finding(
+                severity="high",
+                description="Path argument carries control characters",
+                field=field,
+                matched_pattern="path_containment",
+                view=view.name,
+            )
+        if path_escapes_upward(folded):
+            return Finding(
+                severity="high",
+                description=f"Path traverses above its base: {folded}",
+                field=field,
+                matched_pattern="path_containment",
+                view=view.name,
+                matched_text=folded,
+            )
+        segments = path_segments(folded)
+        for entry in condition.denied_paths:
+            if PolicyEngine._path_denied(folded, segments, entry):
+                return Finding(
+                    severity="high",
+                    description=f"Sensitive path denied by {entry}: {folded}",
+                    field=field,
+                    matched_pattern=entry,
+                    view=view.name,
+                    matched_text=folded,
+                )
+        roots = condition.allowed_roots
+        if (
+            roots is not None
+            and folded.startswith("/")
+            and not any(path_within(folded, root) for root in roots)
+        ):
+            return Finding(
+                severity="high",
+                description=f"Path outside every allowed root: {folded}",
+                field=field,
+                matched_pattern="allowed_roots",
+                view=view.name,
+                matched_text=folded,
+            )
+        return None
+
+    @staticmethod
+    def _path_denied(folded: str, segments: tuple[str, ...], entry: str) -> bool:
+        """Match a folded path against one denylist entry.
+
+        An absolute entry denies itself and its subtree. A relative entry denies
+        any path with those segments in it, consecutively, so ``.ssh`` reaches
+        ``/home/user/.ssh/id_ed25519`` without the operator having to know whose
+        home directory the server runs in.
+        """
+        if entry.startswith("/"):
+            return path_within(folded, entry)
+        wanted = path_segments(entry)
+        if not wanted:
+            return False
+        span = len(wanted)
+        return any(segments[index : index + span] == wanted for index in range(len(segments) - span + 1))
 
     @staticmethod
     def _host_allowlisted(host: str, condition: Condition) -> bool:
