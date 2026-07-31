@@ -12,9 +12,18 @@ AgentParry helps you **scan**, **protect**, and **verify** autonomous AI agents 
 - **Closed loop** (`agentparry harden` / `agentparry verify`): scan, generate policy rules from the findings, re-scan, and report both what got fixed and what the new rules broke.
 - **Policy linter** (`agentparry lint-policy`): predicts which rules over-block, offline, by evaluating each rule against a benign payload corpus and by reading its regexes. `harden` refuses to write rules that fail it.
 
-## Stdio proxy (Claude / MCP)
+## Install
 
-Run from the repository root so `config/default_policy.yaml` resolves correctly:
+```bash
+pip install agent-parry
+agentparry quickstart --command "npx some-mcp-server"
+```
+
+`quickstart` starts a throwaway proxy in front of that server, runs one safe scan through it (policy is evaluated, no tool call is forwarded), prints detection and over-block, and says what to run next. `agentparry --help` groups the rest of the commands under the three verbs.
+
+The policy and the payload corpus ship inside the package, and every default resolves absolutely, so no command needs a particular working directory. Precedence for both: the explicit flag, then `AGENTPARRY_POLICY` / `AGENTPARRY_PAYLOADS`, then `~/.agentparry/policy.yaml` / `~/.agentparry/payloads.yaml`, then the packaged copy. `agentparry harden` cannot write package data, so merging rules onto a packaged default copies it to `~/.agentparry/policy.yaml` first and prints where it went; every later command then prefers that copy, and deleting it goes back to the shipped rules.
+
+## Stdio proxy (Claude / MCP)
 
 ```bash
 python -m src.stdio_proxy --wrap npx -- some-mcp-server
@@ -25,7 +34,7 @@ Put AgentParry flags **before** `--wrap`. After `--wrap`, the first token is the
 
 | Option | Meaning |
 |--------|--------|
-| `--policy PATH` | Policy YAML (default: `config/default_policy.yaml`, or `AGENTPARRY_POLICY` if set) |
+| `--policy PATH` | Policy YAML (default: `AGENTPARRY_POLICY`, then `~/.agentparry/policy.yaml`, then the packaged policy) |
 | `--log PATH` | Log file (default: `~/.agentparry/proxy.log`) |
 | `--audit PATH` | JSONL audit log (default: `~/.agentparry/audit.jsonl`, or `AGENTPARRY_AUDIT_PATH`) |
 | `--no-audit` | Disable the audit log |
@@ -181,7 +190,7 @@ Both halves run under the policy's own `settings.normalization` block and per-ru
 
 | Flag | Meaning |
 |---|---|
-| `--policy PATH` | Policy YAML to lint (default: `config/default_policy.yaml`) |
+| `--policy PATH` | Policy YAML to lint (default: the resolved default policy) |
 | `--payloads PATH` | Payload YAML holding the benign corpus |
 | `--no-corpus` | Skip the payload file and rely on generated benign strings |
 | `--no-probes` | Static checks and corpus only |
@@ -228,9 +237,9 @@ The console output of the HTTP proxy still shows raw arguments. That is delibera
 
 ```bash
 agentparry replay                                                    # default audit path
-agentparry replay --policy config/default_policy.yaml --bucket day
+agentparry replay --policy ~/.agentparry/policy.yaml --bucket day
 agentparry replay --format json --fail-on-fail-open                  # exit 3 if any FAIL_OPEN
-agentparry replay --policy config/default_policy.yaml --against candidate.yaml
+agentparry replay --policy ~/.agentparry/policy.yaml --against candidate.yaml
 ```
 
 Reported from the log alone, with no policy file: the `FAIL_OPEN` count, `REQUIRE_APPROVAL` decisions made over stdio, which rules fired and on which tools, which tools were called, response-side result and metadata decisions, and a day/hour/minute decision histogram. With `--policy`, also the rules in that policy that never fired anywhere in the log. `--format json` prints the whole report for CI.
