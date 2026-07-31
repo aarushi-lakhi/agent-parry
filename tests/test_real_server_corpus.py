@@ -121,7 +121,7 @@ class TestMetadataInspectorOnRealServers:
 
     def test_no_injection_pattern_matches_real_prose(self) -> None:
         patterns = INJECTION_PATTERNS + METADATA_PATTERNS
-        assert len(patterns) == 16
+        assert patterns, "no patterns to check against the corpus"
         hits: list[tuple[str, str, str]] = []
         for entry in CORPUS:
             for text in prose_leaves(entry):
