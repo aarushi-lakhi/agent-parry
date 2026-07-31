@@ -41,9 +41,35 @@ logger = logging.getLogger(__name__)
 
 _OPAQUE_BLOB_SIGNAL = "opaque encoded blob"
 
+_URL_RE = re.compile(r"(?:[a-z][a-z0-9+.\-]{1,31}://|www\.)[^\s\"'<>)\]}]+", re.IGNORECASE)
+"""Spans the opaque-blob signal ignores.
+
+A URL path is long, mixed case, punctuation-heavy and does not decode to text,
+which is the exact shape the blob rule looks for. `everything` advertises a real
+raw.githubusercontent.com default and trips it. A URL is also not concealment:
+the model can read it, so the signal has nothing to say about one.
+"""
+
 Severity = Literal["low", "medium", "high", "critical"]
 
 _SEVERITY_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+def opaque_blob_matches(text: str) -> list[re.Match[str]]:
+    """Return the base64-shaped runs in ``text`` that read as encoded bytes.
+
+    Runs inside a URL are excluded. Shared by the argument side and the metadata
+    side so the two can never disagree about what counts as a blob.
+    """
+    urls = [match.span() for match in _URL_RE.finditer(text)]
+    matches = []
+    for match in iter_base64_runs(text, min_length=40):
+        start, end = match.span()
+        if any(url_start <= start and end <= url_end for url_start, url_end in urls):
+            continue
+        if is_opaque_blob(match.group(0)):
+            matches.append(match)
+    return matches
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,22 +265,17 @@ class InputInspector:
         decode to text is matched by the ordinary patterns in a decoded view at
         their ordinary severity instead.
         """
-        findings: list[Finding] = []
-        for match in iter_base64_runs(value, min_length=40):
-            fragment = match.group(0)
-            if not is_opaque_blob(fragment):
-                continue
-            findings.append(
-                Finding(
-                    severity="medium",
-                    description=f"Suspicious {_OPAQUE_BLOB_SIGNAL} in {tool_name}",
-                    field=field_path,
-                    matched_pattern=_OPAQUE_BLOB_SIGNAL,
-                    matched_text=fragment,
-                    span=match.span(),
-                )
+        return [
+            Finding(
+                severity="medium",
+                description=f"Suspicious {_OPAQUE_BLOB_SIGNAL} in {tool_name}",
+                field=field_path,
+                matched_pattern=_OPAQUE_BLOB_SIGNAL,
+                matched_text=match.group(0),
+                span=match.span(),
             )
-        return findings
+            for match in opaque_blob_matches(value)
+        ]
 
     @staticmethod
     def _dedupe(candidates: list[Finding]) -> list[Finding]:
@@ -945,11 +966,20 @@ for a model, so anything past this is already the oversize signal below, and a
 ``tools/list`` walk runs on the critical path of the client handshake.
 """
 
-MAX_DESCRIPTION_CHARS = 2_000
-"""Longest description that is not itself suspicious.
+MAX_DESCRIPTION_CHARS = 8_000
+"""Longest description that is worth remarking on.
 
-Real descriptions run long, but a wall of text is how a poisoned tool buries an
-instruction where a human reviewer scrolling a tool list will never reach it.
+Measured over the 75 real tool descriptions in ``tests/fixtures/real_servers/``:
+median 57 characters, p90 323, p95 360, and then one outlier at 2781.
+sequential-thinking's description *is* its tool, a full spec of how to drive it,
+and the old 2000-character cap flagged it. So the corpus sets a floor of 2781,
+not a target: any cap between 460 and 2781 only ever catches a legitimate tool.
+
+8000 is roughly 2000 tokens, near three times that outlier and three quarters of
+what the eight real servers spend on all 75 descriptions put together (10,732
+characters). It stays below
+``MAX_METADATA_LEAF_CHARS`` so the signal is still reachable before a leaf is
+skipped from scanning entirely.
 """
 
 METADATA_METHODS = frozenset({"initialize", "tools/list"})
@@ -1059,6 +1089,12 @@ _BLOB_EXEMPT_KEYS = frozenset({"pattern", "format", "$schema"})
 
 A JSON Schema regex or a format URI is long, mixed-case, punctuation-heavy and
 does not decode to text, which is exactly the shape the blob rule looks for.
+
+``default`` is deliberately not in here. A schema default is model-facing text an
+attacker controls, and being a non-prose leaf it escalates to dropping the tool,
+so blinding the rule to it would give up a real surface. The one real-server
+false positive on a default was a URL, and `opaque_blob_matches` skips URLs
+wherever they appear.
 """
 
 
@@ -1112,12 +1148,10 @@ class MetadataInspector:
     property key names.
 
     Measured against ``tests/fixtures/real_servers/``, eight real servers and 75
-    tools: no pattern in either table matches any real description, and the
-    shipped default rewrites nothing. Two ``medium`` findings come from the
-    structural heuristics, both below threshold. Lowering
-    ``severity_threshold`` to ``medium`` is not free: on that same corpus it
-    drops one working tool and redacts one description the model needs.
-    ``docs/real-servers.md`` has the numbers.
+    tools: zero findings at any severity, from the pattern tables and from the
+    structural heuristics alike, so every ``severity_threshold`` including
+    ``medium`` leaves all eight catalogues untouched. ``docs/real-servers.md``
+    has the numbers and what it took to get there.
     """
 
     def __init__(
@@ -1367,11 +1401,20 @@ class MetadataInspector:
         ]
 
     def _oversize_findings(self, path: str, text: str, subject: str) -> list[Finding]:
+        """Note a description long enough to hide something, without acting on it.
+
+        ``low`` and not ``medium``, so it can never reach a severity threshold on
+        its own. Length is a fact about the author, not about the content: a wall
+        of text is where an instruction hides, but it is not evidence that one is
+        there, and the patterns and the invisible-character rule are what find it
+        when it is. Redacting a description for being long costs the model a tool
+        it can no longer drive and tells it nothing about why.
+        """
         if not is_prose_leaf(path) or len(text) <= self._settings.max_description_chars:
             return []
         return [
             Finding(
-                severity="medium",
+                severity="low",
                 description=f"Oversized metadata prose in {subject} ({len(text)} chars)",
                 field=path,
                 matched_pattern="oversized metadata",
@@ -1380,22 +1423,17 @@ class MetadataInspector:
 
     @staticmethod
     def _blob_findings(path: str, text: str, subject: str) -> list[Finding]:
-        findings: list[Finding] = []
-        for match in iter_base64_runs(text, min_length=40):
-            fragment = match.group(0)
-            if not is_opaque_blob(fragment):
-                continue
-            findings.append(
-                Finding(
-                    severity="medium",
-                    description=f"Suspicious {_OPAQUE_BLOB_SIGNAL} in {subject}",
-                    field=path,
-                    matched_pattern=_OPAQUE_BLOB_SIGNAL,
-                    matched_text=fragment,
-                    span=match.span(),
-                )
+        return [
+            Finding(
+                severity="medium",
+                description=f"Suspicious {_OPAQUE_BLOB_SIGNAL} in {subject}",
+                field=path,
+                matched_pattern=_OPAQUE_BLOB_SIGNAL,
+                matched_text=match.group(0),
+                span=match.span(),
             )
-        return findings
+            for match in opaque_blob_matches(text)
+        ]
 
     @staticmethod
     def _annotate(
